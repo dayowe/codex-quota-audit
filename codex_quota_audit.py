@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.9.
+"""Codex quota audit v2.10.
 
 Analyze local Codex rollout logs and relate observed token usage to Codex quota
 meters. The main historical analysis defaults to the 7-day meter; the Guardian /
@@ -42,6 +42,8 @@ What it does
 * Associates approval episodes with conservative 5-hour / 7-day quota envelopes.
 * Estimates Approve-for-me quota cost separately for each reconstructed reset period when identifiable.
 * Reports both percentage points of the 100-point allowance and share of quota actually consumed.
+* Prices codex-auto-review using the published GPT-5.4 auto-review rate-card mapping.
+* Reports public rate-card-equivalent Guardian cost per approval and per reset period.
 * Detects explicit linkage metadata when present, otherwise uses confidence-labelled temporal matching.
 * Discovers and analyzes 5-hour and 7-day quota snapshots when present.
 * Compares model/month and detected model-policy regimes.
@@ -51,6 +53,9 @@ What it does
 
 Raw tokens/cache/model mix are direct observations. API-dollar values use public
 list-price equivalents only as a normalization ruler; they are never plan billing.
+For Guardian, the dedicated $eq estimate uses the published GPT-5.4 auto-review
+rates and applies the documented >272K-input long-context multiplier per request.
+Fast-mode/regional multipliers are not inferred when the logs do not expose them.
 
 By default the script reads ~/.codex/sessions and ~/.codex/archived_sessions.
 The normal text analysis uses only the Python standard library. matplotlib is
@@ -59,7 +64,8 @@ imported only when --charts is requested.
 Price JSON accepts either form:
     {"gpt-x": [4.0, 0.4, 20.0]}
     {"gpt-x": {"input": 4.0, "cached": 0.4, "output": 20.0}}
-All prices are dollars per 1M tokens.
+All prices are dollars per 1M tokens. Overriding gpt-5.4 also updates the
+codex-auto-review alias unless codex-auto-review is explicitly provided.
 """
 
 from __future__ import annotations
@@ -84,7 +90,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.9"
+__version__ = "2.10"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +105,21 @@ DEFAULT_PRICES: Dict[str, Tuple[float, float, float]] = {
     "gpt-5.5": (5.0, 0.5, 30.0),
     "gpt-5.4": (2.5, 0.25, 15.0),
 }
+
+# OpenAI's public ChatGPT Work/Codex rate card documents that Auto review uses
+# GPT-5.4. The values below are a public-rate-card equivalent, not subscription
+# billing or an estimate of OpenAI's internal compute cost.
+AUTO_REVIEW_MODEL = "gpt-5.4"
+AUTO_REVIEW_ALIAS = "codex-auto-review"
+AUTO_REVIEW_RATECARD_SOURCE = "https://help.openai.com/en/articles/20001415"
+AUTO_REVIEW_RATECARD_AS_OF = "2026-09-17"
+LONG_CONTEXT_THRESHOLD_INPUT_TOKENS = 272_000
+LONG_CONTEXT_INPUT_MULTIPLIER = 2.0
+LONG_CONTEXT_CACHED_MULTIPLIER = 2.0
+LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5
+# Default alias. load_prices() keeps this synchronized with a user override of
+# gpt-5.4 unless the alias itself is explicitly overridden.
+DEFAULT_PRICES[AUTO_REVIEW_ALIAS] = DEFAULT_PRICES[AUTO_REVIEW_MODEL]
 
 DEFAULT_WINDOW_MINUTES = 10080
 DEFAULT_DENSE_THRESHOLD = 20
@@ -465,20 +486,24 @@ def top_model_mix(model_tokens: Dict[str, int], min_share: float = 0.05) -> str:
 
 def load_prices(path: Optional[str]) -> Dict[str, Tuple[float, float, float]]:
     prices = dict(DEFAULT_PRICES)
-    if not path:
-        return prices
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-    if not isinstance(obj, dict):
-        raise ValueError("price file must contain a JSON object")
-    for model, value in obj.items():
-        if isinstance(value, (list, tuple)) and len(value) == 3:
-            triple = tuple(float(x) for x in value)
-        elif isinstance(value, dict):
-            triple = (float(value["input"]), float(value["cached"]), float(value["output"]))
-        else:
-            raise ValueError(f"invalid price for {model!r}")
-        prices[str(model)] = triple  # type: ignore[assignment]
+    explicit: set[str] = set()
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError("price file must contain a JSON object")
+        for model, value in obj.items():
+            if isinstance(value, (list, tuple)) and len(value) == 3:
+                triple = tuple(float(x) for x in value)
+            elif isinstance(value, dict):
+                triple = (float(value["input"]), float(value["cached"]), float(value["output"]))
+            else:
+                raise ValueError(f"invalid price for {model!r}")
+            key = str(model)
+            explicit.add(key)
+            prices[key] = triple  # type: ignore[assignment]
+    if AUTO_REVIEW_ALIAS not in explicit and AUTO_REVIEW_MODEL in prices:
+        prices[AUTO_REVIEW_ALIAS] = prices[AUTO_REVIEW_MODEL]
     return prices
 
 
@@ -488,6 +513,48 @@ def price_event(model: str, uncached: int, cached: int, output: int,
     if p is None:
         return None
     return (uncached * p[0] + cached * p[1] + output * p[2]) / 1_000_000.0
+
+
+def guardian_ratecard_event_cost(event: Event,
+                                 prices: Dict[str, Tuple[float, float, float]]) -> Tuple[float, float, bool]:
+    """Return (base USD-equivalent, adjusted USD-equivalent, long-context flag).
+
+    Auto review is publicly documented as GPT-5.4. Base cost uses the configured
+    GPT-5.4/alias token rates. The adjusted value additionally applies the public
+    >272K-input long-context multipliers request by request. Fast-mode and regional
+    multipliers are intentionally not guessed from logs that do not expose them.
+    """
+    rates = prices.get(AUTO_REVIEW_ALIAS) or prices.get(AUTO_REVIEW_MODEL)
+    if rates is None:
+        return float("nan"), float("nan"), False
+    base = (event.uncached * rates[0] + event.cached * rates[1] + event.output * rates[2]) / 1_000_000.0
+    long_context = event.input_total > LONG_CONTEXT_THRESHOLD_INPUT_TOKENS
+    if not long_context:
+        return base, base, False
+    adjusted = (
+        event.uncached * rates[0] * LONG_CONTEXT_INPUT_MULTIPLIER
+        + event.cached * rates[1] * LONG_CONTEXT_CACHED_MULTIPLIER
+        + event.output * rates[2] * LONG_CONTEXT_OUTPUT_MULTIPLIER
+    ) / 1_000_000.0
+    return base, adjusted, True
+
+
+def guardian_ratecard_group_cost(events: Sequence[Event],
+                                 prices: Dict[str, Tuple[float, float, float]]) -> Tuple[float, float, int]:
+    base = adjusted = 0.0
+    long_context_events = 0
+    any_price = False
+    for e in events:
+        b, a, lc = guardian_ratecard_event_cost(e, prices)
+        if not math.isfinite(a):
+            continue
+        any_price = True
+        base += b
+        adjusted += a
+        long_context_events += int(lc)
+    if not any_price:
+        return float("nan"), float("nan"), long_context_events
+    return base, adjusted, long_context_events
 
 
 # ---------------------------------------------------------------------------
@@ -1401,7 +1468,8 @@ def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis
     source_display = "~/.codex" if args.home == os.path.expanduser("~/.codex") else args.home
     print(f"Source: {source_display}")
     print(f"Target limit: {args.window_minutes} minutes ({args.window_minutes / 1440:.1f} days)")
-    print("API $ values are list-price-equivalent normalization only, never plan billing.\n")
+    print("API $ values are list-price-equivalent normalization only, never plan billing.")
+    print(f"Auto review $eq maps codex-auto-review -> {AUTO_REVIEW_MODEL}; >272K-input long-context multipliers are applied.\n")
 
     print("Data audit")
     print("----------")
@@ -2364,8 +2432,10 @@ def _regime_label(regimes: Sequence[PolicyRegime], model: str, ts: datetime) -> 
 
 
 def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: argparse.Namespace,
-                            primary: Optional[Analysis] = None) -> List[Dict[str, object]]:
+                            primary: Optional[Analysis] = None,
+                            prices: Optional[Dict[str, Tuple[float, float, float]]] = None) -> List[Dict[str, object]]:
     """Build Guardian approval episodes and pair them to likely parent work."""
+    prices = prices or DEFAULT_PRICES
     by_source = _source_events(events)
     quota_indexes = _build_quota_snapshot_indexes(events, args)
     regimes = _policy_regimes_for_approval_matching(primary, args) if primary is not None else []
@@ -2391,6 +2461,7 @@ def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: ar
             effort = _dominant_value(parent_context or parent_all, "effort")
             unc, cached, out, reasoning = _event_token_totals(group)
             guardian_tokens = unc + cached + out
+            ratecard_base_usd, ratecard_usd, long_context_events = guardian_ratecard_group_cost(group, prices)
             parent_tokens = sum(e.tokens for e in parent_context)
             markers = []
             if pair.parent_source:
@@ -2410,6 +2481,10 @@ def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: ar
                 "guardian_tokens": guardian_tokens,
                 "guardian_uncached": unc, "guardian_cached": cached, "guardian_output": out,
                 "guardian_reasoning_output": reasoning,
+                "guardian_ratecard_model": AUTO_REVIEW_MODEL,
+                "guardian_ratecard_base_usd": ratecard_base_usd,
+                "guardian_ratecard_usd": ratecard_usd,
+                "guardian_long_context_events": long_context_events,
                 "parent_tokens_before": sum(e.tokens for e in parent_before),
                 "parent_tokens_during": sum(e.tokens for e in parent_during),
                 "parent_tokens_after": sum(e.tokens for e in parent_after),
@@ -2639,6 +2714,12 @@ def guardian_period_cost_rows(primary: Analysis,
         guardian_tokens = sum(int(r.get("guardian_tokens", 0) or 0) for r in period_approvals)
         if guardian_tokens <= 0:
             continue
+        period_usd_values = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in period_approvals]
+        period_base_values = [float(r.get("guardian_ratecard_base_usd", float("nan"))) for r in period_approvals]
+        guardian_ratecard_usd = sum(x for x in period_usd_values if math.isfinite(x))
+        guardian_ratecard_base_usd = sum(x for x in period_base_values if math.isfinite(x))
+        priced_approvals = sum(math.isfinite(x) for x in period_usd_values)
+        long_context_events = sum(int(r.get("guardian_long_context_events", 0) or 0) for r in period_approvals)
 
         good_pairs = sum(r.get("pair_confidence") in {"high", "medium"} for r in period_approvals)
         guardian_m = guardian_tokens / 1e6
@@ -2665,6 +2746,12 @@ def guardian_period_cost_rows(primary: Analysis,
             "paired_approvals": good_pairs,
             "guardian_tokens": guardian_tokens,
             "guardian_mtokens": guardian_m,
+            "guardian_ratecard_model": AUTO_REVIEW_MODEL,
+            "guardian_ratecard_usd": guardian_ratecard_usd if priced_approvals else float("nan"),
+            "guardian_ratecard_base_usd": guardian_ratecard_base_usd if priced_approvals else float("nan"),
+            "guardian_ratecard_priced_approvals": priced_approvals,
+            "guardian_long_context_events": long_context_events,
+            "guardian_ratecard_usd_per_approval": guardian_ratecard_usd / len(period_approvals) if priced_approvals and period_approvals else float("nan"),
             "estimate_status": "supported" if supported else "not-identifiable",
             "estimated_guardian_points": est,
             "estimated_guardian_points_lo": est_lo,
@@ -2676,6 +2763,8 @@ def guardian_period_cost_rows(primary: Analysis,
             "estimated_share_of_used_percent": share_used,
             "estimated_share_of_used_percent_lo": share_used_lo,
             "estimated_share_of_used_percent_hi": share_used_hi,
+            "guardian_ratecard_usd_per_estimated_point": guardian_ratecard_usd / est
+                if priced_approvals and est == est and est > EPS else float("nan"),
         })
     return rows
 
@@ -2708,9 +2797,11 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
 
     print("`est G pt` is the estimated number of percentage points lost from that period's")
     print("100-point allowance. `% of used` asks what share of the quota actually consumed")
-    print("in that period the estimate represents. Intervals propagate the 80% bootstrap")
-    print("range of the observational Guardian coefficient; they are not server billing data.\n")
-    print(f"{'period':<15} {'used':>6} {'appr':>6} {'G tok M':>8} {'est G pt':>9} {'80% range':>15} {'% of used':>10}")
+    print("in that period the estimate represents. `G $eq` is the public GPT-5.4 rate-card")
+    print("equivalent of Guardian inference (including documented >272K long-context multipliers).")
+    print("Intervals propagate the 80% bootstrap range of the observational Guardian coefficient;")
+    print("quota estimates are not server billing data, and $eq is not your Pro subscription charge.\n")
+    print(f"{'period':<15} {'used':>6} {'appr':>6} {'G tok M':>8} {'G $eq':>9} {'est G pt':>9} {'80% range':>15} {'% of used':>10}")
     for r in rows:
         est = float(r.get("estimated_guardian_points", float("nan")))
         lo = float(r.get("estimated_guardian_points_lo", float("nan")))
@@ -2719,8 +2810,10 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
         rng = f"{lo:.1f}-{hi:.1f}" if lo == lo and hi == hi else "n/a"
         est_s = f"{est:.1f}" if est == est else "n/a"
         share_s = f"{share:.1f}%" if share == share else "n/a"
+        usd = float(r.get("guardian_ratecard_usd", float("nan")))
+        usd_s = f"${usd:.2f}" if math.isfinite(usd) else "n/a"
         print(f"{_period_label(r):<15} {float(r['period_used_points']):>5.0f}% {int(r['approvals']):>6} "
-              f"{float(r['guardian_mtokens']):>8.1f} {est_s:>9} {rng:>15} {share_s:>10}")
+              f"{float(r['guardian_mtokens']):>8.1f} {usd_s:>9} {est_s:>9} {rng:>15} {share_s:>10}")
 
     supported_rows = [r for r in rows if float(r.get("estimated_guardian_points", float("nan"))) ==
                       float(r.get("estimated_guardian_points", float("nan")))]
@@ -2730,8 +2823,11 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
         lo = sum(float(r["estimated_guardian_points_lo"]) for r in supported_rows)
         hi = sum(float(r["estimated_guardian_points_hi"]) for r in supported_rows)
         share = 100.0 * est / used if used > EPS else float("nan")
+        total_usd = sum(float(r.get("guardian_ratecard_usd", 0.0)) for r in supported_rows
+                        if math.isfinite(float(r.get("guardian_ratecard_usd", float("nan")))))
         print("\nAcross Guardian-active reset periods:")
         print(f"  quota consumed on meter:          {used:.0f} points")
+        print(f"  Guardian public-rate-card $eq:    ${total_usd:,.2f}")
         print(f"  estimated Approve-for-me cost:    {est:.1f} points (80% {lo:.1f}-{hi:.1f})")
         if share == share:
             print(f"  estimated share of consumed quota: {share:.1f}%")
@@ -2744,6 +2840,9 @@ def export_guardian_period_cost_csv(path: str, rows: Sequence[Dict[str, object]]
         "reset_key", "period_start", "period_end", "first_seen", "last_seen",
         "first_used", "period_used_points", "observed_new_high_points",
         "approvals", "paired_approvals", "guardian_tokens", "guardian_mtokens",
+        "guardian_ratecard_model", "guardian_ratecard_usd", "guardian_ratecard_base_usd",
+        "guardian_ratecard_priced_approvals", "guardian_long_context_events",
+        "guardian_ratecard_usd_per_approval", "guardian_ratecard_usd_per_estimated_point",
         "estimate_status", "estimated_guardian_points", "estimated_guardian_points_lo",
         "estimated_guardian_points_hi", "estimated_allowance_percent",
         "estimated_allowance_percent_lo", "estimated_allowance_percent_hi",
@@ -2790,8 +2889,10 @@ def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
         lo = float(r["estimated_guardian_points_lo"])
         hi = float(r["estimated_guardian_points_hi"])
         axes[0].errorbar(est, y, xerr=[[max(0.0, est-lo)], [max(0.0, hi-est)]], fmt="o", capsize=4)
+        usd = float(r.get("guardian_ratecard_usd", float("nan")))
+        usd_note = f" · ${usd:.0f}eq" if math.isfinite(usd) else ""
         axes[0].text(hi + max(.08, hi*.02), y,
-                     f"{est:.1f}pt · {int(r['approvals'])} approvals", color=CHART_FG,
+                     f"{est:.1f}pt · {int(r['approvals'])} approvals{usd_note}", color=CHART_FG,
                      va="center", fontsize=8.5)
         share = float(r["estimated_share_of_used_percent"])
         slo = float(r["estimated_share_of_used_percent_lo"])
@@ -2889,7 +2990,8 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
                          approval_episodes: Optional[Sequence[Dict[str, object]]] = None,
                          primary: Optional[Analysis] = None,
                          period_cost_rows: Optional[Sequence[Dict[str, object]]] = None,
-                         target_guardian_fit: Optional[Dict[str, object]] = None) -> None:
+                         target_guardian_fit: Optional[Dict[str, object]] = None,
+                         prices: Optional[Dict[str, Tuple[float, float, float]]] = None) -> None:
     print("\
 Guardian / auto-review approval audit")
     print("-------------------------------------")
@@ -2900,6 +3002,7 @@ Guardian / auto-review approval audit")
     parent_user = [e for e in events if not e.is_auto_review_inference
                    and e.approvals_reviewer == "user"]
     stats = stats or ParseStats()
+    prices = prices or DEFAULT_PRICES
 
     print("Guardian is treated as extra inference spawned by normal work, not as unrelated")
     print("background activity. Parent + Guardian are grouped into approval episodes; quota")
@@ -2920,9 +3023,18 @@ Guardian / auto-review approval audit")
         print(f"  output:                           {out / 1e6:,.1f}M")
         print(f"  reasoning output (subset/field):  {reasoning / 1e6:,.1f}M")
         print(f"  cached share of input:            {fmt_pct_ratio(_cache_ratio_events(auto))}")
+        base_usd, ratecard_usd, lc_events = guardian_ratecard_group_cost(auto, prices)
+        if math.isfinite(ratecard_usd):
+            print(f"  public rate-card equivalent:      ${ratecard_usd:,.2f}")
+            if ratecard_usd > base_usd + 0.005:
+                print(f"    base GPT-5.4 token rates:       ${base_usd:,.2f}")
+                print(f"    long-context uplift:            ${ratecard_usd-base_usd:,.2f} ({lc_events:,} >272K-input calls)")
+            print(f"  rate-card mapping:                Auto review -> {AUTO_REVIEW_MODEL} (as of {AUTO_REVIEW_RATECARD_AS_OF})")
+            print("  $eq is a public-rate-card equivalent, not a Pro subscription charge or internal compute cost.")
+            print("  Fast-mode/regional multipliers are not inferred when absent from the local telemetry.")
 
     if approval_episodes is None:
-        approval_episodes = build_approval_episodes(events, stats, args, primary)
+        approval_episodes = build_approval_episodes(events, stats, args, primary, prices)
     episodes = list(approval_episodes)
     print("\
 Parent ↔ Guardian pairing and approval episodes")
@@ -2952,6 +3064,11 @@ Parent ↔ Guardian pairing and approval episodes")
                   f"{_q(gt,.10)/1e6:.2f}M / {_q(gt,.50)/1e6:.2f}M / {_q(gt,.90)/1e6:.2f}M")
             if shares:
                 print(f"Guardian share of local parent+review context, median: {_q(shares,.50):.0%}")
+            dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in good]
+            dollars = [x for x in dollars if math.isfinite(x)]
+            if dollars:
+                print(f"Guardian $eq / approval p10/p50/p90: "
+                      f"${_q(dollars,.10):.2f} / ${_q(dollars,.50):.2f} / ${_q(dollars,.90):.2f}")
             print("Pairing uses explicit hashed linkage metadata when available; otherwise temporal")
             print("proximity and reviewer state are used and confidence is downgraded accordingly.")
 
@@ -3093,7 +3210,9 @@ def export_approval_episodes_csv(path: str, rows: Sequence[Dict[str, object]]) -
         "episode_id", "start", "end", "duration_seconds", "pair_confidence", "pair_method",
         "pair_ambiguous", "nearest_parent_seconds", "parent_coverage_60s", "guardian_events",
         "guardian_tokens", "guardian_uncached", "guardian_cached", "guardian_output",
-        "guardian_reasoning_output", "parent_tokens_before", "parent_tokens_during",
+        "guardian_reasoning_output", "guardian_ratecard_model", "guardian_ratecard_base_usd",
+        "guardian_ratecard_usd", "guardian_long_context_events",
+        "parent_tokens_before", "parent_tokens_during",
         "parent_tokens_after", "parent_tokens", "parent_events", "parent_model", "parent_effort",
         "policy_regime", "approval_markers_nearby", "guardian_share_local",
     ]
@@ -3140,6 +3259,8 @@ def print_notes(analysis: Analysis) -> None:
     print("  treated as telemetry backsteps/stale observations, not quota replenishment.")
     print("* API$/pt uses only high-water buckets meeting the configured pricing coverage.")
     print("* API pricing is a normalization yardstick, not internal cost or plan billing.")
+    print(f"* codex-auto-review is priced as {AUTO_REVIEW_MODEL} for public rate-card equivalence;")
+    print("  Guardian $eq also applies the documented >272K-input long-context multiplier per request.")
     if churn:
         print(f"* Near-zero resets_at churn transitions merged: {churn:,}.")
     if backsteps:
@@ -3540,8 +3661,11 @@ def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str
         rs = groups[key]
         vals = [float(r["guardian_tokens"]) / 1e6 for r in rs]
         med, lo, hi = _q(vals,.5), _q(vals,.1), _q(vals,.9)
+        dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in rs]
+        dollars = [x for x in dollars if math.isfinite(x)]
+        dollar_note = f" · ${_q(dollars,.5):.2f}eq" if dollars else ""
         axes[0].errorbar(med, y, xerr=[[med-lo],[hi-med]], fmt="o", capsize=4)
-        axes[0].text(hi + max(0.01, hi*.02), y, f"{med:.2f}M · {len(rs)}ep", color=CHART_FG, va="center", fontsize=8.5)
+        axes[0].text(hi + max(0.01, hi*.02), y, f"{med:.2f}M · {len(rs)}ep{dollar_note}", color=CHART_FG, va="center", fontsize=8.5)
         shares = [float(r["guardian_share_local"]) for r in rs if math.isfinite(float(r["guardian_share_local"]))]
         smed, slo, shi = _q(shares,.5), _q(shares,.1), _q(shares,.9)
         axes[1].errorbar(smed*100, y, xerr=[[(smed-slo)*100],[(shi-smed)*100]], fmt="o", capsize=4)
@@ -3860,8 +3984,10 @@ def run_self_test() -> None:
                          0, 0, 0, 2, empty_usage, 0, 0, {}, [])
     pa = Analysis([], [], [ep1, ep2], [], [])
     apr = [
-        {"start": d1+timedelta(days=1), "guardian_tokens": 5_000_000, "pair_confidence": "high"},
-        {"start": d2+timedelta(days=1), "guardian_tokens": 10_000_000, "pair_confidence": "medium"},
+        {"start": d1+timedelta(days=1), "guardian_tokens": 5_000_000, "pair_confidence": "high",
+         "guardian_ratecard_usd": 3.25, "guardian_ratecard_base_usd": 3.00, "guardian_long_context_events": 1},
+        {"start": d2+timedelta(days=1), "guardian_tokens": 10_000_000, "pair_confidence": "medium",
+         "guardian_ratecard_usd": 6.50, "guardian_ratecard_base_usd": 6.00, "guardian_long_context_events": 2},
     ]
     pfit = {"status": "supported", "guardian_coef": .2, "guardian_lo": .1, "guardian_hi": .3}
     prows = guardian_period_cost_rows(pa, apr, pfit, argparse.Namespace())
@@ -3870,6 +3996,13 @@ def run_self_test() -> None:
     assert abs(float(prows[0]["estimated_share_of_used_percent"]) - 2.0) < 1e-9
     assert abs(float(prows[1]["estimated_guardian_points"]) - 2.0) < 1e-9
     assert abs(float(prows[1]["estimated_share_of_used_percent"]) - 2.5) < 1e-9
+    assert abs(float(prows[0]["guardian_ratecard_usd"]) - 3.25) < 1e-9
+    # Dedicated rate-card pricing: cached input is discounted; long context applies
+    # request-level multipliers once total input exceeds 272K.
+    rc = _fake_event("2026-02-02T00:00:00Z", 0, reset, model="codex-auto-review",
+                     unc=50_000, cached=250_000, out=10_000, effort="low")
+    base_rc, adj_rc, lc = guardian_ratecard_event_cost(rc, DEFAULT_PRICES)
+    assert lc and adj_rc > base_rc > 0, (base_rc, adj_rc, lc)
 
     print("self-test: OK")
 
@@ -3904,7 +4037,8 @@ def build_parser() -> argparse.ArgumentParser:
       Export parent-paired Guardian approval episodes and quota envelopes.
 
   python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
-      Export estimated Approve-for-me quota cost for each reconstructed reset period.
+      Export estimated Approve-for-me quota cost and public-rate-card $ equivalent
+      for each reconstructed reset period.
 
 Chart setup (recommended):
   python3 -m venv .venv
@@ -4173,7 +4307,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if (not args.no_guardian_audit or args.export_guardian_buckets or args.export_approval_episodes
             or args.export_guardian_periods or args.charts):
         guardian_rows = guardian_bucket_rows(primary_records, args)
-        approval_episodes = build_approval_episodes(primary_records, stats, args, primary)
+        approval_episodes = build_approval_episodes(primary_records, stats, args, primary, prices)
         if approval_episodes:
             guardian_target_fit = guardian_incremental_fit(
                 approval_episodes, args.window_minutes, args.guardian_fit_bootstraps
@@ -4183,7 +4317,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
     if not args.no_guardian_audit:
         print_guardian_audit(primary_records, args, guardian_rows, stats, approval_episodes, primary,
-                             guardian_period_costs, guardian_target_fit)
+                             guardian_period_costs, guardian_target_fit, prices)
 
     print_unpriced(primary.events, prices)
     print_notes(primary)
