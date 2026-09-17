@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.7.
+"""Codex quota audit v2.8.
 
 Analyze local Codex rollout logs and relate observed token usage to Codex quota
 meters. The main historical analysis defaults to the 7-day meter; the Guardian /
@@ -28,6 +28,7 @@ Useful commands:
     python3 codex_quota_audit.py --export-buckets quota_buckets.csv
     python3 codex_quota_audit.py --export-resets reset_ledger.csv
     python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
+    python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
 
 What it does
 ------------
@@ -35,12 +36,15 @@ What it does
 * Uses high-water accounting so stale/backward meter readings do not double-count quota.
 * Detects replayed rollout history from cumulative total_token_usage and excludes it by default.
 * Tracks model and reasoning effort, including provenance/conflict diagnostics.
-* Audits codex-auto-review / Guardian inference, approval reviewer state, and local concurrency.
+* Pairs codex-auto-review / Guardian inference with likely parent work sessions.
+* Groups Guardian calls into approval episodes and measures incremental inference overhead.
+* Associates approval episodes with conservative 5-hour / 7-day quota envelopes.
+* Detects explicit linkage metadata when present, otherwise uses confidence-labelled temporal matching.
 * Discovers and analyzes 5-hour and 7-day quota snapshots when present.
 * Compares model/month and detected model-policy regimes.
 * Estimates token-type quota weights only when the data are identifiable enough to support them.
 * Produces model x effort chart data with whole-episode bootstrap intervals.
-* With --charts, writes the chart CSV plus PNG and SVG directly from this one script.
+* With --charts, writes the model/effort chart and a Guardian approval-overhead chart when enough paired episodes exist.
 
 Raw tokens/cache/model mix are direct observations. API-dollar values use public
 list-price equivalents only as a normalization ruler; they are never plan billing.
@@ -60,11 +64,13 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import hashlib
 import glob
 import json
 import math
 import os
 import random
+import re
 import statistics
 import sys
 import tempfile
@@ -75,7 +81,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.7"
+__version__ = "2.8"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +129,12 @@ DEFAULT_CHART_INTERVAL = 0.80
 DEFAULT_GUARDIAN_PURITY = 0.95
 DEFAULT_GUARDIAN_ISOLATION_SECONDS = 60.0
 DEFAULT_GUARDIAN_WINDOWS = (300, 10080)
+DEFAULT_GUARDIAN_PARENT_MATCH_SECONDS = 300.0
+DEFAULT_GUARDIAN_EPISODE_GAP_SECONDS = 300.0
+DEFAULT_GUARDIAN_CONTEXT_SECONDS = 120.0
+DEFAULT_GUARDIAN_QUOTA_SNAPSHOT_SECONDS = 600.0
+DEFAULT_GUARDIAN_MATCH_TOKEN_RATIO = 2.0
+DEFAULT_GUARDIAN_FIT_BOOTSTRAPS = 300
 EPS = 1e-9
 
 
@@ -150,6 +162,29 @@ class Usage:
 class RateWindow:
     used: float
     reset_at: float
+
+
+@dataclass
+class SessionLinkInfo:
+    """Privacy-safe linkage fingerprints discovered inside one rollout file.
+
+    Values are one-way hashes of ID-like metadata. Raw identifiers are never
+    retained or printed by the analyzer.
+    """
+    own_ids: set[str] = field(default_factory=set)
+    parent_ids: set[str] = field(default_factory=set)
+    schema_paths: Counter = field(default_factory=Counter)
+
+
+@dataclass
+class GuardianPair:
+    guardian_source: str
+    parent_source: Optional[str]
+    confidence: str
+    method: str
+    nearest_seconds: float = float("nan")
+    coverage_60s: float = 0.0
+    ambiguous: bool = False
 
 
 @dataclass
@@ -241,6 +276,9 @@ class ParseStats:
     source_kind_updates: int = 0
     reviewer_state_updates: int = 0
     approval_policy_updates: int = 0
+    session_links: Dict[str, SessionLinkInfo] = field(default_factory=dict)
+    approval_markers: Dict[str, List[Tuple[datetime, str]]] = field(default_factory=dict)
+    link_schema_paths: Counter = field(default_factory=Counter)
 
 
 @dataclass
@@ -563,6 +601,120 @@ def source_kind_from_payload(payload: object) -> Optional[str]:
     return None
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _id_fingerprint(value: object) -> Optional[str]:
+    """Return a privacy-safe fingerprint for an ID-like scalar."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    if len(text) < 6 or len(text) > 256:
+        return None
+    # Paths, prompts, and prose are deliberately rejected. Identifiers are
+    # expected to be compact scalars without path separators or long whitespace.
+    if "/" in text or "\\" in text or "\n" in text or "\r" in text:
+        return None
+    if len(text.split()) > 2:
+        return None
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _rollout_fingerprint(path: str) -> Optional[str]:
+    m = _UUID_RE.search(os.path.basename(path))
+    return _id_fingerprint(m.group(0)) if m else None
+
+
+def _collect_link_ids(payload: object, info: SessionLinkInfo, stats: Optional[ParseStats] = None) -> None:
+    """Discover likely session/thread linkage IDs without retaining raw values.
+
+    Codex schemas evolve. Rather than hard-code one parent field, this walks only
+    metadata already selected by the parser and fingerprints ID-like fields whose
+    paths mention session/thread/conversation/rollout/parent/subagent. Values under
+    source.subagent are treated as parent-side linkage because that object describes
+    how a spawned subagent relates to its origin.
+    """
+    domain = ("session", "thread", "conversation", "rollout", "parent", "subagent", "agent")
+
+    def walk(obj: object, path: Tuple[str, ...], depth: int) -> None:
+        if depth > 7:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = str(k).lower()
+                p2 = path + (key,)
+                walk(v, p2, depth + 1)
+        elif isinstance(obj, list):
+            for v in obj[:64]:
+                walk(v, path + ("[]",), depth + 1)
+        else:
+            if not path:
+                return
+            terminal = path[-1]
+            path_text = ".".join(path)
+            idish = (
+                terminal.endswith("_id")
+                or terminal in {"session", "thread", "conversation", "rollout"}
+                or (terminal == "id" and any(w in path_text for w in domain))
+            )
+            if not idish or not any(w in path_text for w in domain):
+                return
+            fp = _id_fingerprint(obj)
+            if not fp:
+                return
+            schema = ".".join(path[-5:])
+            info.schema_paths[schema] += 1
+            if stats is not None:
+                stats.link_schema_paths[schema] += 1
+            if "parent" in path_text or "source.subagent" in path_text:
+                info.parent_ids.add(fp)
+            else:
+                info.own_ids.add(fp)
+
+    walk(payload, tuple(), 0)
+
+
+def _approval_marker_kind(payload: object, obj_type: object = None) -> Optional[str]:
+    """Detect explicit approval request/decision records without reading content."""
+    if not isinstance(payload, dict):
+        return None
+    ptype = str(payload.get("type") or obj_type or "").strip().lower()
+    if "thread_settings" in ptype:
+        return None
+    keys: List[str] = []
+
+    def collect_keys(x: object, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                keys.append(str(k).lower())
+                if isinstance(v, (dict, list)):
+                    collect_keys(v, depth + 1)
+        elif isinstance(x, list):
+            for v in x[:32]:
+                collect_keys(v, depth + 1)
+
+    collect_keys(payload)
+    signals = " ".join([ptype] + keys)
+    if "approval" not in signals:
+        return None
+    # Settings alone are state, not an approval episode marker.
+    non_state = [k for k in keys if "approval" in k and k not in {"approval_policy", "approvals_reviewer"}]
+    if "approval" not in ptype and not non_state:
+        return None
+    if any(w in signals for w in ("request", "requested", "prompt", "ask")):
+        return "request"
+    if any(w in signals for w in ("decision", "response", "approved", "denied", "reject", "accept")):
+        return "decision"
+    return "approval"
+
+
 def extract_rate_windows(rate_limits: object) -> Dict[int, RateWindow]:
     out: Dict[int, RateWindow] = {}
     if not isinstance(rate_limits, dict) or rate_limits.get("limit_id") != "codex":
@@ -597,6 +749,8 @@ def parse_file(path: str,
     approval_policy: Optional[str] = None
     approvals_reviewer: Optional[str] = None
     source_kind: Optional[str] = None
+    link_info = SessionLinkInfo()
+    approval_markers: List[Tuple[datetime, str]] = []
     prev_total: Optional[Tuple[int, int, int]] = None
     out: List[Event] = []
     source_index = 0
@@ -624,6 +778,13 @@ def parse_file(path: str,
                 or b'"approvals_reviewer"' in raw
                 or b'"thread_settings_applied"' in raw
                 or b'"codex-auto-review"' in raw
+                or b'"parent' in raw
+                or b'"session_id"' in raw
+                or b'"thread_id"' in raw
+                or b'"conversation_id"' in raw
+                or b'"rollout_id"' in raw
+                or b'"subagent"' in raw
+                or b'"approval' in raw
             )
             if not is_usage_hint and not metadata_hint:
                 continue
@@ -636,6 +797,15 @@ def parse_file(path: str,
             payload = obj.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
+
+            _collect_link_ids(payload, link_info, stats)
+            marker_kind = _approval_marker_kind(payload, obj.get("type"))
+            if marker_kind is not None:
+                try:
+                    marker_ts = parse_timestamp(obj["timestamp"])
+                    approval_markers.append((marker_ts, marker_kind))
+                except (KeyError, TypeError, ValueError):
+                    pass
 
             new_model = model_from_payload(payload)
             if new_model is not None:
@@ -745,6 +915,14 @@ def parse_file(path: str,
             source_index += 1
             stats.candidate_events += 1
 
+    path_fp = _rollout_fingerprint(path)
+    if path_fp:
+        link_info.own_ids.add(path_fp)
+    if link_info.own_ids or link_info.parent_ids or link_info.schema_paths:
+        stats.session_links[path] = link_info
+    if approval_markers:
+        # De-duplicate identical marker records that are sometimes emitted twice.
+        stats.approval_markers[path] = sorted(set(approval_markers), key=lambda x: x[0])
     return out
 
 def event_identity(e: Event) -> Tuple[object, ...]:
@@ -1990,6 +2168,428 @@ def _has_nearby_non_auto_review(non_auto_times: Sequence[float],
     return i < len(non_auto_times) and non_auto_times[i] <= hi
 
 
+def _source_events(events: Sequence[Event]) -> Dict[str, List[Event]]:
+    out: Dict[str, List[Event]] = defaultdict(list)
+    for e in events:
+        out[e.source].append(e)
+    for evs in out.values():
+        evs.sort(key=lambda e: (e.ts, e.ts_raw, e.source_index))
+    return dict(out)
+
+
+def _nearest_distances(a: Sequence[Event], b: Sequence[Event]) -> List[float]:
+    if not a or not b:
+        return []
+    bt = [e.ts.timestamp() for e in b]
+    out: List[float] = []
+    for e in a:
+        t = e.ts.timestamp()
+        i = bisect.bisect_left(bt, t)
+        ds = []
+        if i < len(bt):
+            ds.append(abs(bt[i] - t))
+        if i > 0:
+            ds.append(abs(bt[i - 1] - t))
+        if ds:
+            out.append(min(ds))
+    return out
+
+
+def _pair_guardian_group(group: Sequence[Event], guardian_source: str,
+                         by_source: Dict[str, List[Event]], stats: ParseStats,
+                         args: argparse.Namespace) -> GuardianPair:
+    """Pair one Guardian burst to a likely parent session.
+
+    Explicit privacy-safe ID linkage wins. When the schema exposes no usable
+    linkage, use reviewer state + temporal proximity and label the confidence.
+    """
+    if not group:
+        return GuardianPair(guardian_source, None, "unpaired", "none")
+    non_guardian = {
+        src: evs for src, evs in by_source.items()
+        if src != guardian_source and not any(e.is_auto_review_inference for e in evs)
+    }
+    if not non_guardian:
+        return GuardianPair(guardian_source, None, "unpaired", "none")
+
+    glink = stats.session_links.get(guardian_source, SessionLinkInfo())
+
+    def temporal_rank(src: str) -> Tuple[float, float, float, float]:
+        evs = non_guardian[src]
+        ds = _nearest_distances(group, evs)
+        if not ds:
+            return (0.0, 0.0, float("inf"), float("inf"))
+        cov60 = sum(d <= 60.0 for d in ds) / len(ds)
+        covmatch = sum(d <= args.guardian_parent_match_seconds for d in ds) / len(ds)
+        return (cov60, covmatch, statistics.median(ds), min(ds))
+
+    explicit = []
+    shared = []
+    for src in non_guardian:
+        plink = stats.session_links.get(src, SessionLinkInfo())
+        if glink.parent_ids & plink.own_ids:
+            explicit.append(src)
+        elif glink.own_ids & plink.own_ids:
+            shared.append(src)
+
+    if explicit or shared:
+        pool = explicit or shared
+        ranked = sorted(pool, key=lambda src: (-temporal_rank(src)[0], -temporal_rank(src)[1],
+                                               temporal_rank(src)[2], temporal_rank(src)[3], src))
+        best = ranked[0]
+        cov60, _covmatch, med, nearest = temporal_rank(best)
+        ambiguous = len(ranked) > 1 and temporal_rank(ranked[1])[:2] == temporal_rank(best)[:2]
+        method = "explicit-parent-id" if explicit else "shared-link-id"
+        confidence = "high" if not ambiguous else "medium"
+        return GuardianPair(guardian_source, best, confidence, method, nearest, cov60, ambiguous)
+
+    # Prefer normal sessions that actually carried auto_review reviewer state.
+    reviewer_pool = [
+        src for src, evs in non_guardian.items()
+        if any(e.approvals_reviewer == "auto_review" for e in evs)
+    ]
+    pool = reviewer_pool or list(non_guardian)
+    scored = []
+    for src in pool:
+        cov60, covmatch, med, nearest = temporal_rank(src)
+        if nearest <= args.guardian_parent_match_seconds:
+            scored.append((src, cov60, covmatch, med, nearest))
+    if not scored:
+        return GuardianPair(guardian_source, None, "unpaired", "no-nearby-parent")
+    scored.sort(key=lambda x: (-x[1], -x[2], x[3], x[4], x[0]))
+    best = scored[0]
+    ambiguous = False
+    if len(scored) > 1:
+        second = scored[1]
+        ambiguous = (abs(best[1] - second[1]) < 0.10 and
+                     abs(best[2] - second[2]) < 0.10 and
+                     abs(best[4] - second[4]) <= 10.0)
+    if ambiguous:
+        confidence = "low"
+    elif best[1] >= 0.50 or (best[4] <= 15.0 and best[1] > 0):
+        confidence = "medium"
+    else:
+        confidence = "low"
+    method = "temporal+reviewer" if reviewer_pool else "temporal"
+    return GuardianPair(guardian_source, best[0], confidence, method, best[4], best[1], ambiguous)
+
+
+def _split_event_groups(events: Sequence[Event], gap_seconds: float) -> List[List[Event]]:
+    if not events:
+        return []
+    evs = sorted(events, key=lambda e: (e.ts, e.ts_raw, e.source_index))
+    groups: List[List[Event]] = [[evs[0]]]
+    for e in evs[1:]:
+        if (e.ts - groups[-1][-1].ts).total_seconds() > gap_seconds:
+            groups.append([e])
+        else:
+            groups[-1].append(e)
+    return groups
+
+
+def _dominant_value(events: Sequence[Event], attr: str) -> str:
+    weights: Dict[str, int] = defaultdict(int)
+    for e in events:
+        value = str(getattr(e, attr, "unknown") or "unknown")
+        weights[value] += max(e.tokens, 1)
+    return max(weights.items(), key=lambda kv: kv[1])[0] if weights else "unknown"
+
+
+def _build_quota_snapshot_indexes(events: Sequence[Event], args: argparse.Namespace) -> Dict[int, Dict[str, object]]:
+    indexes: Dict[int, Dict[str, object]] = {}
+    for minutes in discovered_windows(events):
+        wevs = events_for_window(events, minutes)
+        if not wevs:
+            continue
+        wevs = sorted(wevs, key=lambda e: (e.ts, e.ts_raw, e.source))
+        times = [e.ts.timestamp() for e in wevs]
+        raw_keys = [reset_key(e.reset_at, args.reset_tolerance) for e in wevs]
+        highs: List[float] = []
+        high_by_key: Dict[int, float] = {}
+        for e, rk in zip(wevs, raw_keys):
+            high_by_key[rk] = max(high_by_key.get(rk, e.used), e.used)
+            highs.append(high_by_key[rk])
+        indexes[minutes] = {"events": wevs, "times": times, "raw_keys": raw_keys, "highs": highs}
+    return indexes
+
+
+def _quota_envelope(index: Dict[str, object], start: datetime, end: datetime,
+                    max_gap_seconds: float) -> Dict[str, object]:
+    evs = index["events"]
+    times = index["times"]
+    raw_keys = index["raw_keys"]
+    highs = index["highs"]
+    assert isinstance(evs, list) and isinstance(times, list)
+    st = start.timestamp()
+    en = end.timestamp()
+    before_i = bisect.bisect_left(times, st) - 1
+    after_i = bisect.bisect_left(times, en)
+    if before_i < 0 or after_i >= len(evs):
+        return {"status": "missing-snapshot", "points": float("nan")}
+    before = evs[before_i]
+    after = evs[after_i]
+    before_gap = st - times[before_i]
+    after_gap = times[after_i] - en
+    if before_gap > max_gap_seconds or after_gap > max_gap_seconds:
+        return {"status": "stale-snapshot", "points": float("nan"),
+                "before_gap_s": before_gap, "after_gap_s": after_gap}
+    if raw_keys[before_i] != raw_keys[after_i]:
+        return {"status": "reset-boundary", "points": float("nan"),
+                "before_used": before.used, "after_used": after.used}
+    points = max(0.0, float(highs[after_i]) - float(highs[before_i]))
+    return {
+        "status": "ok", "points": points,
+        "before_used": before.used, "after_used": after.used,
+        "before_high": float(highs[before_i]), "after_high": float(highs[after_i]),
+        "before_gap_s": before_gap, "after_gap_s": after_gap,
+    }
+
+
+def _policy_regimes_for_approval_matching(primary: Analysis, args: argparse.Namespace) -> List[PolicyRegime]:
+    rows = _dominant_weight_rows(primary.buckets, args.weight_model_purity)
+    return detect_policy_regimes(
+        rows, args.min_price_coverage, args.regime_min_episodes, args.regime_min_points,
+        args.regime_min_ratio, args.regime_min_improvement,
+    )
+
+
+def _regime_label(regimes: Sequence[PolicyRegime], model: str, ts: datetime) -> str:
+    for reg in regimes:
+        if reg.model == model and reg.start_ts <= ts <= reg.end_ts:
+            return reg.label
+    return "unknown"
+
+
+def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: argparse.Namespace,
+                            primary: Optional[Analysis] = None) -> List[Dict[str, object]]:
+    """Build Guardian approval episodes and pair them to likely parent work."""
+    by_source = _source_events(events)
+    quota_indexes = _build_quota_snapshot_indexes(events, args)
+    regimes = _policy_regimes_for_approval_matching(primary, args) if primary is not None else []
+    rows: List[Dict[str, object]] = []
+    episode_id = 0
+
+    for src, sev in sorted(by_source.items()):
+        auto = [e for e in sev if e.is_auto_review_inference]
+        if not auto:
+            continue
+        for group in _split_event_groups(auto, args.guardian_episode_gap_seconds):
+            episode_id += 1
+            pair = _pair_guardian_group(group, src, by_source, stats, args)
+            parent_all = by_source.get(pair.parent_source or "", [])
+            start, end = group[0].ts, group[-1].ts
+            lo = start - timedelta(seconds=args.guardian_context_seconds)
+            hi = end + timedelta(seconds=args.guardian_context_seconds)
+            parent_context = [e for e in parent_all if lo <= e.ts <= hi and not e.is_auto_review_inference]
+            parent_before = [e for e in parent_context if e.ts < start]
+            parent_during = [e for e in parent_context if start <= e.ts <= end]
+            parent_after = [e for e in parent_context if e.ts > end]
+            model = _dominant_value(parent_context or parent_all, "model")
+            effort = _dominant_value(parent_context or parent_all, "effort")
+            unc, cached, out, reasoning = _event_token_totals(group)
+            guardian_tokens = unc + cached + out
+            parent_tokens = sum(e.tokens for e in parent_context)
+            markers = []
+            if pair.parent_source:
+                markers = [m for m in stats.approval_markers.get(pair.parent_source, []) if lo <= m[0] <= hi]
+            row: Dict[str, object] = {
+                "episode_id": episode_id,
+                "guardian_source": src,
+                "parent_source": pair.parent_source or "",
+                "pair_confidence": pair.confidence,
+                "pair_method": pair.method,
+                "pair_ambiguous": pair.ambiguous,
+                "nearest_parent_seconds": pair.nearest_seconds,
+                "parent_coverage_60s": pair.coverage_60s,
+                "start": start, "end": end,
+                "duration_seconds": max(0.0, (end - start).total_seconds()),
+                "guardian_events": len(group),
+                "guardian_tokens": guardian_tokens,
+                "guardian_uncached": unc, "guardian_cached": cached, "guardian_output": out,
+                "guardian_reasoning_output": reasoning,
+                "parent_tokens_before": sum(e.tokens for e in parent_before),
+                "parent_tokens_during": sum(e.tokens for e in parent_during),
+                "parent_tokens_after": sum(e.tokens for e in parent_after),
+                "parent_tokens": parent_tokens,
+                "parent_events": len(parent_context),
+                "parent_model": model, "parent_effort": effort,
+                "policy_regime": _regime_label(regimes, model, start),
+                "approval_markers_nearby": len(markers),
+                "guardian_share_local": guardian_tokens / (guardian_tokens + parent_tokens)
+                    if guardian_tokens + parent_tokens else float("nan"),
+            }
+            for minutes, idx in quota_indexes.items():
+                q = _quota_envelope(idx, start, end, args.guardian_quota_snapshot_seconds)
+                prefix = f"quota_{minutes}m_"
+                row[prefix + "status"] = q.get("status", "unknown")
+                row[prefix + "points"] = q.get("points", float("nan"))
+                row[prefix + "before"] = q.get("before_high", q.get("before_used", float("nan")))
+                row[prefix + "after"] = q.get("after_high", q.get("after_used", float("nan")))
+            rows.append(row)
+    return rows
+
+
+def build_manual_approval_episodes(events: Sequence[Event], stats: ParseStats, args: argparse.Namespace,
+                                   primary: Optional[Analysis] = None) -> List[Dict[str, object]]:
+    """Build best-effort manual-approval controls from explicit approval markers."""
+    by_source = _source_events(events)
+    quota_indexes = _build_quota_snapshot_indexes(events, args)
+    regimes = _policy_regimes_for_approval_matching(primary, args) if primary is not None else []
+    rows: List[Dict[str, object]] = []
+    mid = 0
+    for src, markers in stats.approval_markers.items():
+        sev = by_source.get(src, [])
+        if not sev or not any(e.approvals_reviewer == "user" for e in sev):
+            continue
+        # Prefer request markers; if a schema only exposes generic approval markers, keep those.
+        chosen = [m for m in markers if m[1] == "request"] or [m for m in markers if m[1] == "approval"]
+        if not chosen:
+            continue
+        pseudo = []
+        for ts, _kind in chosen:
+            pseudo.append(Event(ts.isoformat(), ts, src, "unknown", 0, 0, 0, 0.0, 0.0,
+                                args.window_minutes, False, None))
+        for grp in _split_event_groups(pseudo, args.guardian_episode_gap_seconds):
+            mid += 1
+            start, end = grp[0].ts, grp[-1].ts
+            lo = start - timedelta(seconds=args.guardian_context_seconds)
+            hi = end + timedelta(seconds=args.guardian_context_seconds)
+            ctx = [e for e in sev if lo <= e.ts <= hi and not e.is_auto_review_inference]
+            if not ctx:
+                continue
+            model = _dominant_value(ctx, "model")
+            effort = _dominant_value(ctx, "effort")
+            row: Dict[str, object] = {
+                "episode_id": mid, "source": src, "start": start, "end": end,
+                "parent_tokens": sum(e.tokens for e in ctx), "parent_events": len(ctx),
+                "parent_model": model, "parent_effort": effort,
+                "policy_regime": _regime_label(regimes, model, start),
+            }
+            for minutes, idx in quota_indexes.items():
+                q = _quota_envelope(idx, start, end, args.guardian_quota_snapshot_seconds)
+                prefix = f"quota_{minutes}m_"
+                row[prefix + "status"] = q.get("status", "unknown")
+                row[prefix + "points"] = q.get("points", float("nan"))
+            rows.append(row)
+    return rows
+
+
+def _matched_manual_pairs(auto_rows: Sequence[Dict[str, object]], manual_rows: Sequence[Dict[str, object]],
+                          minutes: int, token_ratio: float) -> List[Tuple[Dict[str, object], Dict[str, object]]]:
+    usable_manual = [r for r in manual_rows if r.get(f"quota_{minutes}m_status") == "ok"]
+    used = set()
+    pairs = []
+    for a in auto_rows:
+        if a.get("pair_confidence") not in {"high", "medium"}:
+            continue
+        if a.get(f"quota_{minutes}m_status") != "ok":
+            continue
+        atok = max(float(a.get("parent_tokens", 0) or 0), 1.0)
+        candidates = []
+        for i, m in enumerate(usable_manual):
+            if i in used:
+                continue
+            if (m.get("parent_model") != a.get("parent_model") or
+                    m.get("parent_effort") != a.get("parent_effort") or
+                    m.get("policy_regime") != a.get("policy_regime") or
+                    m.get("policy_regime") == "unknown"):
+                continue
+            mtok = max(float(m.get("parent_tokens", 0) or 0), 1.0)
+            ratio = max(atok / mtok, mtok / atok)
+            if ratio > token_ratio:
+                continue
+            dt = abs((m["start"] - a["start"]).total_seconds())
+            candidates.append((abs(math.log(atok / mtok)), dt, i, m))
+        if candidates:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            _lr, _dt, i, m = candidates[0]
+            used.add(i)
+            pairs.append((a, m))
+    return pairs
+
+
+def _nnls_two_feature(rows: Sequence[Tuple[float, float, float]]) -> Tuple[float, float, float, float]:
+    """Tiny non-negative least-squares solver for y ~= b1*x1 + b2*x2."""
+    if not rows:
+        return 0.0, 0.0, float("inf"), float("inf")
+    a = sum(x1*x1 for x1, _x2, _y in rows)
+    b = sum(x1*x2 for x1, x2, _y in rows)
+    c = sum(x2*x2 for _x1, x2, _y in rows)
+    d = sum(x1*y for x1, _x2, y in rows)
+    e = sum(x2*y for _x1, x2, y in rows)
+    candidates = [(0.0, 0.0)]
+    if a > EPS:
+        candidates.append((max(0.0, d/a), 0.0))
+    if c > EPS:
+        candidates.append((0.0, max(0.0, e/c)))
+    det = a*c - b*b
+    if det > EPS:
+        b1 = (d*c - e*b) / det
+        b2 = (e*a - d*b) / det
+        if b1 >= 0 and b2 >= 0:
+            candidates.append((b1, b2))
+    def sse(beta: Tuple[float, float]) -> float:
+        return sum((y - beta[0]*x1 - beta[1]*x2)**2 for x1, x2, y in rows)
+    best = min(candidates, key=sse)
+    parent_only = sse((max(0.0, d/a) if a > EPS else 0.0, 0.0))
+    rho = b / math.sqrt(a*c) if a > EPS and c > EPS else 1.0
+    rho = min(max(rho, 0.0), 0.999999999)
+    condition = math.sqrt((1.0 + rho) / max(1e-12, 1.0 - rho))
+    improve = 1.0 - sse(best) / parent_only if parent_only > EPS else 0.0
+    return best[0], best[1], condition, improve
+
+
+def guardian_incremental_fit(episodes: Sequence[Dict[str, object]], minutes: int,
+                             boots: int) -> Dict[str, object]:
+    rows = []
+    groups: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
+    for r in episodes:
+        if r.get("pair_confidence") not in {"high", "medium"}:
+            continue
+        if r.get(f"quota_{minutes}m_status") != "ok":
+            continue
+        parent = float(r.get("parent_tokens", 0) or 0) / 1e6
+        guardian = float(r.get("guardian_tokens", 0) or 0) / 1e6
+        points = float(r.get(f"quota_{minutes}m_points", 0) or 0)
+        if parent <= 0 or guardian <= 0:
+            continue
+        row = (parent, guardian, points)
+        rows.append(row)
+        groups[str(r.get("parent_source", ""))].append(row)
+    if len(rows) < 30 or len(groups) < 5 or sum(r[2] for r in rows) < 10:
+        return {"status": "not identifiable", "reason": "insufficient independent approval episodes",
+                "episodes": len(rows), "sessions": len(groups)}
+    bp, bg, cond, improve = _nnls_two_feature(rows)
+    if cond > 20.0:
+        return {"status": "not identifiable", "reason": f"parent/Guardian workload is too collinear (condition={cond:.1f})",
+                "episodes": len(rows), "sessions": len(groups), "condition": cond}
+    if bg <= EPS or improve < 0.05:
+        return {"status": "not identifiable", "reason": "Guardian term adds too little stable explanatory value",
+                "episodes": len(rows), "sessions": len(groups), "condition": cond, "improvement": improve}
+    rng = random.Random(_stable_seed("guardian-fit", minutes, len(rows), len(groups)))
+    keys = sorted(groups)
+    gb = []
+    for _ in range(max(0, boots)):
+        sample = []
+        for _j in range(len(keys)):
+            k = rng.choice(keys)
+            sample.extend(groups[k])
+        _p, g, _c, _i = _nnls_two_feature(sample)
+        gb.append(g)
+    if len(gb) < 50:
+        return {"status": "not identifiable", "reason": "too few bootstrap replicates",
+                "episodes": len(rows), "sessions": len(groups)}
+    lo, med, hi = _q(gb, .10), _q(gb, .50), _q(gb, .90)
+    positive = sum(x > EPS for x in gb) / len(gb)
+    if lo <= EPS or positive < .80 or (lo > EPS and hi / lo > 10.0):
+        return {"status": "not identifiable", "reason": "Guardian coefficient is unstable across parent-session bootstrap resamples",
+                "episodes": len(rows), "sessions": len(groups), "condition": cond,
+                "bootstrap_positive": positive}
+    return {"status": "supported", "episodes": len(rows), "sessions": len(groups),
+            "parent_coef": bp, "guardian_coef": bg, "guardian_lo": lo, "guardian_med": med,
+            "guardian_hi": hi, "condition": cond, "improvement": improve}
+
+
 def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> List[Dict[str, object]]:
     """Build conservative attribution rows for every requested/discovered limit window.
 
@@ -2049,26 +2649,31 @@ def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> L
 
 
 def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
-                         rows: Optional[Sequence[Dict[str, object]]] = None) -> None:
-    print("\nGuardian / auto-review audit")
-    print("----------------------------")
+                         rows: Optional[Sequence[Dict[str, object]]] = None,
+                         stats: Optional[ParseStats] = None,
+                         approval_episodes: Optional[Sequence[Dict[str, object]]] = None,
+                         primary: Optional[Analysis] = None) -> None:
+    print("\
+Guardian / auto-review approval audit")
+    print("-------------------------------------")
     auto = [e for e in events if e.is_auto_review_inference]
     confirmed = [e for e in auto if e.is_confirmed_guardian]
     parent_auto = [e for e in events if not e.is_auto_review_inference
                    and e.approvals_reviewer == "auto_review"]
     parent_user = [e for e in events if not e.is_auto_review_inference
                    and e.approvals_reviewer == "user"]
+    stats = stats or ParseStats()
 
-    print("`codex-auto-review` inference is reported separately from ordinary parent work.")
-    print("Quota movement is account-global, so only conservative local-isolation evidence")
-    print("is shown; it is not exact causal attribution to the approval setting.\n")
+    print("Guardian is treated as extra inference spawned by normal work, not as unrelated")
+    print("background activity. Parent + Guardian are grouped into approval episodes; quota")
+    print("movement remains account-global and is therefore reported as an observed envelope.\
+")
 
     if not auto:
         print("No codex-auto-review inference events were found after replay filtering.")
     else:
         unc, cached, out, reasoning = _event_token_totals(auto)
         total = unc + cached + out
-        cache = _cache_ratio_events(auto)
         print(f"auto-review inference sessions:     {_session_count(auto):,}")
         print(f"confirmed subagent sessions:        {_session_count(confirmed):,}")
         print(f"auto-review inference events:       {len(auto):,}")
@@ -2077,26 +2682,44 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
         print(f"  cached input:                     {cached / 1e6:,.1f}M")
         print(f"  output:                           {out / 1e6:,.1f}M")
         print(f"  reasoning output (subset/field):  {reasoning / 1e6:,.1f}M")
-        print(f"  cached share of input:            {fmt_pct_ratio(cache)}")
+        print(f"  cached share of input:            {fmt_pct_ratio(_cache_ratio_events(auto))}")
 
-        # Event-level concurrency is a diagnostic, not quota attribution.
-        non_auto_times = _non_auto_review_timestamps(events)
-        isolated_events = []
-        concurrent_events = []
-        for e in auto:
-            if _has_nearby_non_auto_review(
-                non_auto_times, e.ts, e.ts, args.guardian_isolation_seconds
-            ):
-                concurrent_events.append(e)
-            else:
-                isolated_events.append(e)
-        iso_tokens = sum(e.tokens for e in isolated_events)
-        print(f"locally isolated auto-review events:{len(isolated_events):>11,} "
-              f"({iso_tokens / 1e6:,.1f}M tokens)")
-        print(f"concurrent/nearby events:           {len(concurrent_events):>11,} "
-              f"(±{args.guardian_isolation_seconds:g}s local-log test)")
+    if approval_episodes is None:
+        approval_episodes = build_approval_episodes(events, stats, args, primary)
+    episodes = list(approval_episodes)
+    print("\
+Parent ↔ Guardian pairing and approval episodes")
+    print("-----------------------------------------------")
+    if not episodes:
+        print("No Guardian approval episodes could be constructed.")
+    else:
+        counts = Counter(str(r.get("pair_confidence", "unpaired")) for r in episodes)
+        methods = Counter(str(r.get("pair_method", "none")) for r in episodes)
+        paired = [r for r in episodes if r.get("parent_source")]
+        good = [r for r in episodes if r.get("pair_confidence") in {"high", "medium"}]
+        marker_hits = sum(int(r.get("approval_markers_nearby", 0) or 0) > 0 for r in episodes)
+        print(f"approval episodes:                   {len(episodes):,}")
+        print(f"paired to a parent session:          {len(paired):,}")
+        print(f"  high confidence:                   {counts.get('high', 0):,}")
+        print(f"  medium confidence:                 {counts.get('medium', 0):,}")
+        print(f"  low confidence:                    {counts.get('low', 0):,}")
+        print(f"  unpaired:                          {counts.get('unpaired', 0):,}")
+        print(f"episodes with explicit approval marker nearby: {marker_hits:,}")
+        explicit_n = sum(v for k, v in methods.items() if k in {"explicit-parent-id", "shared-link-id"})
+        print(f"episodes paired via discovered linkage IDs:    {explicit_n:,}")
+        if good:
+            gt = [float(r["guardian_tokens"]) for r in good]
+            shares = [float(r["guardian_share_local"]) for r in good
+                      if float(r.get("guardian_share_local", float('nan'))) == float(r.get("guardian_share_local", float('nan')))]
+            print(f"Guardian tokens / approval p10/p50/p90: "
+                  f"{_q(gt,.10)/1e6:.2f}M / {_q(gt,.50)/1e6:.2f}M / {_q(gt,.90)/1e6:.2f}M")
+            if shares:
+                print(f"Guardian share of local parent+review context, median: {_q(shares,.50):.0%}")
+            print("Pairing uses explicit hashed linkage metadata when available; otherwise temporal")
+            print("proximity and reviewer state are used and confidence is downgraded accordingly.")
 
-    print("\nReviewer setting observed on non-auto-review work")
+    print("\
+Reviewer setting observed on non-auto-review work")
     print("-------------------------------------------------")
     print(f"{'reviewer':<14} {'sessions':>9} {'events':>10} {'tokens M':>11} {'cache':>7}")
     for name, evs in (("auto_review", parent_auto), ("user", parent_user)):
@@ -2105,60 +2728,77 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
             continue
         print(f"{name:<14} {_session_count(evs):>9,} {len(evs):>10,} "
               f"{sum(e.tokens for e in evs)/1e6:>11.1f} {fmt_pct_ratio(_cache_ratio_events(evs)):>7}")
-    print("These rows describe workload while a reviewer mode was active; they are not the")
-    print("incremental cost of that reviewer mode.")
+    print("These rows describe parent workload under each reviewer setting; Guardian inference")
+    print("itself is kept separate above.")
+
+    available = discovered_windows(events)
+    print("\
+Approval-episode quota envelopes")
+    print("--------------------------------")
+    if available:
+        print("discovered windows: " + ", ".join(f"{window_label(w)} ({w}m)" for w in available))
+    print(f"{'limit':<7} {'usable ep':>9} {'obs pt':>8} {'Guardian M':>11} {'parent M':>10} {'G M/obs pt':>11}")
+    for minutes in available:
+        usable = [r for r in episodes if r.get("pair_confidence") in {"high", "medium"}
+                  and r.get(f"quota_{minutes}m_status") == "ok"]
+        pts = sum(float(r.get(f"quota_{minutes}m_points", 0) or 0) for r in usable)
+        gt = sum(int(r.get("guardian_tokens", 0) or 0) for r in usable)
+        pt = sum(int(r.get("parent_tokens", 0) or 0) for r in usable)
+        ratio = gt / 1e6 / pts if pts > EPS else float("nan")
+        print(f"{window_label(minutes):<7} {len(usable):>9,} {pts:>8.0f} {gt/1e6:>11.1f} {pt/1e6:>10.1f} "
+              f"{(f'{ratio:.2f}' if ratio == ratio else 'n/a'):>11}")
+        if auto and not any(e.is_auto_review_inference and minutes in e.rate_windows for e in events):
+            print(f"        note: no codex-auto-review events overlap retained {window_label(minutes)} telemetry.")
+    print("Observed points are the account-global high-water change between fresh snapshots")
+    print("around the approval episode. They include parent work and any other account activity;")
+    print("they are not quota points attributed solely to Guardian.")
+
+    # Best-effort manual approval controls from explicit request markers.
+    manual = build_manual_approval_episodes(events, stats, args, primary)
+    print("\
+Matched manual-approval comparison")
+    print("----------------------------------")
+    if not manual:
+        print("No explicit user-approval request markers were detected in usable user-review sessions.")
+        print("Matched causal comparison is unavailable; reviewer-mode aggregates are shown below instead.")
+    else:
+        print(f"manual approval episodes detected: {len(manual):,}")
+        for minutes in available:
+            pairs = _matched_manual_pairs(episodes, manual, minutes, args.guardian_match_token_ratio)
+            if not pairs:
+                continue
+            apts = sum(float(a.get(f"quota_{minutes}m_points", 0) or 0) for a, _m in pairs)
+            mpts = sum(float(m.get(f"quota_{minutes}m_points", 0) or 0) for _a, m in pairs)
+            aparent = sum(int(a.get("parent_tokens", 0) or 0) for a, _m in pairs)
+            mparent = sum(int(m.get("parent_tokens", 0) or 0) for _a, m in pairs)
+            guardian = sum(int(a.get("guardian_tokens", 0) or 0) for a, _m in pairs)
+            print(f"{window_label(minutes)}: {len(pairs)} matched pairs, "
+                  f"auto episodes {apts:.0f} observed pt on {(aparent+guardian)/1e6:.1f}M local tokens; "
+                  f"manual {mpts:.0f} pt on {mparent/1e6:.1f}M")
+        print("Matches require the same parent model, reasoning effort, detected policy regime,")
+        print(f"and parent-token workload within {args.guardian_match_token_ratio:g}x. Results remain observational.")
+
+    print("\
+Incremental Guardian quota fit (exploratory)")
+    print("--------------------------------------------")
+    for minutes in available:
+        fit = guardian_incremental_fit(episodes, minutes, args.guardian_fit_bootstraps)
+        if fit.get("status") != "supported":
+            if fit.get("episodes", 0):
+                print(f"{window_label(minutes)}: not identifiable ({fit.get('reason')}; "
+                      f"{fit.get('episodes')} episodes / {fit.get('sessions')} parent sessions)")
+            continue
+        g = float(fit["guardian_coef"])
+        lo, med, hi = float(fit["guardian_lo"]), float(fit["guardian_med"]), float(fit["guardian_hi"])
+        inv = 1.0 / g if g > EPS else float("nan")
+        print(f"{window_label(minutes)}: provisional Guardian coefficient {g:.3f} quota pt/Mtok "
+              f"(bootstrap median {med:.3f}, 80% {lo:.3f}-{hi:.3f}); ~{inv:.2f}M Guardian tok/pt")
+        print("        This is an account-global observational fit, not an internal OpenAI quota formula.")
 
     if rows is None:
         rows = guardian_bucket_rows(events, args)
-
-    available = discovered_windows(events)
-    print("\nRate-limit coverage and auto-review attribution")
-    print("-----------------------------------------------")
-    if available:
-        print("discovered windows: " + ", ".join(
-            f"{window_label(w)} ({w}m)" for w in available
-        ))
-    else:
-        print("No rate-limit windows found.")
-        return
-
-    header = (f"{'limit':<7} {'records':>8} {'span':>23} {'hw pt':>7} "
-              f"{'present':>8} {'dominant':>9} {'exclusive':>10} {'isolated':>9} {'iso Mtok/pt':>11}")
-    print(header)
-
-    for minutes in available:
-        wevs = events_for_window(events, minutes)
-        wr = [r for r in rows if int(r["window_minutes"]) == minutes]
-        total_points = sum(float(r["points"]) for r in wr)
-        present_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_present"]))
-        dominant_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_dominant"]))
-        exclusive_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_exclusive"]))
-        isolated_rows = [r for r in wr if bool(r["locally_isolated"])]
-        isolated_points = sum(float(r["points"]) for r in isolated_rows)
-        isolated_tokens = sum(int(r["auto_review_tokens"]) for r in isolated_rows)
-        mtok_pt = isolated_tokens / 1e6 / isolated_points if isolated_points > EPS else float("nan")
-        if wevs:
-            span = f"{wevs[0].ts.strftime('%m-%d')}..{wevs[-1].ts.strftime('%m-%d')}"
-        else:
-            span = "n/a"
-        print(f"{window_label(minutes):<7} {len(wevs):>8,} {span:>23} {total_points:>7.0f} "
-              f"{present_points:>8.0f} {dominant_points:>9.0f} {exclusive_points:>10.0f} "
-              f"{isolated_points:>9.0f} "
-              f"{(f'{mtok_pt:.2f}' if mtok_pt == mtok_pt else 'n/a'):>11}")
-
-        auto_window = [e for e in wevs if e.is_auto_review_inference]
-        if auto and not auto_window:
-            print(f"        note: no codex-auto-review events in retained {window_label(minutes)} telemetry.")
-
-    print("\nColumn semantics:")
-    print("  present   = high-water points in buckets containing any codex-auto-review tokens")
-    print(f"  dominant  = points where codex-auto-review is >= {args.guardian_purity:.0%} of raw tokens")
-    print("  exclusive = points where all locally logged token work in the bucket is codex-auto-review")
-    print(f"  isolated  = exclusive plus no non-auto-review token event within ±{args.guardian_isolation_seconds:g}s")
-    print("`present` is an upper envelope, not attributable usage. `isolated` is the strongest")
-    print("local evidence, but still cannot exclude activity missing from this machine's logs.")
-
-    print("\nReviewer-mode quota buckets (descriptive, not causal)")
+    print("\
+Reviewer-mode quota buckets (descriptive, not causal)")
     print("---------------------------------------------------")
     print(f"Buckets require >= {args.guardian_purity:.0%} raw-token purity for the reviewer mode and")
     print("exclude buckets containing codex-auto-review inference. Model/time/policy mix can still confound them.")
@@ -2181,7 +2821,6 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
             print(f"{window_label(minutes):<7} {reviewer:<12} {pts:>7.0f} {len(pure):>8,} "
                   f"{toks/1e6:>10.1f} {(f'{mtok_pt:.2f}' if mtok_pt == mtok_pt else 'n/a'):>9}")
 
-
 def export_guardian_buckets_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
     fields = [
         "window_minutes", "window", "reset_key", "start", "end", "points", "events",
@@ -2198,6 +2837,29 @@ def export_guardian_buckets_csv(path: str, rows: Sequence[Dict[str, object]]) ->
                 value = cooked.get(key)
                 if isinstance(value, datetime):
                     cooked[key] = value.isoformat()
+            w.writerow({k: cooked.get(k, "") for k in fields})
+
+
+def export_approval_episodes_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    base = [
+        "episode_id", "start", "end", "duration_seconds", "pair_confidence", "pair_method",
+        "pair_ambiguous", "nearest_parent_seconds", "parent_coverage_60s", "guardian_events",
+        "guardian_tokens", "guardian_uncached", "guardian_cached", "guardian_output",
+        "guardian_reasoning_output", "parent_tokens_before", "parent_tokens_during",
+        "parent_tokens_after", "parent_tokens", "parent_events", "parent_model", "parent_effort",
+        "policy_regime", "approval_markers_nearby", "guardian_share_local",
+    ]
+    quota_fields = sorted({k for r in rows for k in r if k.startswith("quota_")})
+    fields = base + quota_fields
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            cooked = dict(row)
+            for key in ("start", "end"):
+                if isinstance(cooked.get(key), datetime):
+                    cooked[key] = cooked[key].isoformat()
+            # File paths/opaque session IDs are intentionally omitted.
             w.writerow({k: cooked.get(k, "") for k in fields})
 
 
@@ -2598,6 +3260,63 @@ def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
     return png, svg
 
 
+def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str) -> Tuple[str, str]:
+    """Render Guardian overhead by paired parent model/effort."""
+    good = [r for r in rows if r.get("pair_confidence") in {"high", "medium"}
+            and int(r.get("parent_tokens", 0) or 0) > 0]
+    groups: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+    for r in good:
+        groups[(str(r.get("parent_model", "unknown")), str(r.get("parent_effort", "unknown")))].append(r)
+    groups = {k: v for k, v in groups.items() if len(v) >= 3 and k[0] != "unknown"}
+    if not groups:
+        raise RuntimeError("no Guardian parent groups with at least 3 medium/high-confidence approval episodes")
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Guardian charts require matplotlib") from exc
+
+    ordered = sorted(groups)
+    fig_h = max(5.5, 0.8 * len(ordered) + 2.6)
+    fig, axes = plt.subplots(1, 2, figsize=(15.5, fig_h))
+    fig.patch.set_facecolor(CHART_BG)
+    for ax in axes:
+        ax.set_facecolor(CHART_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(CHART_GRID)
+        ax.tick_params(colors=CHART_MUTED)
+        ax.xaxis.grid(True, color=CHART_GRID, linewidth=.8)
+        ax.set_axisbelow(True)
+    ys = list(range(len(ordered)))[::-1]
+    labels = [f"{m} {e}" for m, e in ordered]
+    for y, key in zip(ys, ordered):
+        rs = groups[key]
+        vals = [float(r["guardian_tokens"]) / 1e6 for r in rs]
+        med, lo, hi = _q(vals,.5), _q(vals,.1), _q(vals,.9)
+        axes[0].errorbar(med, y, xerr=[[med-lo],[hi-med]], fmt="o", capsize=4)
+        axes[0].text(hi + max(0.01, hi*.02), y, f"{med:.2f}M · {len(rs)}ep", color=CHART_FG, va="center", fontsize=8.5)
+        shares = [float(r["guardian_share_local"]) for r in rs if math.isfinite(float(r["guardian_share_local"]))]
+        smed, slo, shi = _q(shares,.5), _q(shares,.1), _q(shares,.9)
+        axes[1].errorbar(smed*100, y, xerr=[[(smed-slo)*100],[(shi-smed)*100]], fmt="o", capsize=4)
+        axes[1].text(shi*100 + 1, y, f"{smed:.0%} · {len(rs)}ep", color=CHART_FG, va="center", fontsize=8.5)
+    for ax in axes:
+        ax.set_yticks(ys)
+        ax.set_yticklabels(labels, color=CHART_FG, fontweight="bold")
+    axes[0].set_title("Guardian tokens per approval", color=CHART_FG, fontweight="bold", loc="left")
+    axes[1].set_title("Guardian share of local approval context", color=CHART_FG, fontweight="bold", loc="left")
+    axes[0].set_xlabel("Million codex-auto-review tokens", color=CHART_MUTED)
+    axes[1].set_xlabel("Guardian share of Guardian + paired parent context (%)", color=CHART_MUTED)
+    fig.suptitle("Auto-review approval overhead", color=CHART_FG, fontsize=22, fontweight="bold", x=.06, ha="left")
+    fig.text(.06,.035,"Medium/high-confidence parent pairs only · whiskers are p10-p90 across approval episodes · quota causality is not implied",
+             color=CHART_MUTED, fontsize=9)
+    fig.subplots_adjust(left=.18,right=.97,bottom=.13,top=.84,wspace=.25)
+    png, svg = prefix + ".png", prefix + ".svg"
+    Path(png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png,dpi=180,facecolor=CHART_BG,bbox_inches="tight")
+    fig.savefig(svg,facecolor=CHART_BG,bbox_inches="tight")
+    plt.close(fig)
+    return png, svg
+
+
 # ---------------------------------------------------------------------------
 # CSV exports
 # ---------------------------------------------------------------------------
@@ -2803,6 +3522,19 @@ def run_self_test() -> None:
         assert ge.is_auto_review_inference and ge.is_confirmed_guardian
         assert events_for_window([ge], 300)[0].used == 12
 
+        # Privacy-safe linkage + temporal Guardian pairing.
+        li_g = SessionLinkInfo(); li_p = SessionLinkInfo()
+        _collect_link_ids({"source": {"subagent": {"thread_id": "parent-thread-123456"}}}, li_g)
+        _collect_link_ids({"thread_id": "parent-thread-123456"}, li_p)
+        pst = ParseStats(session_links={"guardian": li_g, "parent": li_p})
+        p1 = _fake_event("2026-01-03T00:59:55Z", 0, reset, model="gpt-5.5", effort="high")
+        p1.source = "parent"; p1.approvals_reviewer = "auto_review"
+        g1 = _fake_event("2026-01-03T01:00:00Z", 1, reset, model="codex-auto-review", effort="low")
+        g1.source = "guardian"; g1.source_kind = "subagent"; g1.approvals_reviewer = "auto_review"
+        pargs = argparse.Namespace(guardian_parent_match_seconds=300.0)
+        pair = _pair_guardian_group([g1], "guardian", {"guardian":[g1],"parent":[p1]}, pst, pargs)
+        assert pair.parent_source == "parent" and pair.confidence == "high", pair
+
     # Token-weight fitter: recover a simple two-weight input/output relationship
     # from multiple independent episodes, while a deliberately collinear full design
     # must be flagged by the condition diagnostic.
@@ -2897,6 +3629,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
       Export conservative 5h/7d auto-review attribution buckets.
 
+  python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
+      Export parent-paired Guardian approval episodes and quota envelopes.
+
 Chart setup (recommended):
   python3 -m venv .venv
   source .venv/bin/activate
@@ -2907,8 +3642,8 @@ Everything except --charts uses only the Python standard library.
     p = argparse.ArgumentParser(
         description=(
             "Audit local Codex usage with effective-reset reconstruction, high-water quota "
-            "accounting, replay detection, model/effort comparisons, Guardian/auto-review "
-            "attribution diagnostics, and experimental token-type quota-weight estimation."
+            "accounting, replay detection, model/effort comparisons, Guardian parent-pairing and "
+            "approval-episode overhead diagnostics, and experimental token-type quota-weight estimation."
         ),
         epilog=epilog,
         formatter_class=_HelpFormatter,
@@ -2927,7 +3662,7 @@ Everything except --charts uses only the Python standard library.
     common.add_argument("--no-weight-analysis", action="store_true",
                         help="skip the experimental token-type quota-weight analysis")
     common.add_argument("--no-guardian-audit", action="store_true",
-                        help="skip Guardian/auto-review and multi-window quota attribution")
+                        help="skip Guardian parent-pairing, approval episodes, and multi-window quota analysis")
     common.add_argument("--self-test", action="store_true", help="run built-in synthetic tests and exit")
     common.add_argument("--version", action="version", version=f"%(prog)s {__version__}", help="show version and exit")
 
@@ -2937,10 +3672,14 @@ Everything except --charts uses only the Python standard library.
     output.add_argument("--export-chart-data", metavar="PATH", help="write model x effort chart aggregates to CSV")
     output.add_argument("--export-guardian-buckets", metavar="PATH",
                         help="write Guardian/auto-review high-water attribution buckets to CSV")
+    output.add_argument("--export-approval-episodes", metavar="PATH",
+                        help="write parent-paired Guardian approval episodes and quota envelopes to CSV")
     output.add_argument("--charts", action="store_true",
                         help="write quota_chart_data.csv plus model/effort PNG and SVG (requires matplotlib)")
     output.add_argument("--chart-prefix", default="quota_value_by_model_effort",
                         help="output path prefix for --charts PNG/SVG")
+    output.add_argument("--guardian-chart-prefix", default="guardian_approval_overhead",
+                        help="output path prefix for Guardian approval-overhead PNG/SVG")
     output.add_argument("--chart-all-regimes", action="store_true",
                         help="include every detected policy regime instead of only the latest per model")
 
@@ -2958,7 +3697,19 @@ Everything except --charts uses only the Python standard library.
     guardian.add_argument("--guardian-purity", type=float, default=DEFAULT_GUARDIAN_PURITY,
                           help="minimum codex-auto-review raw-token share for a Guardian-dominant quota bucket")
     guardian.add_argument("--guardian-isolation-seconds", type=float, default=DEFAULT_GUARDIAN_ISOLATION_SECONDS,
-                          help="local concurrency margin around exclusive Guardian buckets/events")
+                          help="legacy local-isolation margin for Guardian high-water bucket diagnostics")
+    guardian.add_argument("--guardian-parent-match-seconds", type=float, default=DEFAULT_GUARDIAN_PARENT_MATCH_SECONDS,
+                          help="maximum temporal distance for heuristic Guardian-to-parent pairing")
+    guardian.add_argument("--guardian-episode-gap-seconds", type=float, default=DEFAULT_GUARDIAN_EPISODE_GAP_SECONDS,
+                          help="gap that starts a new Guardian approval episode")
+    guardian.add_argument("--guardian-context-seconds", type=float, default=DEFAULT_GUARDIAN_CONTEXT_SECONDS,
+                          help="parent-work context captured before/after each Guardian episode")
+    guardian.add_argument("--guardian-quota-snapshot-seconds", type=float, default=DEFAULT_GUARDIAN_QUOTA_SNAPSHOT_SECONDS,
+                          help="maximum age/gap for quota snapshots around an approval episode")
+    guardian.add_argument("--guardian-match-token-ratio", type=float, default=DEFAULT_GUARDIAN_MATCH_TOKEN_RATIO,
+                          help="maximum parent-token ratio for matched auto-vs-manual approval controls")
+    guardian.add_argument("--guardian-fit-bootstraps", type=int, default=DEFAULT_GUARDIAN_FIT_BOOTSTRAPS,
+                          help="parent-session bootstrap replicates for exploratory incremental Guardian fit")
 
     replay = p.add_argument_group("Advanced replay detection")
     replay.add_argument("--replay-scan-seconds", type=float, default=DEFAULT_REPLAY_SCAN_SECONDS,
@@ -3033,6 +3784,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--guardian-purity must be between 0 and 1")
     if args.guardian_isolation_seconds < 0:
         raise SystemExit("--guardian-isolation-seconds must be non-negative")
+    if args.guardian_parent_match_seconds < 0 or args.guardian_episode_gap_seconds < 0:
+        raise SystemExit("Guardian pairing/gap seconds must be non-negative")
+    if args.guardian_context_seconds < 0 or args.guardian_quota_snapshot_seconds < 0:
+        raise SystemExit("Guardian context/snapshot seconds must be non-negative")
+    if args.guardian_match_token_ratio < 1.0:
+        raise SystemExit("--guardian-match-token-ratio must be >= 1")
+    if args.guardian_fit_bootstraps < 0:
+        raise SystemExit("--guardian-fit-bootstraps must be non-negative")
     if args.reset_tolerance <= 0:
         raise SystemExit("--reset-tolerance must be positive")
     if args.reset_class_tolerance_hours < 0:
@@ -3130,10 +3889,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_replay_sensitivity(filtered_analysis, included_analysis, args.min_price_coverage)
 
     guardian_rows: List[Dict[str, object]] = []
-    if not args.no_guardian_audit or args.export_guardian_buckets:
+    approval_episodes: List[Dict[str, object]] = []
+    if not args.no_guardian_audit or args.export_guardian_buckets or args.export_approval_episodes or args.charts:
         guardian_rows = guardian_bucket_rows(primary_records, args)
+        approval_episodes = build_approval_episodes(primary_records, stats, args, primary)
     if not args.no_guardian_audit:
-        print_guardian_audit(primary_records, args, guardian_rows)
+        print_guardian_audit(primary_records, args, guardian_rows, stats, approval_episodes, primary)
 
     print_unpriced(primary.events, prices)
     print_notes(primary)
@@ -3147,6 +3908,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.export_guardian_buckets:
         export_guardian_buckets_csv(args.export_guardian_buckets, guardian_rows)
         print(f"Wrote Guardian bucket CSV: {args.export_guardian_buckets}")
+    if args.export_approval_episodes:
+        export_approval_episodes_csv(args.export_approval_episodes, approval_episodes)
+        print(f"Wrote approval episode CSV: {args.export_approval_episodes}")
 
     if args.export_chart_data or args.charts:
         chart_rows = build_chart_rows(primary.buckets, args)
@@ -3163,6 +3927,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except RuntimeError as exc:
                 print(f"Chart rendering unavailable: {exc}", file=sys.stderr)
                 print("The chart CSV was still written.", file=sys.stderr)
+        if approval_episodes:
+            try:
+                gpng, gsvg = render_guardian_episode_chart(approval_episodes, args.guardian_chart_prefix)
+                print(f"Wrote Guardian approval charts: {gpng}, {gsvg}")
+            except RuntimeError as exc:
+                print(f"Guardian approval chart unavailable: {exc}", file=sys.stderr)
 
     return 0
 
