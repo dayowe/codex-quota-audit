@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.6.
+"""Codex quota audit v2.7.
 
-Analyze local Codex rollout logs and relate observed token usage to the 7-day
-Codex quota meter. Nothing leaves your machine.
+Analyze local Codex rollout logs and relate observed token usage to Codex quota
+meters. The main historical analysis defaults to the 7-day meter; the Guardian /
+auto-review audit also discovers 5-hour telemetry when present. Nothing leaves
+your machine.
 
 Quick start
 -----------
@@ -25,6 +27,7 @@ Useful commands:
     python3 codex_quota_audit.py --export-chart-data quota_chart_data.csv
     python3 codex_quota_audit.py --export-buckets quota_buckets.csv
     python3 codex_quota_audit.py --export-resets reset_ledger.csv
+    python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
 
 What it does
 ------------
@@ -32,6 +35,8 @@ What it does
 * Uses high-water accounting so stale/backward meter readings do not double-count quota.
 * Detects replayed rollout history from cumulative total_token_usage and excludes it by default.
 * Tracks model and reasoning effort, including provenance/conflict diagnostics.
+* Audits codex-auto-review / Guardian inference, approval reviewer state, and local concurrency.
+* Discovers and analyzes 5-hour and 7-day quota snapshots when present.
 * Compares model/month and detected model-policy regimes.
 * Estimates token-type quota weights only when the data are identifiable enough to support them.
 * Produces model x effort chart data with whole-episode bootstrap intervals.
@@ -53,6 +58,7 @@ All prices are dollars per 1M tokens.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import glob
 import json
@@ -63,13 +69,13 @@ import statistics
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.6"
+__version__ = "2.7"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +120,9 @@ DEFAULT_CHART_MIN_POINTS = 10.0
 DEFAULT_CHART_MIN_EPISODES = 3
 DEFAULT_CHART_BOOTSTRAPS = 1000
 DEFAULT_CHART_INTERVAL = 0.80
+DEFAULT_GUARDIAN_PURITY = 0.95
+DEFAULT_GUARDIAN_ISOLATION_SECONDS = 60.0
+DEFAULT_GUARDIAN_WINDOWS = (300, 10080)
 EPS = 1e-9
 
 
@@ -137,6 +146,12 @@ class Usage:
         return self.uncached + self.cached + self.output
 
 
+@dataclass(frozen=True)
+class RateWindow:
+    used: float
+    reset_at: float
+
+
 @dataclass
 class Event:
     ts_raw: str
@@ -152,6 +167,11 @@ class Event:
     priced: bool
     api_usd: Optional[float]
     effort: str = "unknown"
+    reasoning_output: int = 0
+    approval_policy: str = "unknown"
+    approvals_reviewer: str = "unknown"
+    source_kind: str = "unknown"
+    rate_windows: Dict[int, RateWindow] = field(default_factory=dict)
     total_input: Optional[int] = None
     total_cached: Optional[int] = None
     total_output: Optional[int] = None
@@ -172,6 +192,26 @@ class Event:
     @property
     def input_total(self) -> int:
         return self.uncached + self.cached
+
+    @property
+    def is_auto_review_inference(self) -> bool:
+        return self.model == "codex-auto-review"
+
+    @property
+    def is_confirmed_guardian(self) -> bool:
+        return self.is_auto_review_inference and self.source_kind == "subagent"
+
+    @property
+    def activity_class(self) -> str:
+        if self.is_auto_review_inference:
+            return "auto-review inference"
+        if self.approvals_reviewer == "auto_review":
+            return "auto-review parent"
+        if self.approvals_reviewer == "user":
+            return "user-review parent"
+        if self.source_kind == "subagent":
+            return "other subagent"
+        return "other"
 
 
 @dataclass
@@ -196,6 +236,11 @@ class ParseStats:
     effort_conflicts: int = 0
     effort_state_updates: int = 0
     unknown_effort_events: int = 0
+    target_candidate_events: int = 0
+    window_records: Dict[int, int] = field(default_factory=dict)
+    source_kind_updates: int = 0
+    reviewer_state_updates: int = 0
+    approval_policy_updates: int = 0
 
 
 @dataclass
@@ -213,6 +258,9 @@ class Bucket:
     total_tokens: int
     model_tokens: Dict[str, int] = field(default_factory=dict)
     effort_tokens: Dict[str, int] = field(default_factory=dict)
+    activity_tokens: Dict[str, int] = field(default_factory=dict)
+    activity_events: Dict[str, int] = field(default_factory=dict)
+    reviewer_tokens: Dict[str, int] = field(default_factory=dict)
 
     @property
     def price_coverage(self) -> float:
@@ -456,15 +504,103 @@ def effort_from_payload(payload: object, stats: Optional[ParseStats] = None) -> 
     return direct or next(v for v in fallbacks if v is not None)
 
 
+def _normalize_state(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def model_from_payload(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("model"),
+        _nested_get(payload, ("state", "model")),
+        _nested_get(payload, ("thread_settings", "model")),
+        _nested_get(payload, ("collaboration_mode", "settings", "model")),
+        _nested_get(payload, ("state", "collaboration_mode", "model")),
+    ]
+    for value in candidates:
+        value2 = _normalize_state(value)
+        if value2:
+            return value2
+    return None
+
+
+def approval_state_from_payload(payload: object) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(payload, dict):
+        return None, None
+    policy = (
+        _normalize_state(payload.get("approval_policy"))
+        or _normalize_state(_nested_get(payload, ("thread_settings", "approval_policy")))
+    )
+    reviewer = (
+        _normalize_state(payload.get("approvals_reviewer"))
+        or _normalize_state(_nested_get(payload, ("thread_settings", "approvals_reviewer")))
+    )
+    return policy, reviewer
+
+
+def source_kind_from_payload(payload: object) -> Optional[str]:
+    """Return a privacy-safe coarse session source such as cli or subagent."""
+    if not isinstance(payload, dict):
+        return None
+    src = payload.get("source")
+    if isinstance(src, str):
+        src = src.strip().lower()
+        return src or None
+    if isinstance(src, dict):
+        # Real Guardian rollouts use source={subagent:{...}}. We intentionally do
+        # not retain nested IDs, paths, names, or other source metadata.
+        if "subagent" in src:
+            return "subagent"
+        if "guardian" in src:
+            return "guardian"
+        kind = src.get("type") or src.get("kind")
+        if isinstance(kind, str) and kind.strip():
+            return kind.strip().lower()
+    return None
+
+
+def extract_rate_windows(rate_limits: object) -> Dict[int, RateWindow]:
+    out: Dict[int, RateWindow] = {}
+    if not isinstance(rate_limits, dict) or rate_limits.get("limit_id") != "codex":
+        return out
+    for name in ("primary", "secondary"):
+        win = rate_limits.get(name)
+        if not isinstance(win, dict):
+            continue
+        try:
+            minutes = int(win["window_minutes"])
+            used = float(win["used_percent"])
+            reset_at = float(win["resets_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if minutes > 0:
+            out[minutes] = RateWindow(used=used, reset_at=reset_at)
+    return out
+
+
 def parse_file(path: str,
                prices: Dict[str, Tuple[float, float, float]],
                target_window_minutes: int,
                stats: ParseStats) -> List[Event]:
+    """Parse one rollout file once, retaining every Codex rate-limit window.
+
+    `used`/`reset_at` continue to refer to the requested main-analysis window so
+    the existing weekly analysis remains backward compatible. `rate_windows`
+    retains 5h/7d (and any future windows) for the Guardian audit.
+    """
     model: Optional[str] = None
     effort: Optional[str] = None
+    approval_policy: Optional[str] = None
+    approvals_reviewer: Optional[str] = None
+    source_kind: Optional[str] = None
     prev_total: Optional[Tuple[int, int, int]] = None
     out: List[Event] = []
     source_index = 0
+    file_line_index = 0
 
     try:
         fh = open(path, "rb")
@@ -473,11 +609,23 @@ def parse_file(path: str,
 
     with fh:
         for raw in fh:
+            file_line_index += 1
             stats.lines += 1
-            # Most lines are irrelevant. Effort state may live outside turn_context,
-            # so parse any line that mentions an effort field as well as token events.
-            if (b'"token_count"' not in raw and b'"turn_context"' not in raw
-                    and b'"effort"' not in raw and b'"reasoning_effort"' not in raw):
+            # Session source usually appears at the beginning. Later state changes
+            # are selected by narrow field-name checks to avoid JSON-decoding every
+            # prompt/response/tool-content record in very large rollout files.
+            is_usage_hint = b'"token_count"' in raw or b'"token_usage_record"' in raw
+            metadata_hint = (
+                file_line_index <= 50
+                or b'"turn_context"' in raw
+                or b'"effort"' in raw
+                or b'"reasoning_effort"' in raw
+                or b'"approval_policy"' in raw
+                or b'"approvals_reviewer"' in raw
+                or b'"thread_settings_applied"' in raw
+                or b'"codex-auto-review"' in raw
+            )
+            if not is_usage_hint and not metadata_hint:
                 continue
             try:
                 obj = json.loads(raw)
@@ -486,33 +634,47 @@ def parse_file(path: str,
                 continue
 
             payload = obj.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+
+            new_model = model_from_payload(payload)
+            if new_model is not None:
+                model = new_model
+
             new_effort = effort_from_payload(payload, stats)
             if new_effort is not None and new_effort != effort:
                 effort = new_effort
                 stats.effort_state_updates += 1
 
-            # Model state is carried forward from turn_context records.
-            if b'"turn_context"' in raw or (isinstance(payload, dict) and payload.get("type") == "turn_context"):
-                try:
-                    model = payload.get("model") or model
-                except AttributeError:
-                    stats.json_errors += 1
-                if not (isinstance(payload, dict) and payload.get("type") == "token_count"):
-                    continue
+            new_policy, new_reviewer = approval_state_from_payload(payload)
+            if new_policy is not None and new_policy != approval_policy:
+                approval_policy = new_policy
+                stats.approval_policy_updates += 1
+            if new_reviewer is not None and new_reviewer != approvals_reviewer:
+                approvals_reviewer = new_reviewer
+                stats.reviewer_state_updates += 1
 
-            if not (isinstance(payload, dict) and payload.get("type") == "token_count"):
+            new_source = source_kind_from_payload(payload)
+            if new_source is not None and new_source != source_kind:
+                source_kind = new_source
+                stats.source_kind_updates += 1
+
+            ptype = payload.get("type") or obj.get("type")
+            if ptype not in ("token_count", "token_usage_record"):
                 continue
             stats.token_count_records += 1
 
             info = payload.get("info") or {}
-            last = info.get("last_token_usage")
-            total = info.get("total_token_usage")
-            if not last:
+            if not isinstance(info, dict):
+                info = {}
+            last = info.get("last_token_usage") or payload.get("last_token_usage")
+            total = info.get("total_token_usage") or payload.get("total_token_usage")
+            if not isinstance(last, dict):
                 stats.missing_usage += 1
                 continue
 
             total_input = total_cached = total_output = None
-            if total:
+            if isinstance(total, dict):
                 cur_total = tuple(int(total.get(k, 0) or 0) for k in
                                   ("input_tokens", "cached_input_tokens", "output_tokens"))
                 if cur_total == prev_total:
@@ -521,25 +683,26 @@ def parse_file(path: str,
                 prev_total = cur_total
                 total_input, total_cached, total_output = cur_total
 
-            rl = payload.get("rate_limits") or {}
-            if rl.get("limit_id") != "codex":
+            windows = extract_rate_windows(payload.get("rate_limits"))
+            if not windows:
                 stats.missing_target_limit += 1
                 continue
+            for minutes in windows:
+                stats.window_records[minutes] = stats.window_records.get(minutes, 0) + 1
 
-            win = next(
-                (w for w in (rl.get("primary"), rl.get("secondary"))
-                 if w and int(w.get("window_minutes", -1)) == target_window_minutes),
-                None,
-            )
-            if not win:
+            target = windows.get(target_window_minutes)
+            if target is None:
                 stats.missing_target_limit += 1
-                continue
+                used = float("nan")
+                reset_at = float("nan")
+            else:
+                stats.target_candidate_events += 1
+                used = target.used
+                reset_at = target.reset_at
 
             try:
                 ts_raw = obj["timestamp"]
                 ts = parse_timestamp(ts_raw)
-                used = float(win["used_percent"])
-                reset_at = float(win["resets_at"])
             except (KeyError, TypeError, ValueError):
                 stats.json_errors += 1
                 continue
@@ -547,6 +710,7 @@ def parse_file(path: str,
             inp = int(last.get("input_tokens", 0) or 0)
             cached = int(last.get("cached_input_tokens", 0) or 0)
             output = int(last.get("output_tokens", 0) or 0)
+            reasoning_output = int(last.get("reasoning_output_tokens", 0) or 0)
             uncached = max(inp - cached, 0)
             current_model = model or "unknown"
             current_effort = effort or "unknown"
@@ -568,6 +732,11 @@ def parse_file(path: str,
                 priced=api_usd is not None,
                 api_usd=api_usd,
                 effort=current_effort,
+                reasoning_output=reasoning_output,
+                approval_policy=approval_policy or "unknown",
+                approvals_reviewer=approvals_reviewer or "unknown",
+                source_kind=source_kind or "unknown",
+                rate_windows=windows,
                 total_input=total_input,
                 total_cached=total_cached,
                 total_output=total_output,
@@ -579,6 +748,10 @@ def parse_file(path: str,
     return out
 
 def event_identity(e: Event) -> Tuple[object, ...]:
+    meter = tuple(
+        sorted((minutes, round(win.used, 6), round(win.reset_at, 3))
+               for minutes, win in e.rate_windows.items())
+    )
     return (
         e.ts_raw,
         e.uncached,
@@ -587,9 +760,7 @@ def event_identity(e: Event) -> Tuple[object, ...]:
         e.total_input,
         e.total_cached,
         e.total_output,
-        round(e.used, 6),
-        round(e.reset_at, 3),
-        e.window_minutes,
+        meter,
     )
 
 
@@ -632,11 +803,19 @@ def detect_replay_prefixes(events: List[Event], stats: ParseStats,
 
         # Rate-limit snapshots in a replay often encode historical states spanning
         # hours/days even though their outer log timestamps are compressed together.
-        reset_vals = [e.reset_at for e in prefix if e.reset_at > 0]
-        reset_span = (max(reset_vals) - min(reset_vals)) if len(reset_vals) >= 2 else 0.0
-        used_vals = [e.used for e in prefix]
-        used_span = (max(used_vals) - min(used_vals)) if used_vals else 0.0
-        historical_state_evidence = reset_span >= 60.0 or used_span >= 2.0
+        # Check every retained limit window so replay detection still works when the
+        # requested main-analysis window is absent from part of history.
+        historical_state_evidence = False
+        windows_seen = sorted({m for e in prefix for m in e.rate_windows})
+        for minutes in windows_seen:
+            wins = [e.rate_windows[minutes] for e in prefix if minutes in e.rate_windows]
+            reset_vals = [w.reset_at for w in wins if w.reset_at > 0]
+            reset_span = (max(reset_vals) - min(reset_vals)) if len(reset_vals) >= 2 else 0.0
+            used_vals = [w.used for w in wins]
+            used_span = (max(used_vals) - min(used_vals)) if used_vals else 0.0
+            if reset_span >= 60.0 or used_span >= 2.0:
+                historical_state_evidence = True
+                break
 
         # A large, monotone rebuild from near-zero cumulative usage in the opening
         # seconds is the core replay signature. Historical rate-limit variation is
@@ -696,8 +875,18 @@ def load_events(home: str,
             by_identity[ident] = e
         else:
             stats.global_duplicates += 1
-            prev_quality = int(prev.model != "unknown") + int(prev.effort != "unknown")
-            new_quality = int(e.model != "unknown") + int(e.effort != "unknown")
+            prev_quality = (
+                int(prev.model != "unknown") + int(prev.effort != "unknown")
+                + int(prev.approvals_reviewer != "unknown")
+                + int(prev.approval_policy != "unknown")
+                + int(prev.source_kind != "unknown")
+            )
+            new_quality = (
+                int(e.model != "unknown") + int(e.effort != "unknown")
+                + int(e.approvals_reviewer != "unknown")
+                + int(e.approval_policy != "unknown")
+                + int(e.source_kind != "unknown")
+            )
             if new_quality > prev_quality:
                 by_identity[ident] = e
 
@@ -707,6 +896,29 @@ def load_events(home: str,
         replay_min_growth_mtokens, replay_start_max_mtokens, dense_threshold,
     )
     return deduped, stats
+
+
+def events_for_window(events: Sequence[Event], window_minutes: int) -> List[Event]:
+    """Project deduplicated usage records onto one rate-limit window.
+
+    The parser already projects the requested main window, so reuse those Event
+    objects instead of cloning hundreds of thousands of records. Other windows
+    are shallow copies sharing the immutable rate-window mapping contents.
+    """
+    out: List[Event] = []
+    for e in events:
+        win = e.rate_windows.get(window_minutes)
+        if win is None:
+            continue
+        if e.window_minutes == window_minutes and e.used == e.used and e.reset_at == e.reset_at:
+            out.append(e)
+        else:
+            out.append(replace(e, used=win.used, reset_at=win.reset_at, window_minutes=window_minutes))
+    return out
+
+
+def discovered_windows(events: Sequence[Event]) -> List[int]:
+    return sorted({minutes for e in events for minutes in e.rate_windows})
 
 
 # ---------------------------------------------------------------------------
@@ -734,9 +946,15 @@ def make_bucket(reset_k: int, reset_at: float,
     any_priced = any(e.priced for e in events)
     model_tokens: Dict[str, int] = defaultdict(int)
     effort_tokens: Dict[str, int] = defaultdict(int)
+    activity_tokens: Dict[str, int] = defaultdict(int)
+    activity_events: Dict[str, int] = defaultdict(int)
+    reviewer_tokens: Dict[str, int] = defaultdict(int)
     for e in events:
         model_tokens[e.model] += e.tokens
         effort_tokens[e.effort] += e.tokens
+        activity_tokens[e.activity_class] += e.tokens
+        activity_events[e.activity_class] += 1
+        reviewer_tokens[e.approvals_reviewer] += e.tokens
     return Bucket(
         reset_key=reset_k,
         reset_at=reset_at,
@@ -751,6 +969,9 @@ def make_bucket(reset_k: int, reset_at: float,
         total_tokens=total_tokens,
         model_tokens=dict(model_tokens),
         effort_tokens=dict(effort_tokens),
+        activity_tokens=dict(activity_tokens),
+        activity_events=dict(activity_events),
+        reviewer_tokens=dict(reviewer_tokens),
     )
 
 
@@ -994,7 +1215,7 @@ def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis
     max_backstep = max((ep.max_backstep for ep in analysis.episodes), default=0.0)
     effective = kinds.get("scheduled", 0) + kinds.get("early", 0) + kinds.get("after-due", 0)
 
-    print("Codex quota audit v2.6")
+    print("Codex quota audit v2.7")
     print("======================")
     source_display = "~/.codex" if args.home == os.path.expanduser("~/.codex") else args.home
     print(f"Source: {source_display}")
@@ -1006,6 +1227,10 @@ def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis
     print(f"files scanned:                 {stats.files:,}")
     print(f"token_count records seen:      {stats.token_count_records:,}")
     print(f"candidate events:              {stats.candidate_events:,}")
+    print(f"target-window candidates:      {stats.target_candidate_events:,}")
+    if stats.window_records:
+        window_text = ", ".join(f"{window_label(m)}={n:,}" for m, n in sorted(stats.window_records.items()))
+        print(f"rate-limit window records:     {window_text}")
     print(f"immediate duplicate totals:    {stats.immediate_duplicate_totals:,}")
     print(f"cross-file/event duplicates:   {stats.global_duplicates:,}")
     print(f"probable replay prefixes:      {stats.replay_prefixes:,}")
@@ -1714,6 +1939,268 @@ def print_replay_sensitivity(filtered: Analysis, included: Analysis,
     print(f"Median absolute monthly change: {med:.1f}%; worst month: {worst:.1f}%; >5% months: {affected}/{len(deltas)} ({verdict}).")
 
 
+
+# ---------------------------------------------------------------------------
+# Guardian / auto-review audit
+# ---------------------------------------------------------------------------
+
+def window_label(minutes: int) -> str:
+    if minutes == 300:
+        return "5h"
+    if minutes == 10080:
+        return "7d"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+
+def _event_token_totals(events: Sequence[Event]) -> Tuple[int, int, int, int]:
+    unc = sum(e.uncached for e in events)
+    cached = sum(e.cached for e in events)
+    out = sum(e.output for e in events)
+    reasoning = sum(e.reasoning_output for e in events)
+    return unc, cached, out, reasoning
+
+
+def _session_count(events: Sequence[Event]) -> int:
+    return len({e.source for e in events})
+
+
+def _cache_ratio_events(events: Sequence[Event]) -> float:
+    unc, cached, _, _ = _event_token_totals(events)
+    denom = unc + cached
+    return cached / denom if denom else float("nan")
+
+
+def _non_auto_review_timestamps(events: Sequence[Event]) -> List[float]:
+    return sorted(e.ts.timestamp() for e in events
+                  if e.tokens > 0 and not e.is_auto_review_inference)
+
+
+def _has_nearby_non_auto_review(non_auto_times: Sequence[float],
+                                start_ts: datetime, end_ts: datetime,
+                                margin_seconds: float) -> bool:
+    if not non_auto_times:
+        return False
+    lo = start_ts.timestamp() - margin_seconds
+    hi = end_ts.timestamp() + margin_seconds
+    i = bisect.bisect_left(non_auto_times, lo)
+    return i < len(non_auto_times) and non_auto_times[i] <= hi
+
+
+def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> List[Dict[str, object]]:
+    """Build conservative attribution rows for every requested/discovered limit window.
+
+    A quota point is never called "caused by Guardian" merely because an auto-review
+    record observed it. Rows distinguish auto-review-present, dominant, exclusive,
+    and locally isolated buckets. Local isolation means no non-auto-review token event
+    was logged around the bucket; account-global work outside these logs can still exist.
+    """
+    rows: List[Dict[str, object]] = []
+    available = set(discovered_windows(events))
+    wanted = [w for w in DEFAULT_GUARDIAN_WINDOWS if w in available]
+    # Also retain unexpected/future windows rather than silently discarding them.
+    wanted += [w for w in sorted(available) if w not in wanted]
+    non_auto_times = _non_auto_review_timestamps(events)
+
+    for minutes in wanted:
+        wevs = events_for_window(events, minutes)
+        if not wevs:
+            continue
+        wa = argparse.Namespace(**vars(args))
+        wa.window_minutes = minutes
+        analysis = analyze_events(wevs, wa)
+        for b in analysis.buckets:
+            auto_tokens = b.activity_tokens.get("auto-review inference", 0)
+            auto_parent_tokens = b.activity_tokens.get("auto-review parent", 0)
+            user_parent_tokens = b.activity_tokens.get("user-review parent", 0)
+            other_tokens = max(b.total_tokens - auto_tokens, 0)
+            share = auto_tokens / b.total_tokens if b.total_tokens else 0.0
+            present = auto_tokens > 0
+            exclusive = present and other_tokens == 0
+            dominant = present and share + EPS >= args.guardian_purity
+            isolated = (
+                exclusive
+                and not _has_nearby_non_auto_review(
+                    non_auto_times, b.start_ts, b.end_ts, args.guardian_isolation_seconds
+                )
+            )
+            rows.append({
+                "window_minutes": minutes,
+                "window": window_label(minutes),
+                "reset_key": b.reset_key,
+                "start": b.start_ts,
+                "end": b.end_ts,
+                "points": b.points,
+                "events": b.events,
+                "total_tokens": b.total_tokens,
+                "auto_review_tokens": auto_tokens,
+                "auto_review_share": share,
+                "auto_review_present": present,
+                "auto_review_dominant": dominant,
+                "auto_review_exclusive": exclusive,
+                "locally_isolated": isolated,
+                "auto_review_parent_tokens": auto_parent_tokens,
+                "user_review_parent_tokens": user_parent_tokens,
+            })
+    return rows
+
+
+def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
+                         rows: Optional[Sequence[Dict[str, object]]] = None) -> None:
+    print("\nGuardian / auto-review audit")
+    print("----------------------------")
+    auto = [e for e in events if e.is_auto_review_inference]
+    confirmed = [e for e in auto if e.is_confirmed_guardian]
+    parent_auto = [e for e in events if not e.is_auto_review_inference
+                   and e.approvals_reviewer == "auto_review"]
+    parent_user = [e for e in events if not e.is_auto_review_inference
+                   and e.approvals_reviewer == "user"]
+
+    print("`codex-auto-review` inference is reported separately from ordinary parent work.")
+    print("Quota movement is account-global, so only conservative local-isolation evidence")
+    print("is shown; it is not exact causal attribution to the approval setting.\n")
+
+    if not auto:
+        print("No codex-auto-review inference events were found after replay filtering.")
+    else:
+        unc, cached, out, reasoning = _event_token_totals(auto)
+        total = unc + cached + out
+        cache = _cache_ratio_events(auto)
+        print(f"auto-review inference sessions:     {_session_count(auto):,}")
+        print(f"confirmed subagent sessions:        {_session_count(confirmed):,}")
+        print(f"auto-review inference events:       {len(auto):,}")
+        print(f"auto-review tokens:                 {total / 1e6:,.1f}M")
+        print(f"  uncached input:                   {unc / 1e6:,.1f}M")
+        print(f"  cached input:                     {cached / 1e6:,.1f}M")
+        print(f"  output:                           {out / 1e6:,.1f}M")
+        print(f"  reasoning output (subset/field):  {reasoning / 1e6:,.1f}M")
+        print(f"  cached share of input:            {fmt_pct_ratio(cache)}")
+
+        # Event-level concurrency is a diagnostic, not quota attribution.
+        non_auto_times = _non_auto_review_timestamps(events)
+        isolated_events = []
+        concurrent_events = []
+        for e in auto:
+            if _has_nearby_non_auto_review(
+                non_auto_times, e.ts, e.ts, args.guardian_isolation_seconds
+            ):
+                concurrent_events.append(e)
+            else:
+                isolated_events.append(e)
+        iso_tokens = sum(e.tokens for e in isolated_events)
+        print(f"locally isolated auto-review events:{len(isolated_events):>11,} "
+              f"({iso_tokens / 1e6:,.1f}M tokens)")
+        print(f"concurrent/nearby events:           {len(concurrent_events):>11,} "
+              f"(±{args.guardian_isolation_seconds:g}s local-log test)")
+
+    print("\nReviewer setting observed on non-auto-review work")
+    print("-------------------------------------------------")
+    print(f"{'reviewer':<14} {'sessions':>9} {'events':>10} {'tokens M':>11} {'cache':>7}")
+    for name, evs in (("auto_review", parent_auto), ("user", parent_user)):
+        if not evs:
+            print(f"{name:<14} {0:>9} {0:>10} {0:>11} {'n/a':>7}")
+            continue
+        print(f"{name:<14} {_session_count(evs):>9,} {len(evs):>10,} "
+              f"{sum(e.tokens for e in evs)/1e6:>11.1f} {fmt_pct_ratio(_cache_ratio_events(evs)):>7}")
+    print("These rows describe workload while a reviewer mode was active; they are not the")
+    print("incremental cost of that reviewer mode.")
+
+    if rows is None:
+        rows = guardian_bucket_rows(events, args)
+
+    available = discovered_windows(events)
+    print("\nRate-limit coverage and auto-review attribution")
+    print("-----------------------------------------------")
+    if available:
+        print("discovered windows: " + ", ".join(
+            f"{window_label(w)} ({w}m)" for w in available
+        ))
+    else:
+        print("No rate-limit windows found.")
+        return
+
+    header = (f"{'limit':<7} {'records':>8} {'span':>23} {'hw pt':>7} "
+              f"{'present':>8} {'dominant':>9} {'exclusive':>10} {'isolated':>9} {'iso Mtok/pt':>11}")
+    print(header)
+
+    for minutes in available:
+        wevs = events_for_window(events, minutes)
+        wr = [r for r in rows if int(r["window_minutes"]) == minutes]
+        total_points = sum(float(r["points"]) for r in wr)
+        present_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_present"]))
+        dominant_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_dominant"]))
+        exclusive_points = sum(float(r["points"]) for r in wr if bool(r["auto_review_exclusive"]))
+        isolated_rows = [r for r in wr if bool(r["locally_isolated"])]
+        isolated_points = sum(float(r["points"]) for r in isolated_rows)
+        isolated_tokens = sum(int(r["auto_review_tokens"]) for r in isolated_rows)
+        mtok_pt = isolated_tokens / 1e6 / isolated_points if isolated_points > EPS else float("nan")
+        if wevs:
+            span = f"{wevs[0].ts.strftime('%m-%d')}..{wevs[-1].ts.strftime('%m-%d')}"
+        else:
+            span = "n/a"
+        print(f"{window_label(minutes):<7} {len(wevs):>8,} {span:>23} {total_points:>7.0f} "
+              f"{present_points:>8.0f} {dominant_points:>9.0f} {exclusive_points:>10.0f} "
+              f"{isolated_points:>9.0f} "
+              f"{(f'{mtok_pt:.2f}' if mtok_pt == mtok_pt else 'n/a'):>11}")
+
+        auto_window = [e for e in wevs if e.is_auto_review_inference]
+        if auto and not auto_window:
+            print(f"        note: no codex-auto-review events in retained {window_label(minutes)} telemetry.")
+
+    print("\nColumn semantics:")
+    print("  present   = high-water points in buckets containing any codex-auto-review tokens")
+    print(f"  dominant  = points where codex-auto-review is >= {args.guardian_purity:.0%} of raw tokens")
+    print("  exclusive = points where all locally logged token work in the bucket is codex-auto-review")
+    print(f"  isolated  = exclusive plus no non-auto-review token event within ±{args.guardian_isolation_seconds:g}s")
+    print("`present` is an upper envelope, not attributable usage. `isolated` is the strongest")
+    print("local evidence, but still cannot exclude activity missing from this machine's logs.")
+
+    print("\nReviewer-mode quota buckets (descriptive, not causal)")
+    print("---------------------------------------------------")
+    print(f"Buckets require >= {args.guardian_purity:.0%} raw-token purity for the reviewer mode and")
+    print("exclude buckets containing codex-auto-review inference. Model/time/policy mix can still confound them.")
+    print(f"{'limit':<7} {'reviewer':<12} {'pt':>7} {'buckets':>8} {'tokens M':>10} {'Mtok/pt':>9}")
+    for minutes in available:
+        wr = [r for r in rows if int(r["window_minutes"]) == minutes]
+        for reviewer, token_key in (("auto_review", "auto_review_parent_tokens"),
+                                    ("user", "user_review_parent_tokens")):
+            pure = []
+            for r in wr:
+                total = int(r["total_tokens"])
+                mode_tokens = int(r[token_key])
+                auto_tokens = int(r["auto_review_tokens"])
+                share = mode_tokens / total if total else 0.0
+                if auto_tokens == 0 and mode_tokens > 0 and share + EPS >= args.guardian_purity:
+                    pure.append(r)
+            pts = sum(float(r["points"]) for r in pure)
+            toks = sum(int(r[token_key]) for r in pure)
+            mtok_pt = toks / 1e6 / pts if pts > EPS else float("nan")
+            print(f"{window_label(minutes):<7} {reviewer:<12} {pts:>7.0f} {len(pure):>8,} "
+                  f"{toks/1e6:>10.1f} {(f'{mtok_pt:.2f}' if mtok_pt == mtok_pt else 'n/a'):>9}")
+
+
+def export_guardian_buckets_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    fields = [
+        "window_minutes", "window", "reset_key", "start", "end", "points", "events",
+        "total_tokens", "auto_review_tokens", "auto_review_share", "auto_review_present",
+        "auto_review_dominant", "auto_review_exclusive", "locally_isolated",
+        "auto_review_parent_tokens", "user_review_parent_tokens",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            cooked = dict(row)
+            for key in ("start", "end"):
+                value = cooked.get(key)
+                if isinstance(value, datetime):
+                    cooked[key] = value.isoformat()
+            w.writerow({k: cooked.get(k, "") for k in fields})
+
+
 def print_unpriced(events: Sequence[Event], prices: Dict[str, Tuple[float, float, float]]) -> None:
     missing: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
     for e in events:
@@ -2296,6 +2783,26 @@ def run_self_test() -> None:
         assert effort_from_payload({"effort": "high", "collaboration_mode": {"settings": {"reasoning_effort": "xhigh"}}}, est2) == "high"
         assert est2.effort_conflicts == 1
 
+        # Guardian/reviewer metadata and multi-window extraction use only coarse,
+        # privacy-safe state. Primary/secondary order does not matter.
+        assert source_kind_from_payload({"source": {"subagent": {"name": "guardian"}}}) == "subagent"
+        pol, rev = approval_state_from_payload({
+            "thread_settings": {"approval_policy": "never", "approvals_reviewer": "auto_review"}
+        })
+        assert (pol, rev) == ("never", "auto_review")
+        wins = extract_rate_windows({
+            "limit_id": "codex",
+            "primary": {"window_minutes": 300, "used_percent": 12, "resets_at": reset},
+            "secondary": {"window_minutes": 10080, "used_percent": 34, "resets_at": reset3},
+        })
+        assert wins[300].used == 12 and wins[10080].used == 34
+        ge = _fake_event("2026-01-03T01:00:00Z", 1, reset, model="codex-auto-review", effort="low")
+        ge.source_kind = "subagent"
+        ge.approvals_reviewer = "auto_review"
+        ge.rate_windows = wins
+        assert ge.is_auto_review_inference and ge.is_confirmed_guardian
+        assert events_for_window([ge], 300)[0].used == 12
+
     # Token-weight fitter: recover a simple two-weight input/output relationship
     # from multiple independent episodes, while a deliberately collinear full design
     # must be flagged by the condition diagnostic.
@@ -2387,6 +2894,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py --weight-details
       Show detailed token-weight fit diagnostics.
 
+  python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
+      Export conservative 5h/7d auto-review attribution buckets.
+
 Chart setup (recommended):
   python3 -m venv .venv
   source .venv/bin/activate
@@ -2397,8 +2907,8 @@ Everything except --charts uses only the Python standard library.
     p = argparse.ArgumentParser(
         description=(
             "Audit local Codex usage with effective-reset reconstruction, high-water quota "
-            "accounting, replay detection, model/effort comparisons, and experimental "
-            "token-type quota-weight estimation."
+            "accounting, replay detection, model/effort comparisons, Guardian/auto-review "
+            "attribution diagnostics, and experimental token-type quota-weight estimation."
         ),
         epilog=epilog,
         formatter_class=_HelpFormatter,
@@ -2416,6 +2926,8 @@ Everything except --charts uses only the Python standard library.
                         help="show every candidate token-weight model and its diagnostics")
     common.add_argument("--no-weight-analysis", action="store_true",
                         help="skip the experimental token-type quota-weight analysis")
+    common.add_argument("--no-guardian-audit", action="store_true",
+                        help="skip Guardian/auto-review and multi-window quota attribution")
     common.add_argument("--self-test", action="store_true", help="run built-in synthetic tests and exit")
     common.add_argument("--version", action="version", version=f"%(prog)s {__version__}", help="show version and exit")
 
@@ -2423,6 +2935,8 @@ Everything except --charts uses only the Python standard library.
     output.add_argument("--export-buckets", metavar="PATH", help="write high-water quota buckets to CSV")
     output.add_argument("--export-resets", metavar="PATH", help="write inferred reset ledger to CSV")
     output.add_argument("--export-chart-data", metavar="PATH", help="write model x effort chart aggregates to CSV")
+    output.add_argument("--export-guardian-buckets", metavar="PATH",
+                        help="write Guardian/auto-review high-water attribution buckets to CSV")
     output.add_argument("--charts", action="store_true",
                         help="write quota_chart_data.csv plus model/effort PNG and SVG (requires matplotlib)")
     output.add_argument("--chart-prefix", default="quota_value_by_model_effort",
@@ -2439,6 +2953,12 @@ Everything except --charts uses only the Python standard library.
                           help="minimum raw-token share for a bucket to be assigned to one model")
     advanced.add_argument("--model-time-min-points", type=float, default=5.0,
                           help="minimum quota points for a model x month row")
+
+    guardian = p.add_argument_group("Guardian / auto-review audit")
+    guardian.add_argument("--guardian-purity", type=float, default=DEFAULT_GUARDIAN_PURITY,
+                          help="minimum codex-auto-review raw-token share for a Guardian-dominant quota bucket")
+    guardian.add_argument("--guardian-isolation-seconds", type=float, default=DEFAULT_GUARDIAN_ISOLATION_SECONDS,
+                          help="local concurrency margin around exclusive Guardian buckets/events")
 
     replay = p.add_argument_group("Advanced replay detection")
     replay.add_argument("--replay-scan-seconds", type=float, default=DEFAULT_REPLAY_SCAN_SECONDS,
@@ -2509,6 +3029,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--model-purity must be between 0 and 1")
     if args.window_minutes <= 0:
         raise SystemExit("--window-minutes must be positive")
+    if not (0.0 <= args.guardian_purity <= 1.0):
+        raise SystemExit("--guardian-purity must be between 0 and 1")
+    if args.guardian_isolation_seconds < 0:
+        raise SystemExit("--guardian-isolation-seconds must be non-negative")
     if args.reset_tolerance <= 0:
         raise SystemExit("--reset-tolerance must be positive")
     if args.reset_class_tolerance_hours < 0:
@@ -2562,22 +3086,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(f"could not load prices: {exc}")
         return 2
 
-    all_events, stats = load_events(
+    all_records, stats = load_events(
         os.path.expanduser(args.home), prices, args.window_minutes,
         args.replay_scan_seconds, args.replay_min_events,
         args.replay_min_growth_mtokens, args.replay_start_max_mtokens,
         args.dense_threshold,
     )
-    if not all_events:
+    if not all_records:
         print("No analyzable Codex events found.")
         print(f"Searched: {os.path.expanduser(args.home)}")
         return 1
 
-    filtered_events = [e for e in all_events if not e.probable_replay]
-    primary_events = all_events if args.include_replays else filtered_events
-    if not primary_events:
+    filtered_records = [e for e in all_records if not e.probable_replay]
+    primary_records = all_records if args.include_replays else filtered_records
+    if not primary_records:
         print("No events remain in the primary analysis after replay filtering.")
         print("Try --include-replays or relax the replay thresholds.")
+        return 1
+
+    all_target_events = events_for_window(all_records, args.window_minutes)
+    filtered_target_events = events_for_window(filtered_records, args.window_minutes)
+    primary_events = events_for_window(primary_records, args.window_minutes)
+    if not primary_events:
+        print(f"No events contain the requested {args.window_minutes}-minute Codex limit.")
+        print("Discovered windows: " + ", ".join(str(w) for w in discovered_windows(primary_records)))
         return 1
     stats.analyzed_events = len(primary_events)
 
@@ -2592,10 +3124,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_weight_analysis(primary.buckets, args)
 
     # Sensitivity comparison uses the exact same parsed/deduped dataset.
-    if stats.replay_events and filtered_events:
-        filtered_analysis = primary if not args.include_replays else analyze_events(filtered_events, args)
-        included_analysis = primary if args.include_replays else analyze_events(all_events, args)
+    if stats.replay_events and filtered_target_events:
+        filtered_analysis = primary if not args.include_replays else analyze_events(filtered_target_events, args)
+        included_analysis = primary if args.include_replays else analyze_events(all_target_events, args)
         print_replay_sensitivity(filtered_analysis, included_analysis, args.min_price_coverage)
+
+    guardian_rows: List[Dict[str, object]] = []
+    if not args.no_guardian_audit or args.export_guardian_buckets:
+        guardian_rows = guardian_bucket_rows(primary_records, args)
+    if not args.no_guardian_audit:
+        print_guardian_audit(primary_records, args, guardian_rows)
 
     print_unpriced(primary.events, prices)
     print_notes(primary)
@@ -2606,6 +3144,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.export_resets:
         export_resets_csv(args.export_resets, primary.ledger)
         print(f"Wrote reset ledger CSV: {args.export_resets}")
+    if args.export_guardian_buckets:
+        export_guardian_buckets_csv(args.export_guardian_buckets, guardian_rows)
+        print(f"Wrote Guardian bucket CSV: {args.export_guardian_buckets}")
 
     if args.export_chart_data or args.charts:
         chart_rows = build_chart_rows(primary.buckets, args)
@@ -2628,4 +3169,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
