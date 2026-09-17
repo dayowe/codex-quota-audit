@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.8.
+"""Codex quota audit v2.9.
 
 Analyze local Codex rollout logs and relate observed token usage to Codex quota
 meters. The main historical analysis defaults to the 7-day meter; the Guardian /
@@ -29,6 +29,7 @@ Useful commands:
     python3 codex_quota_audit.py --export-resets reset_ledger.csv
     python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
     python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
+    python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
 
 What it does
 ------------
@@ -39,12 +40,14 @@ What it does
 * Pairs codex-auto-review / Guardian inference with likely parent work sessions.
 * Groups Guardian calls into approval episodes and measures incremental inference overhead.
 * Associates approval episodes with conservative 5-hour / 7-day quota envelopes.
+* Estimates Approve-for-me quota cost separately for each reconstructed reset period when identifiable.
+* Reports both percentage points of the 100-point allowance and share of quota actually consumed.
 * Detects explicit linkage metadata when present, otherwise uses confidence-labelled temporal matching.
 * Discovers and analyzes 5-hour and 7-day quota snapshots when present.
 * Compares model/month and detected model-policy regimes.
 * Estimates token-type quota weights only when the data are identifiable enough to support them.
 * Produces model x effort chart data with whole-episode bootstrap intervals.
-* With --charts, writes the model/effort chart and a Guardian approval-overhead chart when enough paired episodes exist.
+* With --charts, writes model/effort, Guardian approval-overhead, and per-reset quota-cost charts when supported.
 
 Raw tokens/cache/model mix are direct observations. API-dollar values use public
 list-price equivalents only as a normalization ruler; they are never plan billing.
@@ -81,7 +84,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.8"
+__version__ = "2.9"
 
 
 # ---------------------------------------------------------------------------
@@ -1393,8 +1396,8 @@ def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis
     max_backstep = max((ep.max_backstep for ep in analysis.episodes), default=0.0)
     effective = kinds.get("scheduled", 0) + kinds.get("early", 0) + kinds.get("after-due", 0)
 
-    print("Codex quota audit v2.7")
-    print("======================")
+    print(f"Codex quota audit v{__version__}")
+    print("=" * len(f"Codex quota audit v{__version__}"))
     source_display = "~/.codex" if args.home == os.path.expanduser("~/.codex") else args.home
     print(f"Source: {source_display}")
     print(f"Target limit: {args.window_minutes} minutes ({args.window_minutes / 1440:.1f} days)")
@@ -2590,6 +2593,238 @@ def guardian_incremental_fit(episodes: Sequence[Dict[str, object]], minutes: int
             "guardian_hi": hi, "condition": cond, "improvement": improve}
 
 
+
+def guardian_period_cost_rows(primary: Analysis,
+                              approval_episodes: Sequence[Dict[str, object]],
+                              fit: Dict[str, object],
+                              args: argparse.Namespace) -> List[Dict[str, object]]:
+    """Estimate auto-review quota cost per reconstructed reset/accounting period.
+
+    The quota meter is cumulative within a reset period, so ``high_used`` is the
+    best local estimate of how much of that period's 100-point allowance was
+    consumed before the next reset. Guardian cost is model-based: the supported
+    global Guardian coefficient is applied to Guardian tokens in each period.
+    The bootstrap coefficient interval is propagated directly into the period
+    estimate. This is observational attribution, not a server-side billing field.
+    """
+    ordered = sorted(primary.episodes, key=lambda ep: (ep.activation_at, ep.reset_at, ep.first_ts))
+    if not ordered:
+        return []
+
+    supported = fit.get("status") == "supported"
+    coef = float(fit.get("guardian_coef", float("nan"))) if supported else float("nan")
+    lo_coef = float(fit.get("guardian_lo", float("nan"))) if supported else float("nan")
+    hi_coef = float(fit.get("guardian_hi", float("nan"))) if supported else float("nan")
+
+    # Guardian inference itself is directly observed, so include every constructed
+    # Guardian episode in the token total. Pair confidence matters for fitting the
+    # coefficient, but not for deciding whether those codex-auto-review tokens exist.
+    approvals = sorted(approval_episodes, key=lambda r: r.get("start"))
+    rows: List[Dict[str, object]] = []
+
+    for i, ep in enumerate(ordered):
+        start = ep.activation_at
+        next_start = ordered[i + 1].activation_at if i + 1 < len(ordered) else None
+        period_approvals = []
+        for r in approvals:
+            ts = r.get("start")
+            if not isinstance(ts, datetime):
+                continue
+            if ts < start:
+                continue
+            if next_start is not None and ts >= next_start:
+                continue
+            period_approvals.append(r)
+
+        guardian_tokens = sum(int(r.get("guardian_tokens", 0) or 0) for r in period_approvals)
+        if guardian_tokens <= 0:
+            continue
+
+        good_pairs = sum(r.get("pair_confidence") in {"high", "medium"} for r in period_approvals)
+        guardian_m = guardian_tokens / 1e6
+        used_points = max(float(ep.high_used), 0.0)
+        observed_new_points = max(float(ep.new_high_points), 0.0)
+
+        est = guardian_m * coef if supported and math.isfinite(coef) else float("nan")
+        est_lo = guardian_m * lo_coef if supported and math.isfinite(lo_coef) else float("nan")
+        est_hi = guardian_m * hi_coef if supported and math.isfinite(hi_coef) else float("nan")
+        share_used = 100.0 * est / used_points if est == est and used_points > EPS else float("nan")
+        share_used_lo = 100.0 * est_lo / used_points if est_lo == est_lo and used_points > EPS else float("nan")
+        share_used_hi = 100.0 * est_hi / used_points if est_hi == est_hi and used_points > EPS else float("nan")
+
+        rows.append({
+            "reset_key": ep.reset_key,
+            "period_start": start,
+            "period_end": next_start,
+            "first_seen": ep.first_ts,
+            "last_seen": ep.last_ts,
+            "first_used": ep.first_used,
+            "period_used_points": used_points,
+            "observed_new_high_points": observed_new_points,
+            "approvals": len(period_approvals),
+            "paired_approvals": good_pairs,
+            "guardian_tokens": guardian_tokens,
+            "guardian_mtokens": guardian_m,
+            "estimate_status": "supported" if supported else "not-identifiable",
+            "estimated_guardian_points": est,
+            "estimated_guardian_points_lo": est_lo,
+            "estimated_guardian_points_hi": est_hi,
+            # One quota point is one percentage point of the 100-point allowance.
+            "estimated_allowance_percent": est,
+            "estimated_allowance_percent_lo": est_lo,
+            "estimated_allowance_percent_hi": est_hi,
+            "estimated_share_of_used_percent": share_used,
+            "estimated_share_of_used_percent_lo": share_used_lo,
+            "estimated_share_of_used_percent_hi": share_used_hi,
+        })
+    return rows
+
+
+def _period_label(row: Dict[str, object]) -> str:
+    start = row.get("period_start")
+    end = row.get("period_end")
+    if isinstance(start, datetime):
+        left = start.strftime("%m-%d")
+    else:
+        left = "?"
+    if isinstance(end, datetime):
+        right = end.strftime("%m-%d")
+    else:
+        right = "current"
+    return f"{left}..{right}"
+
+
+def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str, object],
+                               minutes: int) -> None:
+    print("\nApprove-for-me estimated cost by reset period")
+    print("-----------------------------------------------")
+    if not rows:
+        print(f"No Guardian activity could be assigned to reconstructed {window_label(minutes)} reset periods.")
+        return
+    if fit.get("status") != "supported":
+        print("Guardian tokens can be counted per period, but quota cost is not identifiable from the current data.")
+        if fit.get("reason"):
+            print(f"Reason: {fit.get('reason')}")
+
+    print("`est G pt` is the estimated number of percentage points lost from that period's")
+    print("100-point allowance. `% of used` asks what share of the quota actually consumed")
+    print("in that period the estimate represents. Intervals propagate the 80% bootstrap")
+    print("range of the observational Guardian coefficient; they are not server billing data.\n")
+    print(f"{'period':<15} {'used':>6} {'appr':>6} {'G tok M':>8} {'est G pt':>9} {'80% range':>15} {'% of used':>10}")
+    for r in rows:
+        est = float(r.get("estimated_guardian_points", float("nan")))
+        lo = float(r.get("estimated_guardian_points_lo", float("nan")))
+        hi = float(r.get("estimated_guardian_points_hi", float("nan")))
+        share = float(r.get("estimated_share_of_used_percent", float("nan")))
+        rng = f"{lo:.1f}-{hi:.1f}" if lo == lo and hi == hi else "n/a"
+        est_s = f"{est:.1f}" if est == est else "n/a"
+        share_s = f"{share:.1f}%" if share == share else "n/a"
+        print(f"{_period_label(r):<15} {float(r['period_used_points']):>5.0f}% {int(r['approvals']):>6} "
+              f"{float(r['guardian_mtokens']):>8.1f} {est_s:>9} {rng:>15} {share_s:>10}")
+
+    supported_rows = [r for r in rows if float(r.get("estimated_guardian_points", float("nan"))) ==
+                      float(r.get("estimated_guardian_points", float("nan")))]
+    if supported_rows:
+        used = sum(float(r["period_used_points"]) for r in supported_rows)
+        est = sum(float(r["estimated_guardian_points"]) for r in supported_rows)
+        lo = sum(float(r["estimated_guardian_points_lo"]) for r in supported_rows)
+        hi = sum(float(r["estimated_guardian_points_hi"]) for r in supported_rows)
+        share = 100.0 * est / used if used > EPS else float("nan")
+        print("\nAcross Guardian-active reset periods:")
+        print(f"  quota consumed on meter:          {used:.0f} points")
+        print(f"  estimated Approve-for-me cost:    {est:.1f} points (80% {lo:.1f}-{hi:.1f})")
+        if share == share:
+            print(f"  estimated share of consumed quota: {share:.1f}%")
+        print("The aggregate row sums independent reset periods; the per-period rows above are")
+        print("the useful answer for how much of each allowance was plausibly spent on auto-review.")
+
+
+def export_guardian_period_cost_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    fields = [
+        "reset_key", "period_start", "period_end", "first_seen", "last_seen",
+        "first_used", "period_used_points", "observed_new_high_points",
+        "approvals", "paired_approvals", "guardian_tokens", "guardian_mtokens",
+        "estimate_status", "estimated_guardian_points", "estimated_guardian_points_lo",
+        "estimated_guardian_points_hi", "estimated_allowance_percent",
+        "estimated_allowance_percent_lo", "estimated_allowance_percent_hi",
+        "estimated_share_of_used_percent", "estimated_share_of_used_percent_lo",
+        "estimated_share_of_used_percent_hi",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            cooked = dict(row)
+            for key in ("period_start", "period_end", "first_seen", "last_seen"):
+                value = cooked.get(key)
+                cooked[key] = value.isoformat() if isinstance(value, datetime) else ""
+            w.writerow({k: cooked.get(k, "") for k in fields})
+
+
+def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
+                                 minutes: int) -> Tuple[str, str]:
+    good = [r for r in rows if math.isfinite(float(r.get("estimated_guardian_points", float("nan"))))]
+    if not good:
+        raise RuntimeError("no supported per-period Guardian quota estimates")
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Guardian period charts require matplotlib") from exc
+
+    good = sorted(good, key=lambda r: r["period_start"])
+    labels = [_period_label(r) for r in good]
+    ys = list(range(len(good)))[::-1]
+    fig_h = max(5.5, .62 * len(good) + 2.8)
+    fig, axes = plt.subplots(1, 2, figsize=(15.5, fig_h))
+    fig.patch.set_facecolor(CHART_BG)
+    for ax in axes:
+        ax.set_facecolor(CHART_AX_BG)
+        for spine in ax.spines.values():
+            spine.set_color(CHART_GRID)
+        ax.tick_params(colors=CHART_MUTED)
+        ax.xaxis.grid(True, color=CHART_GRID, linewidth=.8)
+        ax.set_axisbelow(True)
+
+    for y, r in zip(ys, good):
+        est = float(r["estimated_guardian_points"])
+        lo = float(r["estimated_guardian_points_lo"])
+        hi = float(r["estimated_guardian_points_hi"])
+        axes[0].errorbar(est, y, xerr=[[max(0.0, est-lo)], [max(0.0, hi-est)]], fmt="o", capsize=4)
+        axes[0].text(hi + max(.08, hi*.02), y,
+                     f"{est:.1f}pt · {int(r['approvals'])} approvals", color=CHART_FG,
+                     va="center", fontsize=8.5)
+        share = float(r["estimated_share_of_used_percent"])
+        slo = float(r["estimated_share_of_used_percent_lo"])
+        shi = float(r["estimated_share_of_used_percent_hi"])
+        axes[1].errorbar(share, y, xerr=[[max(0.0, share-slo)], [max(0.0, shi-share)]], fmt="o", capsize=4)
+        axes[1].text(shi + max(.25, shi*.02), y,
+                     f"{share:.1f}% · meter used {float(r['period_used_points']):.0f}%",
+                     color=CHART_FG, va="center", fontsize=8.5)
+
+    max_hi = max(float(r["estimated_guardian_points_hi"]) for r in good)
+    max_share_hi = max(float(r["estimated_share_of_used_percent_hi"]) for r in good)
+    axes[0].set_xlim(left=0, right=max(1.0, max_hi * 1.28))
+    axes[1].set_xlim(left=0, right=max(1.0, max_share_hi * 1.28))
+    for ax in axes:
+        ax.set_yticks(ys)
+        ax.set_yticklabels(labels, color=CHART_FG, fontweight="bold")
+    axes[0].set_title("Estimated allowance lost to auto-review", color=CHART_FG, fontweight="bold", loc="left")
+    axes[1].set_title("Estimated share of consumed quota", color=CHART_FG, fontweight="bold", loc="left")
+    axes[0].set_xlabel("Estimated quota percentage points out of 100", color=CHART_MUTED)
+    axes[1].set_xlabel("Estimated Guardian share of quota consumed in period (%)", color=CHART_MUTED)
+    fig.suptitle(f"Approve-for-me cost by {window_label(minutes)} reset period",
+                 color=CHART_FG, fontsize=22, fontweight="bold", x=.06, ha="left")
+    fig.text(.06,.035,
+             "Point estimate uses the observational Guardian coefficient · whiskers propagate its 80% parent-session bootstrap interval",
+             color=CHART_MUTED, fontsize=9)
+    fig.subplots_adjust(left=.15,right=.97,bottom=.13,top=.84,wspace=.28)
+    png, svg = prefix + ".png", prefix + ".svg"
+    Path(png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=180, facecolor=CHART_BG, bbox_inches="tight")
+    fig.savefig(svg, facecolor=CHART_BG, bbox_inches="tight")
+    plt.close(fig)
+    return png, svg
+
 def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> List[Dict[str, object]]:
     """Build conservative attribution rows for every requested/discovered limit window.
 
@@ -2652,7 +2887,9 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
                          rows: Optional[Sequence[Dict[str, object]]] = None,
                          stats: Optional[ParseStats] = None,
                          approval_episodes: Optional[Sequence[Dict[str, object]]] = None,
-                         primary: Optional[Analysis] = None) -> None:
+                         primary: Optional[Analysis] = None,
+                         period_cost_rows: Optional[Sequence[Dict[str, object]]] = None,
+                         target_guardian_fit: Optional[Dict[str, object]] = None) -> None:
     print("\
 Guardian / auto-review approval audit")
     print("-------------------------------------")
@@ -2781,8 +3018,13 @@ Matched manual-approval comparison")
     print("\
 Incremental Guardian quota fit (exploratory)")
     print("--------------------------------------------")
+    fits: Dict[int, Dict[str, object]] = {}
     for minutes in available:
-        fit = guardian_incremental_fit(episodes, minutes, args.guardian_fit_bootstraps)
+        if minutes == args.window_minutes and target_guardian_fit is not None:
+            fit = target_guardian_fit
+        else:
+            fit = guardian_incremental_fit(episodes, minutes, args.guardian_fit_bootstraps)
+        fits[minutes] = fit
         if fit.get("status") != "supported":
             if fit.get("episodes", 0):
                 print(f"{window_label(minutes)}: not identifiable ({fit.get('reason')}; "
@@ -2794,6 +3036,12 @@ Incremental Guardian quota fit (exploratory)")
         print(f"{window_label(minutes)}: provisional Guardian coefficient {g:.3f} quota pt/Mtok "
               f"(bootstrap median {med:.3f}, 80% {lo:.3f}-{hi:.3f}); ~{inv:.2f}M Guardian tok/pt")
         print("        This is an account-global observational fit, not an internal OpenAI quota formula.")
+
+    if primary is not None:
+        target_fit = fits.get(args.window_minutes, target_guardian_fit or {"status": "not identifiable"})
+        pc_rows = list(period_cost_rows) if period_cost_rows is not None else \
+            guardian_period_cost_rows(primary, episodes, target_fit, args)
+        print_guardian_period_cost(pc_rows, target_fit, args.window_minutes)
 
     if rows is None:
         rows = guardian_bucket_rows(events, args)
@@ -3600,6 +3848,29 @@ def run_self_test() -> None:
     assert all(r["episodes"] == 6 for r in cr), cr
     assert all(float(r["tokens_p10_m"]) == float(r["tokens_p10_m"]) for r in cr)
 
+    # Per-reset Guardian-cost attribution: one quota point is one percentage point
+    # of the 100-point allowance, while share-of-used divides by the period meter high.
+    d1 = datetime(2026, 2, 1, tzinfo=timezone.utc).astimezone()
+    d2 = datetime(2026, 2, 8, tzinfo=timezone.utc).astimezone()
+    d3 = datetime(2026, 2, 15, tzinfo=timezone.utc).astimezone()
+    empty_usage = Usage()
+    ep1 = EpisodeSummary(1, d2.timestamp(), d1, d1, d2-timedelta(seconds=1), 0, 50, 50, 50,
+                         0, 0, 0, 2, empty_usage, 0, 0, {}, [])
+    ep2 = EpisodeSummary(2, d3.timestamp(), d2, d2, d3-timedelta(seconds=1), 0, 80, 80, 80,
+                         0, 0, 0, 2, empty_usage, 0, 0, {}, [])
+    pa = Analysis([], [], [ep1, ep2], [], [])
+    apr = [
+        {"start": d1+timedelta(days=1), "guardian_tokens": 5_000_000, "pair_confidence": "high"},
+        {"start": d2+timedelta(days=1), "guardian_tokens": 10_000_000, "pair_confidence": "medium"},
+    ]
+    pfit = {"status": "supported", "guardian_coef": .2, "guardian_lo": .1, "guardian_hi": .3}
+    prows = guardian_period_cost_rows(pa, apr, pfit, argparse.Namespace())
+    assert len(prows) == 2, prows
+    assert abs(float(prows[0]["estimated_guardian_points"]) - 1.0) < 1e-9
+    assert abs(float(prows[0]["estimated_share_of_used_percent"]) - 2.0) < 1e-9
+    assert abs(float(prows[1]["estimated_guardian_points"]) - 2.0) < 1e-9
+    assert abs(float(prows[1]["estimated_share_of_used_percent"]) - 2.5) < 1e-9
+
     print("self-test: OK")
 
 
@@ -3631,6 +3902,9 @@ def build_parser() -> argparse.ArgumentParser:
 
   python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
       Export parent-paired Guardian approval episodes and quota envelopes.
+
+  python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
+      Export estimated Approve-for-me quota cost for each reconstructed reset period.
 
 Chart setup (recommended):
   python3 -m venv .venv
@@ -3674,12 +3948,16 @@ Everything except --charts uses only the Python standard library.
                         help="write Guardian/auto-review high-water attribution buckets to CSV")
     output.add_argument("--export-approval-episodes", metavar="PATH",
                         help="write parent-paired Guardian approval episodes and quota envelopes to CSV")
+    output.add_argument("--export-guardian-periods", metavar="PATH",
+                        help="write estimated Approve-for-me cost by reconstructed reset period to CSV")
     output.add_argument("--charts", action="store_true",
                         help="write quota_chart_data.csv plus model/effort PNG and SVG (requires matplotlib)")
     output.add_argument("--chart-prefix", default="quota_value_by_model_effort",
                         help="output path prefix for --charts PNG/SVG")
     output.add_argument("--guardian-chart-prefix", default="guardian_approval_overhead",
                         help="output path prefix for Guardian approval-overhead PNG/SVG")
+    output.add_argument("--guardian-period-chart-prefix", default="guardian_quota_by_period",
+                        help="output path prefix for per-reset-period Guardian quota-cost PNG/SVG")
     output.add_argument("--chart-all-regimes", action="store_true",
                         help="include every detected policy regime instead of only the latest per model")
 
@@ -3890,11 +4168,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     guardian_rows: List[Dict[str, object]] = []
     approval_episodes: List[Dict[str, object]] = []
-    if not args.no_guardian_audit or args.export_guardian_buckets or args.export_approval_episodes or args.charts:
+    guardian_period_costs: List[Dict[str, object]] = []
+    guardian_target_fit: Dict[str, object] = {"status": "not identifiable", "reason": "no approval episodes"}
+    if (not args.no_guardian_audit or args.export_guardian_buckets or args.export_approval_episodes
+            or args.export_guardian_periods or args.charts):
         guardian_rows = guardian_bucket_rows(primary_records, args)
         approval_episodes = build_approval_episodes(primary_records, stats, args, primary)
+        if approval_episodes:
+            guardian_target_fit = guardian_incremental_fit(
+                approval_episodes, args.window_minutes, args.guardian_fit_bootstraps
+            )
+            guardian_period_costs = guardian_period_cost_rows(
+                primary, approval_episodes, guardian_target_fit, args
+            )
     if not args.no_guardian_audit:
-        print_guardian_audit(primary_records, args, guardian_rows, stats, approval_episodes, primary)
+        print_guardian_audit(primary_records, args, guardian_rows, stats, approval_episodes, primary,
+                             guardian_period_costs, guardian_target_fit)
 
     print_unpriced(primary.events, prices)
     print_notes(primary)
@@ -3911,6 +4200,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.export_approval_episodes:
         export_approval_episodes_csv(args.export_approval_episodes, approval_episodes)
         print(f"Wrote approval episode CSV: {args.export_approval_episodes}")
+    if args.export_guardian_periods:
+        export_guardian_period_cost_csv(args.export_guardian_periods, guardian_period_costs)
+        print(f"Wrote Guardian period-cost CSV: {args.export_guardian_periods}")
 
     if args.export_chart_data or args.charts:
         chart_rows = build_chart_rows(primary.buckets, args)
@@ -3933,6 +4225,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"Wrote Guardian approval charts: {gpng}, {gsvg}")
             except RuntimeError as exc:
                 print(f"Guardian approval chart unavailable: {exc}", file=sys.stderr)
+        if guardian_period_costs:
+            try:
+                ppng, psvg = render_guardian_period_chart(
+                    guardian_period_costs, args.guardian_period_chart_prefix, args.window_minutes
+                )
+                print(f"Wrote Guardian period-cost charts: {ppng}, {psvg}")
+            except RuntimeError as exc:
+                print(f"Guardian period-cost chart unavailable: {exc}", file=sys.stderr)
 
     return 0
 
