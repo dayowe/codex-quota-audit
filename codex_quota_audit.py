@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.11.
+"""Codex quota audit v2.12.
 
 How much Codex work does your quota actually buy?
 
@@ -25,6 +25,7 @@ Charts require matplotlib. A virtual environment is recommended:
 Useful commands:
 
     python3 codex_quota_audit.py --help
+    python3 codex_quota_audit.py --history
     python3 codex_quota_audit.py --diagnostics
     python3 codex_quota_audit.py --weight-details
     python3 codex_quota_audit.py --self-test
@@ -32,18 +33,20 @@ Useful commands:
     python3 codex_quota_audit.py --export-chart-data quota_chart_data.csv
     python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
     python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
+    python3 codex_quota_audit.py --report report.md
+    python3 codex_quota_audit.py --summary-json summary.json
 
 Default output focuses on what most users care about
 ----------------------------------------------------
 * Latest model x reasoning-effort quota efficiency.
-* Detected model-specific quota-policy changes over time.
-* Approve-for-me / Guardian inference overhead.
-* Estimated Guardian quota points lost in each reconstructed reset period.
-* Public GPT-5.4 rate-card-equivalent Guardian work.
-* Monthly quota-value trends and model x month comparisons.
+* Approve-for-me / Guardian inference overhead and per-reset quota cost.
+* Compact data-coverage and quota-policy summaries.
 
-Detailed methodology / diagnostics
-----------------------------------
+Use --history for monthly trends, policy-regime tables, and model x month history.
+
+History / detailed methodology
+------------------------------
+Use --history for monthly trends, policy-regime tables, and model x month history.
 Use --diagnostics (or --verbose) for the data audit, reset ledger, full quota
 episode table, replay sensitivity, detailed Guardian pairing/quota-envelope
 diagnostics, unpriced-model list, and interpretation notes. Use
@@ -88,7 +91,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.11"
+__version__ = "2.12"
 
 
 # ---------------------------------------------------------------------------
@@ -2800,13 +2803,11 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
         if fit.get("reason"):
             print(f"Reason: {fit.get('reason')}")
 
-    print("`est G pt` is the estimated number of percentage points lost from that period's")
-    print("100-point allowance. `% of used` asks what share of the quota actually consumed")
-    print("in that period the estimate represents. `G $eq` is the public GPT-5.4 rate-card")
-    print("equivalent of Guardian inference (including documented >272K long-context multipliers).")
+    print("Guardian M = million auto-review tokens; Guardian $eq = public GPT-5.4 rate-card equivalent.")
+    print("Est quota pt = estimated points of the 100-point allowance consumed by Guardian.")
     print("Intervals propagate the 80% bootstrap range of the observational Guardian coefficient;")
     print("quota estimates are not server billing data, and $eq is not your Pro subscription charge.\n")
-    print(f"{'period':<15} {'used':>6} {'appr':>6} {'G tok M':>8} {'G $eq':>9} {'est G pt':>9} {'80% range':>15} {'% of used':>10}")
+    print(f"{'period':<15} {'used':>6} {'approvals':>9} {'Guardian M':>10} {'Guardian $eq':>12} {'est quota pt':>12} {'80% range':>15} {'% of used':>10}")
     for r in rows:
         est = float(r.get("estimated_guardian_points", float("nan")))
         lo = float(r.get("estimated_guardian_points_lo", float("nan")))
@@ -2817,8 +2818,8 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
         share_s = f"{share:.1f}%" if share == share else "n/a"
         usd = float(r.get("guardian_ratecard_usd", float("nan")))
         usd_s = f"${usd:.2f}" if math.isfinite(usd) else "n/a"
-        print(f"{_period_label(r):<15} {float(r['period_used_points']):>5.0f}% {int(r['approvals']):>6} "
-              f"{float(r['guardian_mtokens']):>8.1f} {usd_s:>9} {est_s:>9} {rng:>15} {share_s:>10}")
+        print(f"{_period_label(r):<15} {float(r['period_used_points']):>5.0f}% {int(r['approvals']):>9} "
+              f"{float(r['guardian_mtokens']):>10.1f} {usd_s:>12} {est_s:>12} {rng:>15} {share_s:>10}")
 
     supported_rows = [r for r in rows if float(r.get("estimated_guardian_points", float("nan"))) ==
                       float(r.get("estimated_guardian_points", float("nan")))]
@@ -2866,7 +2867,13 @@ def export_guardian_period_cost_csv(path: str, rows: Sequence[Dict[str, object]]
 
 
 def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
-                                 minutes: int) -> Tuple[str, str]:
+                                 minutes: int, theme: str = "light") -> Tuple[str, str]:
+    """Render the practical per-reset Approve-for-me cost chart.
+
+    The chart intentionally focuses on the most useful quantity: estimated points
+    lost from each 100-point allowance. The current/incomplete period is drawn as
+    a hollow marker rather than using another decorative color.
+    """
     good = [r for r in rows if math.isfinite(float(r.get("estimated_guardian_points", float("nan"))))]
     if not good:
         raise RuntimeError("no supported per-period Guardian quota estimates")
@@ -2875,59 +2882,61 @@ def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
     except ImportError as exc:
         raise RuntimeError("Guardian period charts require matplotlib") from exc
 
+    pal = chart_palette(theme)
     good = sorted(good, key=lambda r: r["period_start"])
     labels = [_period_label(r) for r in good]
     ys = list(range(len(good)))[::-1]
-    fig_h = max(5.5, .62 * len(good) + 2.8)
-    fig, axes = plt.subplots(1, 2, figsize=(15.5, fig_h))
-    fig.patch.set_facecolor(CHART_BG)
-    for ax in axes:
-        ax.set_facecolor(CHART_AX_BG)
-        for spine in ax.spines.values():
-            spine.set_color(CHART_GRID)
-        ax.tick_params(colors=CHART_MUTED)
-        ax.xaxis.grid(True, color=CHART_GRID, linewidth=.8)
-        ax.set_axisbelow(True)
+    fig_h = max(5.0, .53 * len(good) + 2.5)
+    fig, ax = plt.subplots(figsize=(11.5, fig_h))
+    fig.patch.set_facecolor(pal["bg"])
+    _style_axis(ax, pal)
 
+    max_hi = max(float(r["estimated_guardian_points_hi"]) for r in good)
+    xmax = max(1.0, max_hi * 1.35)
     for y, r in zip(ys, good):
         est = float(r["estimated_guardian_points"])
         lo = float(r["estimated_guardian_points_lo"])
         hi = float(r["estimated_guardian_points_hi"])
-        axes[0].errorbar(est, y, xerr=[[max(0.0, est-lo)], [max(0.0, hi-est)]], fmt="o", capsize=4)
+        current = not isinstance(r.get("period_end"), datetime)
+        marker_face = pal["ax"] if current else pal["accent"]
+        marker_edge = pal["warm"] if current else pal["accent"]
+        ax.errorbar(
+            est, y,
+            xerr=[[max(0.0, est-lo)], [max(0.0, hi-est)]],
+            fmt="o", markersize=7.5, markerfacecolor=marker_face,
+            markeredgecolor=marker_edge, markeredgewidth=1.6,
+            ecolor=pal["whisker"], elinewidth=1.5, capsize=3.5,
+            capthick=1.2, zorder=3,
+        )
         usd = float(r.get("guardian_ratecard_usd", float("nan")))
-        usd_note = f" · ${usd:.0f}eq" if math.isfinite(usd) else ""
-        axes[0].text(hi + max(.08, hi*.02), y,
-                     f"{est:.1f}pt · {int(r['approvals'])} approvals{usd_note}", color=CHART_FG,
-                     va="center", fontsize=8.5)
-        share = float(r["estimated_share_of_used_percent"])
-        slo = float(r["estimated_share_of_used_percent_lo"])
-        shi = float(r["estimated_share_of_used_percent_hi"])
-        axes[1].errorbar(share, y, xerr=[[max(0.0, share-slo)], [max(0.0, shi-share)]], fmt="o", capsize=4)
-        axes[1].text(shi + max(.25, shi*.02), y,
-                     f"{share:.1f}% · meter used {float(r['period_used_points']):.0f}%",
-                     color=CHART_FG, va="center", fontsize=8.5)
+        usd_note = f" · ${usd:.0f} eq" if math.isfinite(usd) else ""
+        suffix = " · current" if current else ""
+        text_x = min(xmax * .97, hi + xmax * .018)
+        ax.text(
+            text_x, y,
+            f"{est:.1f} / 100 · {int(r['approvals'])} approvals{usd_note}{suffix}",
+            color=pal["fg"], va="center", ha="left", fontsize=8.7,
+        )
 
-    max_hi = max(float(r["estimated_guardian_points_hi"]) for r in good)
-    max_share_hi = max(float(r["estimated_share_of_used_percent_hi"]) for r in good)
-    axes[0].set_xlim(left=0, right=max(1.0, max_hi * 1.28))
-    axes[1].set_xlim(left=0, right=max(1.0, max_share_hi * 1.28))
-    for ax in axes:
-        ax.set_yticks(ys)
-        ax.set_yticklabels(labels, color=CHART_FG, fontweight="bold")
-    axes[0].set_title("Estimated allowance lost to auto-review", color=CHART_FG, fontweight="bold", loc="left")
-    axes[1].set_title("Estimated share of consumed quota", color=CHART_FG, fontweight="bold", loc="left")
-    axes[0].set_xlabel("Estimated quota percentage points out of 100", color=CHART_MUTED)
-    axes[1].set_xlabel("Estimated Guardian share of quota consumed in period (%)", color=CHART_MUTED)
-    fig.suptitle(f"Approve-for-me cost by {window_label(minutes)} reset period",
-                 color=CHART_FG, fontsize=22, fontweight="bold", x=.06, ha="left")
-    fig.text(.06,.035,
-             "Point estimate uses the observational Guardian coefficient · whiskers propagate its 80% parent-session bootstrap interval",
-             color=CHART_MUTED, fontsize=9)
-    fig.subplots_adjust(left=.15,right=.97,bottom=.13,top=.84,wspace=.28)
+    ax.set_xlim(0, xmax)
+    ax.set_yticks(ys)
+    ax.set_yticklabels(labels, color=pal["fg"], fontsize=9.5)
+    ax.set_xlabel("Estimated percentage points of the 100-point allowance", color=pal["muted"], labelpad=10)
+    ax.set_title(
+        "Estimated weekly allowance consumed by Approve for me\n"
+        "Point = estimate · whisker = 80% bootstrap interval",
+        color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12,
+    )
+    fig.text(.08, .965, f"Approve-for-me cost by {window_label(minutes)} reset period",
+             color=pal["fg"], fontsize=17, fontweight="semibold", ha="left", va="top")
+    fig.text(.08, .028,
+             "Estimated from local quota telemetry; not a server billing field. Hollow marker = current incomplete period.",
+             color=pal["muted"], fontsize=8.7, ha="left")
+    fig.subplots_adjust(left=.17, right=.965, bottom=.18, top=.84)
     png, svg = prefix + ".png", prefix + ".svg"
     Path(png).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(png, dpi=180, facecolor=CHART_BG, bbox_inches="tight")
-    fig.savefig(svg, facecolor=CHART_BG, bbox_inches="tight")
+    fig.savefig(png, dpi=190, facecolor=pal["bg"], bbox_inches="tight")
+    fig.savefig(svg, facecolor=pal["bg"], bbox_inches="tight")
     plt.close(fig)
     return png, svg
 
@@ -3456,6 +3465,106 @@ def _latest_model_effort_lookup(rows: Sequence[Dict[str, object]]) -> Dict[Tuple
     return out
 
 
+def build_data_coverage(records: Sequence[Event], stats: ParseStats,
+                        chart_rows: Sequence[Dict[str, object]],
+                        approval_episodes: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    """Build a privacy-safe summary of what the local logs can actually support."""
+    coverage: Dict[str, object] = {
+        "files": stats.files,
+        "records": len(records),
+        "log_start": min((e.ts for e in records), default=None),
+        "log_end": max((e.ts for e in records), default=None),
+        "usable_models": sorted({str(r.get("model", "")) for r in chart_rows if r.get("model")}),
+        "auto_review_found": bool(approval_episodes),
+        "windows": {},
+    }
+    windows: Dict[int, List[object]] = {}
+    for e in records:
+        for minutes in e.rate_windows:
+            cur = windows.get(minutes)
+            if cur is None:
+                windows[minutes] = [e.ts, e.ts, 1]
+            else:
+                if e.ts < cur[0]: cur[0] = e.ts
+                if e.ts > cur[1]: cur[1] = e.ts
+                cur[2] = int(cur[2]) + 1
+    coverage["windows"] = windows
+    return coverage
+
+
+def _coverage_span_text(start: object, end: object) -> str:
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return "n/a"
+    return f"{start.strftime('%Y-%m-%d')} -> {end.strftime('%Y-%m-%d')}"
+
+
+def print_data_coverage(coverage: Dict[str, object], target_minutes: int) -> None:
+    print("Data coverage")
+    print("-------------")
+    print(f"logs:                 {_coverage_span_text(coverage.get('log_start'), coverage.get('log_end'))}")
+    print(f"sessions scanned:     {int(coverage.get('files', 0)):,}")
+    windows = coverage.get("windows", {})
+    if isinstance(windows, dict):
+        wanted = []
+        for w in (300, 10080, target_minutes):
+            if w in windows and w not in wanted:
+                wanted.append(w)
+        for w in wanted:
+            start, end, count = windows[w]
+            label = f"{window_label(w)} telemetry:"
+            print(f"{label:<21}{_coverage_span_text(start, end)} ({int(count):,} records)")
+    models = coverage.get("usable_models", [])
+    print(f"models with usable comparisons: {len(models) if isinstance(models, list) else 0}")
+    print(f"auto-review found:    {'yes' if coverage.get('auto_review_found') else 'no'}\n")
+
+
+def _short_regime_span(row: Dict[str, object]) -> str:
+    def one(value: object) -> str:
+        if not value:
+            return "?"
+        try:
+            return datetime.fromisoformat(str(value)).strftime("%b %d").replace(" 0", " ")
+        except Exception:
+            text = str(value)
+            return text[:10]
+    return f"{one(row.get('regime_start'))}-{one(row.get('regime_end'))}"
+
+
+def guardian_summary(period_cost_rows: Sequence[Dict[str, object]],
+                     approval_episodes: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    out: Dict[str, object] = {"detected": bool(approval_episodes), "approval_episodes": len(approval_episodes)}
+    if not approval_episodes:
+        return out
+    good = [r for r in approval_episodes if r.get("pair_confidence") in {"high", "medium"}]
+    out["guardian_tokens"] = sum(int(r.get("guardian_tokens", 0) or 0) for r in good)
+    dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in good]
+    dollars = [x for x in dollars if math.isfinite(x)]
+    out["ratecard_usd"] = sum(dollars)
+    out["ratecard_median_per_approval"] = _q(dollars, .50) if dollars else float("nan")
+    out["ratecard_p90_per_approval"] = _q(dollars, .90) if dollars else float("nan")
+    supported = [r for r in period_cost_rows if math.isfinite(float(r.get("estimated_guardian_points", float("nan"))))]
+    if supported:
+        used = sum(float(r.get("period_used_points", 0) or 0) for r in supported)
+        est = sum(float(r.get("estimated_guardian_points", 0) or 0) for r in supported)
+        lo = sum(float(r.get("estimated_guardian_points_lo", 0) or 0) for r in supported)
+        hi = sum(float(r.get("estimated_guardian_points_hi", 0) or 0) for r in supported)
+        out.update({
+            "active_periods": len(supported),
+            "consumed_points": used,
+            "estimated_points": est,
+            "estimated_points_lo": lo,
+            "estimated_points_hi": hi,
+            "estimated_share_of_consumed_percent": 100.0 * est / used if used > EPS else float("nan"),
+            "median_period_points": _q([float(r["estimated_guardian_points"]) for r in supported], .50),
+        })
+        worst = max(supported, key=lambda r: float(r["estimated_guardian_points"]))
+        out["worst_period"] = _period_label(worst)
+        out["worst_period_points"] = float(worst["estimated_guardian_points"])
+        out["worst_period_lo"] = float(worst["estimated_guardian_points_lo"])
+        out["worst_period_hi"] = float(worst["estimated_guardian_points_hi"])
+    return out
+
+
 def print_key_findings(args: argparse.Namespace,
                        chart_rows: Sequence[Dict[str, object]],
                        regimes: Sequence[PolicyRegime],
@@ -3489,45 +3598,36 @@ def print_key_findings(args: argparse.Namespace,
             sa = float(sol.get("api_usd_per_point", float("nan")))
             aa = float(astra.get("api_usd_per_point", float("nan")))
             if sm > 0 and am > 0:
-                print(f"\nSol high vs Astra high: Astra used ~{sm/am:.2f}x as much quota per observed raw token")
+                print(f"\nSol high {sol.get('regime')} ({_short_regime_span(sol)}) vs "
+                      f"Astra high {astra.get('regime')} ({_short_regime_span(astra)}):")
+                print(f"Astra used ~{sm/am:.2f}x as much quota per observed raw token")
                 if sa > 0 and aa > 0:
-                    print(f"and ~{sa/aa:.2f}x as much quota per API-list-equivalent dollar in these latest regimes.")
+                    print(f"and ~{sa/aa:.2f}x as much quota per API-list-equivalent dollar.")
 
     print("\nApprove for me / Guardian")
     print("-------------------------")
     if not guardian_enabled:
         print("Guardian audit skipped (--no-guardian-audit).")
     elif not approval_episodes:
-        print("No codex-auto-review approval episodes were detected after replay filtering.")
+        print("No auto-review / Guardian inference found in the analyzed logs.")
     else:
-        good = [r for r in approval_episodes if r.get("pair_confidence") in {"high", "medium"}]
-        gt = sum(int(r.get("guardian_tokens", 0) or 0) for r in good)
-        usd_vals = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in good]
-        total_usd = sum(v for v in usd_vals if math.isfinite(v))
-        dollars = [v for v in usd_vals if math.isfinite(v)]
-        print(f"approval episodes:                 {len(approval_episodes):,}")
-        print(f"extra Guardian inference:          {gt/1e6:,.1f}M tokens")
-        if dollars:
-            print(f"public GPT-5.4 rate-card $eq:       ${total_usd:,.2f}")
-            print(f"$eq / approval median / p90:       ${_q(dollars,.50):.2f} / ${_q(dollars,.90):.2f}")
-
-        supported = [r for r in period_cost_rows if math.isfinite(float(r.get("estimated_guardian_points", float("nan"))))]
-        if supported:
-            used = sum(float(r.get("period_used_points", 0) or 0) for r in supported)
-            est = sum(float(r.get("estimated_guardian_points", 0) or 0) for r in supported)
-            lo = sum(float(r.get("estimated_guardian_points_lo", 0) or 0) for r in supported)
-            hi = sum(float(r.get("estimated_guardian_points_hi", 0) or 0) for r in supported)
-            share = 100.0 * est / used if used > EPS else float("nan")
-            median_est = _q([float(r["estimated_guardian_points"]) for r in supported], .50)
-            worst = max(supported, key=lambda r: float(r["estimated_guardian_points"]))
-            print(f"estimated share of consumed {window_label(args.window_minutes)} quota: {share:.1f}%")
-            print(f"median active reset-period cost:    {median_est:.1f} quota points out of 100")
-            print(f"largest estimated reset-period cost: {_period_label(worst)} = "
-                  f"{float(worst['estimated_guardian_points']):.1f} points "
-                  f"(80% {float(worst['estimated_guardian_points_lo']):.1f}-{float(worst['estimated_guardian_points_hi']):.1f})")
-            print(f"aggregate estimate across active periods: {est:.1f} points (80% {lo:.1f}-{hi:.1f})")
+        gs = guardian_summary(period_cost_rows, approval_episodes)
+        gt = int(gs.get("guardian_tokens", 0) or 0)
+        print(f"approval episodes:                      {len(approval_episodes):,}")
+        print(f"extra Guardian inference:               {gt/1e6:,.1f}M tokens")
+        usd = float(gs.get("ratecard_usd", float("nan")))
+        if math.isfinite(usd):
+            print(f"public GPT-5.4 rate-card $eq:            ${usd:,.2f}")
+            print(f"$eq / approval median / p90:            ${float(gs['ratecard_median_per_approval']):.2f} / ${float(gs['ratecard_p90_per_approval']):.2f}")
+        if "estimated_points" in gs:
+            print("Estimated Approve-for-me overhead")
+            print(f"  typical active reset period:          ~{float(gs['median_period_points']):.1f} / 100 quota points")
+            print(f"  worst observed reset period:          ~{float(gs['worst_period_points']):.1f} / 100 "
+                  f"({gs.get('worst_period', '?')})")
+            print(f"  share of consumed quota while active: ~{float(gs['estimated_share_of_consumed_percent']):.1f}%")
+            print(f"  worst-period 80% interval:            {float(gs['worst_period_lo']):.1f}-{float(gs['worst_period_hi']):.1f} points")
         elif guardian_fit.get("status") != "supported":
-            print("Guardian quota cost:               not identifiable from the available meter data")
+            print("Guardian quota cost:                    not identifiable from the available meter data")
 
     by_model: Dict[str, int] = Counter(rg.model for rg in regimes)
     changed = sorted(m for m, n in by_model.items() if n > 1)
@@ -3539,8 +3639,166 @@ def print_key_findings(args: argparse.Namespace,
     else:
         print("No model-specific policy-regime break met the configured evidence thresholds.")
 
-    print("\nUse --diagnostics for reset/replay/telemetry details and --weight-details for experimental token-weight fits.")
+    print("\nUse --history for monthly/regime history, --diagnostics for telemetry details,")
+    print("and --weight-details for experimental token-weight fits.")
 
+
+def _json_float(value: object) -> object:
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+    return value
+
+
+def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, object],
+                       chart_rows: Sequence[Dict[str, object]], regimes: Sequence[PolicyRegime],
+                       approval_episodes: Sequence[Dict[str, object]],
+                       period_cost_rows: Sequence[Dict[str, object]]) -> None:
+    windows_out = {}
+    windows = coverage.get("windows", {})
+    if isinstance(windows, dict):
+        for minutes, values in windows.items():
+            start, end, count = values
+            windows_out[str(minutes)] = {
+                "label": window_label(int(minutes)),
+                "start": start.isoformat() if isinstance(start, datetime) else None,
+                "end": end.isoformat() if isinstance(end, datetime) else None,
+                "records": int(count),
+            }
+    changed = Counter(rg.model for rg in regimes)
+    gs = guardian_summary(period_cost_rows, approval_episodes)
+    periods = []
+    for r in period_cost_rows:
+        periods.append({
+            "period": _period_label(r),
+            "used_points": _json_float(float(r.get("period_used_points", float("nan")))),
+            "approvals": int(r.get("approvals", 0) or 0),
+            "guardian_mtokens": _json_float(float(r.get("guardian_mtokens", float("nan")))),
+            "guardian_ratecard_usd": _json_float(float(r.get("guardian_ratecard_usd", float("nan")))),
+            "estimated_guardian_points": _json_float(float(r.get("estimated_guardian_points", float("nan")))),
+            "estimated_guardian_points_lo": _json_float(float(r.get("estimated_guardian_points_lo", float("nan")))),
+            "estimated_guardian_points_hi": _json_float(float(r.get("estimated_guardian_points_hi", float("nan")))),
+        })
+    model_rows = []
+    for r in chart_rows:
+        model_rows.append({
+            "model": str(r.get("model", "")), "effort": str(r.get("effort", "")),
+            "regime": str(r.get("regime", "")), "regime_start": r.get("regime_start"), "regime_end": r.get("regime_end"),
+            "quota_points": _json_float(float(r.get("quota_points", float("nan")))),
+            "episodes": int(r.get("episodes", 0) or 0),
+            "tokens_m_per_point": _json_float(float(r.get("tokens_m_per_point", float("nan")))),
+            "api_usd_per_point": _json_float(float(r.get("api_usd_per_point", float("nan")))),
+        })
+    payload = {
+        "schema": "codex-quota-audit-summary-v1",
+        "version": __version__,
+        "target_limit": {"window_minutes": args.window_minutes, "label": window_label(args.window_minutes)},
+        "coverage": {
+            "log_start": coverage.get("log_start").isoformat() if isinstance(coverage.get("log_start"), datetime) else None,
+            "log_end": coverage.get("log_end").isoformat() if isinstance(coverage.get("log_end"), datetime) else None,
+            "sessions_scanned": int(coverage.get("files", 0)),
+            "windows": windows_out,
+        },
+        "model_effort": model_rows,
+        "policy_regime_changes": sorted(m for m, n in changed.items() if n > 1),
+        "guardian": {k: _json_float(v) for k, v in gs.items()},
+        "guardian_periods": periods,
+        "notes": [
+            "API-dollar values are public list-price-equivalent normalization, not subscription billing.",
+            "Guardian quota estimates are observational, not server billing data.",
+        ],
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+
+
+def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[str, object],
+                          chart_rows: Sequence[Dict[str, object]], regimes: Sequence[PolicyRegime],
+                          approval_episodes: Sequence[Dict[str, object]],
+                          period_cost_rows: Sequence[Dict[str, object]],
+                          chart_files: Sequence[str]) -> None:
+    """Write a privacy-safe, shareable report containing headline aggregates only."""
+    lines: List[str] = ["# Codex quota report", "", f"Generated by `codex_quota_audit.py` v{__version__}.", ""]
+    lines += ["## Data coverage", "", f"- Logs: {_coverage_span_text(coverage.get('log_start'), coverage.get('log_end'))}",
+              f"- Sessions scanned: {int(coverage.get('files', 0)):,}",
+              f"- Target limit: {window_label(args.window_minutes)} ({args.window_minutes} minutes)", ""]
+    lines += ["## Model / effort quota value", "",
+              "Higher values mean more observed work per quota percentage point.", "",
+              "| Model | Effort | Regime | Tokens / 1% | API $eq / 1% | Evidence |",
+              "| --- | --- | --- | ---: | ---: | ---: |"]
+    for r in sorted(chart_rows, key=lambda x: (str(x.get('model')), str(x.get('effort')))):
+        api = float(r.get("api_usd_per_point", float("nan")))
+        lines.append(f"| {r.get('model')} | {r.get('effort')} | {r.get('regime')} | "
+                     f"{float(r.get('tokens_m_per_point',0)):.2f}M | "
+                     f"{'$'+format(api,'.2f') if math.isfinite(api) else 'n/a'} | "
+                     f"{float(r.get('quota_points',0)):.0f}pt / {int(r.get('episodes',0))}ep |")
+    lookup = _latest_model_effort_lookup(chart_rows)
+    sol, astra = lookup.get(("gpt-5.6-sol","high")), lookup.get(("gpt-6-astra","high"))
+    if sol and astra:
+        sm, am = float(sol["tokens_m_per_point"]), float(astra["tokens_m_per_point"])
+        sa, aa = float(sol.get("api_usd_per_point",float("nan"))), float(astra.get("api_usd_per_point",float("nan")))
+        lines += ["", f"Sol high ({_short_regime_span(sol)}) vs Astra high ({_short_regime_span(astra)}): "
+                  f"Astra used about **{sm/am:.2f}x** as much quota per observed raw token"
+                  + (f" and **{sa/aa:.2f}x** as much per API-list-equivalent dollar." if sa>0 and aa>0 else ".")]
+    lines += [""]
+
+    lines += ["## Approve for me / Guardian", ""]
+    if not approval_episodes:
+        lines += ["No auto-review / Guardian inference was found in the analyzed logs.", ""]
+    else:
+        gs = guardian_summary(period_cost_rows, approval_episodes)
+        lines += [f"- Approval episodes: {len(approval_episodes):,}",
+                  f"- Extra Guardian inference: {int(gs.get('guardian_tokens',0))/1e6:.1f}M tokens"]
+        if math.isfinite(float(gs.get("ratecard_usd", float("nan")))):
+            lines.append(f"- Public GPT-5.4 rate-card equivalent: ${float(gs['ratecard_usd']):.2f}")
+        if "estimated_share_of_consumed_percent" in gs:
+            lines += [f"- Estimated share of consumed quota while Guardian was active: {float(gs['estimated_share_of_consumed_percent']):.1f}%",
+                      f"- Typical active reset-period cost: {float(gs['median_period_points']):.1f} / 100 quota points",
+                      f"- Worst observed reset period: {gs['worst_period']} = {float(gs['worst_period_points']):.1f} / 100 "
+                      f"(80% interval {float(gs['worst_period_lo']):.1f}-{float(gs['worst_period_hi']):.1f})"]
+        lines += [""]
+        if period_cost_rows:
+            lines += ["### Estimated cost by reset period", "",
+                      "| Period | Used | Approvals | Guardian tokens | Guardian $eq | Est. quota points | 80% interval |",
+                      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+            for r in period_cost_rows:
+                est = float(r.get("estimated_guardian_points", float("nan")))
+                lo = float(r.get("estimated_guardian_points_lo", float("nan")))
+                hi = float(r.get("estimated_guardian_points_hi", float("nan")))
+                usd = float(r.get("guardian_ratecard_usd", float("nan")))
+                lines.append(f"| {_period_label(r)} | {float(r.get('period_used_points',0)):.0f}% | {int(r.get('approvals',0))} | "
+                             f"{float(r.get('guardian_mtokens',0)):.1f}M | {'$'+format(usd,'.2f') if math.isfinite(usd) else 'n/a'} | "
+                             f"{format(est,'.1f') if math.isfinite(est) else 'n/a'} | "
+                             f"{format(lo,'.1f')+'-'+format(hi,'.1f') if math.isfinite(lo) and math.isfinite(hi) else 'n/a'} |")
+            lines += [""]
+
+    changed = Counter(rg.model for rg in regimes)
+    changed_models = sorted(m for m,n in changed.items() if n>1)
+    lines += ["## Quota policy", ""]
+    if changed_models:
+        lines.append("Detected historical quota-policy regime changes for: " + ", ".join(changed_models) + ".")
+    else:
+        lines.append("No model-specific policy-regime break met the configured evidence thresholds.")
+    lines += [""]
+
+    pngs = [x for x in chart_files if str(x).lower().endswith(".png")]
+    if pngs:
+        lines += ["## Charts", ""]
+        report_dir = Path(path).parent.resolve()
+        for chart in pngs:
+            cp = Path(chart).resolve()
+            try:
+                rel = os.path.relpath(cp, report_dir)
+            except Exception:
+                rel = cp.name
+            label = cp.stem.replace("_", " ").title()
+            lines += [f"### {label}", "", f"![{label}]({rel})", ""]
+
+    lines += ["## Notes", "",
+              "- API `$eq` values are public list-price-equivalent normalization, not subscription billing or internal compute cost.",
+              "- Guardian quota estimates are observational estimates from local telemetry, not OpenAI server billing fields.",
+              "- Replayed rollout history is excluded by default.", ""]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
 
 def export_chart_data_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
     fields = [
@@ -3577,83 +3835,99 @@ def print_chart_data_summary(rows: Sequence[Dict[str, object]], args: argparse.N
     print(f"chart rows:                    {len(rows):,}")
 
 
-EFFORT_COLORS = {
-    "low": "#57d68d",
-    "medium": "#43b7e9",
-    "high": "#f5a316",
-    "xhigh": "#f06d88",
-    "ultra": "#b87bea",
-    "max": "#d9dde5",
+CHART_THEMES: Dict[str, Dict[str, str]] = {
+    "light": {
+        "bg": "#F6F7F9",
+        "ax": "#FFFFFF",
+        "fg": "#1F2933",
+        "muted": "#687482",
+        "grid": "#E3E7EB",
+        "accent": "#356A96",
+        "accent_soft": "#7393AE",
+        "whisker": "#AAB4BE",
+        "warm": "#A56246",
+    },
+    "dark": {
+        "bg": "#101419",
+        "ax": "#151B22",
+        "fg": "#E7EBEF",
+        "muted": "#9AA5B1",
+        "grid": "#2A333D",
+        "accent": "#7FA9CC",
+        "accent_soft": "#9CB4C8",
+        "whisker": "#5F6B76",
+        "warm": "#D09A7D",
+    },
 }
-CHART_BG = "#081321"
-CHART_AX_BG = "#111d31"
-CHART_FG = "#dce4ee"
-CHART_MUTED = "#93a4ba"
-CHART_GRID = "#29364b"
+
+EFFORT_MARKERS = {
+    "low": "v",
+    "medium": "s",
+    "high": "o",
+    "xhigh": "D",
+    "ultra": "^",
+    "max": "P",
+}
+
+
+def chart_palette(theme: str) -> Dict[str, str]:
+    return CHART_THEMES.get(theme, CHART_THEMES["light"])
+
+
+def _style_axis(ax: object, pal: Dict[str, str]) -> None:
+    ax.set_facecolor(pal["ax"])
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(pal["grid"])
+        ax.spines[side].set_linewidth(.8)
+    ax.tick_params(colors=pal["muted"], labelsize=9.5, length=3)
+    ax.xaxis.grid(True, color=pal["grid"], linewidth=.8)
+    ax.yaxis.grid(False)
+    ax.set_axisbelow(True)
 
 
 def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
                        interval: float, all_regimes: bool,
+                       theme: str = "light",
                        title: str = "Quota value by model and effort") -> Tuple[str, str]:
-    """Write the model x effort chart as PNG and SVG.
-
-    matplotlib is intentionally imported lazily so the normal analyzer remains
-    standard-library-only.
-    """
+    """Write a restrained, report-style model x effort chart as PNG and SVG."""
     if not rows:
         raise RuntimeError("no qualifying model x effort chart rows")
     try:
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
     except ImportError as exc:
-        raise RuntimeError(
-            "Charts require matplotlib.\n\n"
-            "Create a virtual environment and install it with:\n"
-            "  python3 -m venv .venv\n"
-            "  source .venv/bin/activate\n"
-            "  python3 -m pip install matplotlib\n\n"
-            "Then run:\n"
-            "  python3 codex_quota_audit.py --charts"
-        ) from exc
+        raise RuntimeError("charts require matplotlib; install with `python3 -m pip install matplotlib`") from exc
 
-    regimes_per_model: Dict[str, set] = defaultdict(set)
-    for r in rows:
-        regimes_per_model[str(r["model"])].add(str(r["regime"]))
-    multi_regime_models = {m for m, regs in regimes_per_model.items() if len(regs) > 1}
-
+    pal = chart_palette(theme)
     groups = sorted(
         {(str(r["model"]), str(r["regime"]), str(r.get("regime_start", ""))) for r in rows},
         key=lambda x: (x[0], x[2], x[1]),
     )
-    group_index = {(m, rg): i for i, (m, rg, _s) in enumerate(groups)}
+    group_index = {g[:2]: i for i, g in enumerate(groups)}
     group_rows: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
     for r in rows:
         group_rows[(str(r["model"]), str(r["regime"]))].append(r)
-
+    model_counts = Counter(m for m, _reg, _start in groups)
+    multi_regime_models = {m for m, n in model_counts.items() if n > 1}
     n_groups = len(groups)
-    fig_h = max(6.7, 1.25 * n_groups + 2.9)
-    fig, axes = plt.subplots(1, 2, figsize=(17.2, fig_h), sharey=False)
-    fig.patch.set_facecolor(CHART_BG)
 
+    fig_h = max(6.3, 0.78 * n_groups + 2.3)
+    fig, axes = plt.subplots(1, 2, figsize=(15.2, fig_h))
+    fig.patch.set_facecolor(pal["bg"])
     for ax in axes:
-        ax.set_facecolor(CHART_AX_BG)
-        for spine in ax.spines.values():
-            spine.set_color(CHART_GRID)
-        ax.tick_params(colors=CHART_MUTED, labelsize=10)
-        ax.xaxis.grid(True, color=CHART_GRID, linewidth=0.8)
-        ax.yaxis.grid(False)
-        ax.set_axisbelow(True)
+        _style_axis(ax, pal)
 
     present_efforts = [e for e in EFFORT_ORDER if any(str(r["effort"]) == e for r in rows)]
-    extras = sorted({str(r["effort"]) for r in rows} - set(EFFORT_ORDER))
-    present_efforts += extras
+    present_efforts += sorted({str(r["effort"]) for r in rows} - set(EFFORT_ORDER))
     offsets: Dict[str, float] = {}
     if len(present_efforts) == 1:
         offsets[present_efforts[0]] = 0.0
     else:
-        span = 0.42
+        span = .38
         for i, effort in enumerate(present_efforts):
-            offsets[effort] = -span / 2 + span * i / (len(present_efforts) - 1)
+            offsets[effort] = -span/2 + span*i/(len(present_efforts)-1)
 
     def finite(x: object) -> bool:
         try:
@@ -3669,8 +3943,8 @@ def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
         float(r["api_p90"]) if finite(r.get("api_p90")) else float(r["api_usd_per_point"])
         for r in rows if finite(r.get("api_usd_per_point"))
     ]
-    token_xlim = max(1.0, max(token_candidates or [1.0]) * 1.22)
-    api_xlim = max(1.0, max(api_candidates or [1.0]) * 1.22)
+    token_xlim = max(1.0, max(token_candidates or [1.0]) * 1.25)
+    api_xlim = max(1.0, max(api_candidates or [1.0]) * 1.25)
 
     panels = [
         (axes[0], "tokens_m_per_point", "tokens_p10_m", "tokens_p90_m", token_xlim),
@@ -3685,28 +3959,30 @@ def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
             val = float(r[value_key])
             lo = float(r[lo_key]) if finite(r.get(lo_key)) else val
             hi = float(r[hi_key]) if finite(r.get(hi_key)) else val
-            color = EFFORT_COLORS.get(effort, "#c8d0da")
+            marker = EFFORT_MARKERS.get(effort, "o")
             ax.errorbar(
                 val, y,
-                xerr=[[max(0.0, val - lo)], [max(0.0, hi - val)]],
-                fmt="o", markersize=7.5, color=color, ecolor=color,
-                elinewidth=1.8, capsize=4, capthick=1.4, zorder=3,
+                xerr=[[max(0.0, val-lo)], [max(0.0, hi-val)]],
+                fmt=marker, markersize=7.2,
+                markerfacecolor=pal["accent"], markeredgecolor=pal["accent"],
+                color=pal["accent"], ecolor=pal["whisker"],
+                elinewidth=1.45, capsize=3.5, capthick=1.1, zorder=3,
             )
             pts_key = "quota_points" if panel == 0 else "api_quota_points"
             eps_key = "episodes" if panel == 0 else "api_episodes"
             pts = float(r.get(pts_key, 0) or 0)
             eps = float(r.get(eps_key, 0) or 0)
-            text_x = min(xmax * 0.97, max(val, hi) + xmax * 0.012)
+            text_x = min(xmax*.975, max(val,hi) + xmax*.012)
             ax.text(text_x, y, f"{val:.1f} · {pts:.0f}pt · {eps:.0f}ep",
-                    color=CHART_FG, fontsize=8.4, va="center", ha="left")
+                    color=pal["fg"], fontsize=8.2, va="center", ha="left")
 
         if panel == 1:
             for model, regime, _start in groups:
                 rs = group_rows[(model, regime)]
                 if not any(finite(r.get("api_usd_per_point")) for r in rs):
                     y0 = n_groups - 1 - group_index[(model, regime)]
-                    ax.text(xmax * 0.42, y0, "unpriced / insufficient priced data",
-                            color=CHART_MUTED, fontsize=8.5, fontstyle="italic",
+                    ax.text(xmax*.46, y0, "unpriced / insufficient data",
+                            color=pal["muted"], fontsize=8.2, fontstyle="italic",
                             va="center", ha="center")
 
         labels, yticks = [], []
@@ -3714,60 +3990,58 @@ def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
             yticks.append(n_groups - 1 - group_index[(model, regime)])
             labels.append(f"{model} {regime}" if model in multi_regime_models else model)
         ax.set_yticks(yticks)
-        ax.set_yticklabels(labels, color=CHART_FG, fontsize=11, fontweight="bold")
-        ax.set_ylim(-0.65, n_groups - 0.35)
+        ax.set_yticklabels(labels, color=pal["fg"], fontsize=10.5, fontweight="semibold")
+        ax.set_ylim(-.6, n_groups-.4)
         ax.set_xlim(0, xmax)
 
-    axes[0].set_title("Token throughput", color=CHART_FG, fontsize=16, fontweight="bold", loc="left", pad=15)
-    axes[1].set_title("API-list-equivalent value", color=CHART_FG, fontsize=16, fontweight="bold", loc="left", pad=15)
-    axes[0].set_xlabel("Million observed tokens per 1% quota", color=CHART_MUTED, fontsize=10, labelpad=10)
-    axes[1].set_xlabel("API-list-equivalent dollars per 1% quota", color=CHART_MUTED, fontsize=10, labelpad=10)
+    axes[0].set_title("Token throughput\nHigher = more work per 1% quota",
+                      color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12)
+    axes[1].set_title("API-list-equivalent value\nHigher = more work per 1% quota",
+                      color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12)
+    axes[0].set_xlabel("Million observed tokens per 1% quota", color=pal["muted"], fontsize=9.5, labelpad=9)
+    axes[1].set_xlabel("API-list-equivalent dollars per 1% quota", color=pal["muted"], fontsize=9.5, labelpad=9)
 
-    fig.text(0.055, 0.982, title, color=CHART_FG, fontsize=25, fontweight="bold", ha="left", va="top")
+    fig.text(.06,.965,title,color=pal["fg"],fontsize=18,fontweight="semibold",ha="left",va="top")
     scope = "Detected policy regimes" if all_regimes or multi_regime_models else "Latest detected policy regime per model"
-    fig.text(
-        0.055, 0.935,
-        f"{scope} · high-water quota buckets · whiskers are {interval:.0%} whole-episode bootstrap intervals",
-        color=CHART_MUTED, fontsize=11.5, ha="left",
-    )
+    fig.text(.06,.905,
+             f"{scope} · high-water quota buckets · whiskers show {interval:.0%} whole-episode bootstrap intervals",
+             color=pal["muted"],fontsize=9.5,ha="left")
 
     handles = [
-        Line2D([0], [0], marker="o", linestyle="None", markersize=9,
-               markerfacecolor=EFFORT_COLORS.get(e, "#c8d0da"), markeredgecolor="none", label=e)
+        Line2D([0],[0], marker=EFFORT_MARKERS.get(e,"o"), linestyle="None", markersize=7,
+               markerfacecolor=pal["accent"], markeredgecolor=pal["accent"], label=e)
         for e in present_efforts
     ]
-    fig.legend(handles=handles, labels=present_efforts, loc="upper right", bbox_to_anchor=(0.965, 0.982),
-               frameon=False, ncol=max(1, len(handles)), labelcolor=CHART_FG, fontsize=10,
-               handletextpad=0.4, columnspacing=1.3)
+    if handles:
+        fig.legend(handles=handles, labels=present_efforts, loc="upper right", bbox_to_anchor=(.965,.965),
+                   frameon=False, ncol=max(1,len(handles)), labelcolor=pal["fg"], fontsize=8.8,
+                   handletextpad=.35, columnspacing=1.05)
 
-    fig.text(0.055, 0.060,
-             "Point labels: value · pt=observed quota points · ep=independent accounting episodes. "
-             "Higher means more observed throughput/value per quota point.",
-             color=CHART_MUTED, fontsize=9.2, ha="left")
-    fig.text(0.055, 0.035,
-             "Replayed rollout history is excluded. API prices are a normalization ruler, not plan billing. "
-             "Model/effort purity and minimum-evidence thresholds are applied by the analyzer.",
-             color=CHART_MUTED, fontsize=9.2, ha="left")
-
-    fig.subplots_adjust(left=0.055, right=0.965, bottom=0.17, top=0.84, wspace=0.22)
-    png = prefix + ".png"
-    svg = prefix + ".svg"
+    fig.text(.06,.047,
+             "Labels: value · observed quota points (pt) · independent accounting episodes (ep).",
+             color=pal["muted"],fontsize=8.3,ha="left")
+    fig.text(.06,.025,
+             "Replay history excluded. API prices are a normalization ruler, not subscription billing.",
+             color=pal["muted"],fontsize=8.3,ha="left")
+    fig.subplots_adjust(left=.06,right=.965,bottom=.15,top=.76,wspace=.22)
+    png, svg = prefix+".png", prefix+".svg"
     Path(png).parent.mkdir(parents=True, exist_ok=True)
     Path(svg).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(png, dpi=180, facecolor=CHART_BG, bbox_inches="tight")
-    fig.savefig(svg, facecolor=CHART_BG, bbox_inches="tight")
+    fig.savefig(png,dpi=190,facecolor=pal["bg"],bbox_inches="tight")
+    fig.savefig(svg,facecolor=pal["bg"],bbox_inches="tight")
     plt.close(fig)
     return png, svg
 
 
-def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str) -> Tuple[str, str]:
-    """Render Guardian overhead by paired parent model/effort."""
-    good = [r for r in rows if r.get("pair_confidence") in {"high", "medium"}
-            and int(r.get("parent_tokens", 0) or 0) > 0]
-    groups: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str,
+                                  theme: str = "light") -> Tuple[str, str]:
+    """Render approval overhead with a restrained single-accent report style."""
+    good = [r for r in rows if r.get("pair_confidence") in {"high","medium"}
+            and int(r.get("parent_tokens",0) or 0) > 0]
+    groups: Dict[Tuple[str,str], List[Dict[str, object]]] = defaultdict(list)
     for r in good:
-        groups[(str(r.get("parent_model", "unknown")), str(r.get("parent_effort", "unknown")))].append(r)
-    groups = {k: v for k, v in groups.items() if len(v) >= 3 and k[0] != "unknown"}
+        groups[(str(r.get("parent_model","unknown")), str(r.get("parent_effort","unknown")))].append(r)
+    groups = {k:v for k,v in groups.items() if len(v)>=3 and k[0] != "unknown"}
     if not groups:
         raise RuntimeError("no Guardian parent groups with at least 3 medium/high-confidence approval episodes")
     try:
@@ -3775,49 +4049,62 @@ def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str
     except ImportError as exc:
         raise RuntimeError("Guardian charts require matplotlib") from exc
 
+    pal = chart_palette(theme)
     ordered = sorted(groups)
-    fig_h = max(5.5, 0.8 * len(ordered) + 2.6)
-    fig, axes = plt.subplots(1, 2, figsize=(15.5, fig_h))
-    fig.patch.set_facecolor(CHART_BG)
+    fig_h = max(5.2, .72*len(ordered)+2.4)
+    fig, axes = plt.subplots(1,2,figsize=(14.8,fig_h))
+    fig.patch.set_facecolor(pal["bg"])
     for ax in axes:
-        ax.set_facecolor(CHART_AX_BG)
-        for spine in ax.spines.values():
-            spine.set_color(CHART_GRID)
-        ax.tick_params(colors=CHART_MUTED)
-        ax.xaxis.grid(True, color=CHART_GRID, linewidth=.8)
-        ax.set_axisbelow(True)
+        _style_axis(ax,pal)
     ys = list(range(len(ordered)))[::-1]
-    labels = [f"{m} {e}" for m, e in ordered]
-    for y, key in zip(ys, ordered):
-        rs = groups[key]
-        vals = [float(r["guardian_tokens"]) / 1e6 for r in rs]
-        med, lo, hi = _q(vals,.5), _q(vals,.1), _q(vals,.9)
-        dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in rs]
-        dollars = [x for x in dollars if math.isfinite(x)]
-        dollar_note = f" · ${_q(dollars,.5):.2f}eq" if dollars else ""
-        axes[0].errorbar(med, y, xerr=[[med-lo],[hi-med]], fmt="o", capsize=4)
-        axes[0].text(hi + max(0.01, hi*.02), y, f"{med:.2f}M · {len(rs)}ep{dollar_note}", color=CHART_FG, va="center", fontsize=8.5)
-        shares = [float(r["guardian_share_local"]) for r in rs if math.isfinite(float(r["guardian_share_local"]))]
-        smed, slo, shi = _q(shares,.5), _q(shares,.1), _q(shares,.9)
-        axes[1].errorbar(smed*100, y, xerr=[[(smed-slo)*100],[(shi-smed)*100]], fmt="o", capsize=4)
-        axes[1].text(shi*100 + 1, y, f"{smed:.0%} · {len(rs)}ep", color=CHART_FG, va="center", fontsize=8.5)
+    labels = [f"{m} {e}" for m,e in ordered]
+
+    for y,key in zip(ys,ordered):
+        rs=groups[key]
+        vals=[float(r["guardian_tokens"])/1e6 for r in rs]
+        med,lo,hi=_q(vals,.5),_q(vals,.1),_q(vals,.9)
+        dollars=[float(r.get("guardian_ratecard_usd",float("nan"))) for r in rs]
+        dollars=[x for x in dollars if math.isfinite(x)]
+        note=f" · ${_q(dollars,.5):.2f} eq" if dollars else ""
+        axes[0].errorbar(med,y,xerr=[[med-lo],[hi-med]],fmt="o",markersize=7.2,
+                         color=pal["accent"],markerfacecolor=pal["accent"],
+                         ecolor=pal["whisker"],elinewidth=1.45,capsize=3.5)
+        axes[0].text(.68,y,f"{med:.2f}M · {len(rs)}ep{note}",
+                     transform=axes[0].get_yaxis_transform(), color=pal["fg"],
+                     va="center",ha="left",fontsize=8.4,clip_on=True)
+        shares=[float(r["guardian_share_local"]) for r in rs if math.isfinite(float(r["guardian_share_local"]))]
+        smed,slo,shi=_q(shares,.5),_q(shares,.1),_q(shares,.9)
+        axes[1].errorbar(smed*100,y,xerr=[[(smed-slo)*100],[(shi-smed)*100]],fmt="o",markersize=7.2,
+                         color=pal["accent"],markerfacecolor=pal["accent"],
+                         ecolor=pal["whisker"],elinewidth=1.45,capsize=3.5)
+        axes[1].text(.68,y,f"{smed:.0%} · {len(rs)}ep",
+                     transform=axes[1].get_yaxis_transform(), color=pal["fg"],
+                     va="center",ha="left",fontsize=8.4,clip_on=True)
+
+    token_hi = max(_q([float(r["guardian_tokens"])/1e6 for r in rs], .9) for rs in groups.values())
+    share_hi = max(_q([float(r["guardian_share_local"])*100 for r in rs
+                       if math.isfinite(float(r["guardian_share_local"]))], .9) for rs in groups.values())
+    axes[0].set_xlim(0, max(.1, token_hi * 1.38))
+    axes[1].set_xlim(0, max(1.0, share_hi * 1.38))
     for ax in axes:
         ax.set_yticks(ys)
-        ax.set_yticklabels(labels, color=CHART_FG, fontweight="bold")
-    axes[0].set_title("Guardian tokens per approval", color=CHART_FG, fontweight="bold", loc="left")
-    axes[1].set_title("Guardian share of local approval context", color=CHART_FG, fontweight="bold", loc="left")
-    axes[0].set_xlabel("Million codex-auto-review tokens", color=CHART_MUTED)
-    axes[1].set_xlabel("Guardian share of Guardian + paired parent context (%)", color=CHART_MUTED)
-    fig.suptitle("Auto-review approval overhead", color=CHART_FG, fontsize=22, fontweight="bold", x=.06, ha="left")
-    fig.text(.06,.035,"Medium/high-confidence parent pairs only · whiskers are p10-p90 across approval episodes · quota causality is not implied",
-             color=CHART_MUTED, fontsize=9)
-    fig.subplots_adjust(left=.18,right=.97,bottom=.13,top=.84,wspace=.25)
-    png, svg = prefix + ".png", prefix + ".svg"
-    Path(png).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(png,dpi=180,facecolor=CHART_BG,bbox_inches="tight")
-    fig.savefig(svg,facecolor=CHART_BG,bbox_inches="tight")
+        ax.set_yticklabels(labels,color=pal["fg"],fontsize=9.8,fontweight="semibold")
+    axes[0].set_title("Guardian tokens per approval\nMedian point · p10-p90 whisker",
+                      color=pal["fg"],fontweight="semibold",fontsize=12,loc="left",pad=10)
+    axes[1].set_title("Guardian share of local approval context\nMedian point · p10-p90 whisker",
+                      color=pal["fg"],fontweight="semibold",fontsize=12,loc="left",pad=10)
+    axes[0].set_xlabel("Million codex-auto-review tokens",color=pal["muted"],labelpad=9)
+    axes[1].set_xlabel("Guardian share of Guardian + paired parent context (%)",color=pal["muted"],labelpad=9)
+    fig.text(.06,.965,"Auto-review approval overhead",color=pal["fg"],fontsize=17,fontweight="semibold",ha="left",va="top")
+    fig.text(.06,.035,"Medium/high-confidence parent pairs only · quota causality is not implied",
+             color=pal["muted"],fontsize=8.5,ha="left")
+    fig.subplots_adjust(left=.18,right=.965,bottom=.17,top=.82,wspace=.25)
+    png,svg=prefix+".png",prefix+".svg"
+    Path(png).parent.mkdir(parents=True,exist_ok=True)
+    fig.savefig(png,dpi=190,facecolor=pal["bg"],bbox_inches="tight")
+    fig.savefig(svg,facecolor=pal["bg"],bbox_inches="tight")
     plt.close(fig)
-    return png, svg
+    return png,svg
 
 
 # ---------------------------------------------------------------------------
@@ -4151,6 +4438,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py
       Run the user-facing analysis. No third-party packages required.
 
+  python3 codex_quota_audit.py --history
+      Add monthly trends, policy-regime tables, and model x month history.
+
   python3 codex_quota_audit.py --diagnostics
       Add the detailed reset/replay/telemetry audit and Guardian diagnostics.
 
@@ -4173,6 +4463,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
       Export estimated Approve-for-me quota cost and public-rate-card $ equivalent
       for each reconstructed reset period.
+
+  python3 codex_quota_audit.py --charts --report report.md --summary-json summary.json
+      Create publication-ready charts plus privacy-safe shareable summaries.
 
 Chart setup (recommended):
   python3 -m venv .venv
@@ -4197,6 +4490,8 @@ Everything except --charts uses only the Python standard library.
     common.add_argument("--include-replays", action="store_true",
                         help="include probable replay prefixes in the primary analysis (debug/sensitivity)")
     common.add_argument("--include-suspect-bursts", action="store_true", dest="include_replays", help=argparse.SUPPRESS)
+    common.add_argument("--history", action="store_true",
+                        help="show monthly trends, policy-regime tables, and model x month history")
     common.add_argument("--diagnostics", action="store_true",
                         help="show detailed reset/replay/telemetry and Guardian diagnostic sections")
     common.add_argument("--verbose", action="store_true", dest="diagnostics",
@@ -4222,6 +4517,10 @@ Everything except --charts uses only the Python standard library.
                         help="write parent-paired Guardian approval episodes and quota envelopes to CSV")
     output.add_argument("--export-guardian-periods", metavar="PATH",
                         help="write estimated Approve-for-me cost by reconstructed reset period to CSV")
+    output.add_argument("--report", metavar="PATH",
+                        help="write a privacy-safe shareable Markdown report")
+    output.add_argument("--summary-json", metavar="PATH",
+                        help="write a privacy-safe machine-readable headline summary")
     output.add_argument("--charts", action="store_true",
                         help="write quota_chart_data.csv plus model/effort PNG and SVG (requires matplotlib)")
     output.add_argument("--chart-prefix", default="quota_value_by_model_effort",
@@ -4232,6 +4531,8 @@ Everything except --charts uses only the Python standard library.
                         help="output path prefix for per-reset-period Guardian quota-cost PNG/SVG")
     output.add_argument("--chart-all-regimes", action="store_true",
                         help="include every detected policy regime instead of only the latest per model")
+    output.add_argument("--chart-theme", choices=("light", "dark"), default="light",
+                        help="saved chart theme; light is designed for README/Reddit sharing")
 
     advanced = p.add_argument_group("Advanced analysis options")
     advanced.add_argument("--window-minutes", type=int, default=DEFAULT_WINDOW_MINUTES,
@@ -4424,8 +4725,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     primary = analyze_events(primary_events, args)
 
-    # Build user-facing summaries before printing. The default model/effort summary
-    # does not bootstrap; --charts / --export-chart-data later builds the full rows.
+    # Build user-facing summaries before printing. The compact summary avoids
+    # expensive bootstrap resampling unless charts/exported chart data need it.
     summary_args = argparse.Namespace(**vars(args))
     summary_args.chart_bootstraps = 0
     summary_chart_rows = build_chart_rows(primary.buckets, summary_args)
@@ -4436,8 +4737,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     guardian_period_costs: List[Dict[str, object]] = []
     guardian_target_fit: Dict[str, object] = {"status": "not identifiable", "reason": "no approval episodes"}
     guardian_needed = (not args.no_guardian_audit or args.export_guardian_buckets
-                       or args.export_approval_episodes or args.export_guardian_periods or args.charts)
-    if guardian_needed:
+                       or args.export_approval_episodes or args.export_guardian_periods or args.charts
+                       or args.report or args.summary_json)
+    if guardian_needed and not args.no_guardian_audit:
         guardian_rows = guardian_bucket_rows(primary_records, args)
         approval_episodes = build_approval_episodes(primary_records, stats, args, primary, prices)
         if approval_episodes:
@@ -4448,8 +4750,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 primary, approval_episodes, guardian_target_fit, args
             )
 
-    # User-facing output first.
+    coverage = build_data_coverage(primary_records, stats, summary_chart_rows, approval_episodes)
+
+    # Compact user-facing output first.
     print_banner(args)
+    print_data_coverage(coverage, args.window_minutes)
     print_key_findings(
         args, summary_chart_rows, regimes, approval_episodes,
         guardian_period_costs, guardian_target_fit,
@@ -4459,18 +4764,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_guardian_audit and guardian_period_costs:
         print_guardian_period_cost(guardian_period_costs, guardian_target_fit, args.window_minutes)
 
-    print_monthly(primary.events, primary.buckets, args.min_price_coverage)
-    print_policy_regime_summary(regimes)
-    print_model_time(primary.buckets, args.min_price_coverage, args.model_purity,
-                     args.model_time_min_points)
+    # Historical tables are useful, but not the first answer most users need.
+    if args.history:
+        print_monthly(primary.events, primary.buckets, args.min_price_coverage)
+        print_policy_regime_summary(regimes)
+        print_model_time(primary.buckets, args.min_price_coverage, args.model_purity,
+                         args.model_time_min_points)
 
-    # Experimental token-type fitting is intentionally opt-in in the user-facing
-    # output because it is useful mainly for advanced investigation.
+    # Experimental token-type fitting remains opt-in.
     if args.weight_details and not args.no_weight_analysis:
         print_weight_analysis(primary.buckets, args)
 
-    # Detailed methodology/forensics are available on demand rather than burying
-    # the answers most users came for.
+    # Detailed methodology/forensics are available on demand.
     if args.diagnostics:
         print_header(args, stats, primary, include_banner=False)
         print_reset_ledger(primary.ledger, args.show_reset_churn)
@@ -4491,51 +4796,93 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_unpriced(primary.events, prices)
         print_notes(primary)
 
+    generated_files: List[str] = []
+
+    # CSV exports.
     if args.export_buckets:
         export_buckets_csv(args.export_buckets, primary.buckets)
-        print(f"\nWrote bucket CSV: {args.export_buckets}")
+        generated_files.append(args.export_buckets)
     if args.export_resets:
         export_resets_csv(args.export_resets, primary.ledger)
-        print(f"Wrote reset ledger CSV: {args.export_resets}")
+        generated_files.append(args.export_resets)
     if args.export_guardian_buckets:
         export_guardian_buckets_csv(args.export_guardian_buckets, guardian_rows)
-        print(f"Wrote Guardian bucket CSV: {args.export_guardian_buckets}")
+        generated_files.append(args.export_guardian_buckets)
     if args.export_approval_episodes:
         export_approval_episodes_csv(args.export_approval_episodes, approval_episodes)
-        print(f"Wrote approval episode CSV: {args.export_approval_episodes}")
+        generated_files.append(args.export_approval_episodes)
     if args.export_guardian_periods:
         export_guardian_period_cost_csv(args.export_guardian_periods, guardian_period_costs)
-        print(f"Wrote Guardian period-cost CSV: {args.export_guardian_periods}")
+        generated_files.append(args.export_guardian_periods)
 
+    # Full chart rows include bootstrap intervals. They are also useful when
+    # explicitly exporting chart data.
+    full_chart_rows: Sequence[Dict[str, object]] = summary_chart_rows
+    chart_files: List[str] = []
     if args.export_chart_data or args.charts:
-        chart_rows = build_chart_rows(primary.buckets, args)
-        print_chart_data_summary(chart_rows, args)
+        full_chart_rows = build_chart_rows(primary.buckets, args)
         chart_csv = args.export_chart_data or "quota_chart_data.csv"
-        export_chart_data_csv(chart_csv, chart_rows)
-        print(f"Wrote chart CSV: {chart_csv}")
+        export_chart_data_csv(chart_csv, full_chart_rows)
+        generated_files.append(chart_csv)
+        if args.diagnostics:
+            print_chart_data_summary(full_chart_rows, args)
+
         if args.charts:
             try:
                 png, svg = render_quota_chart(
-                    chart_rows, args.chart_prefix, args.chart_interval, args.chart_all_regimes
+                    full_chart_rows, args.chart_prefix, args.chart_interval,
+                    args.chart_all_regimes, theme=args.chart_theme,
                 )
-                print(f"Wrote charts: {png}, {svg}")
+                chart_files.extend([png, svg])
+                generated_files.extend([png, svg])
             except RuntimeError as exc:
                 print(f"Chart rendering unavailable: {exc}", file=sys.stderr)
                 print("The chart CSV was still written.", file=sys.stderr)
-        if approval_episodes:
-            try:
-                gpng, gsvg = render_guardian_episode_chart(approval_episodes, args.guardian_chart_prefix)
-                print(f"Wrote Guardian approval charts: {gpng}, {gsvg}")
-            except RuntimeError as exc:
-                print(f"Guardian approval chart unavailable: {exc}", file=sys.stderr)
-        if guardian_period_costs:
-            try:
-                ppng, psvg = render_guardian_period_chart(
-                    guardian_period_costs, args.guardian_period_chart_prefix, args.window_minutes
-                )
-                print(f"Wrote Guardian period-cost charts: {ppng}, {psvg}")
-            except RuntimeError as exc:
-                print(f"Guardian period-cost chart unavailable: {exc}", file=sys.stderr)
+
+            if approval_episodes:
+                try:
+                    gpng, gsvg = render_guardian_episode_chart(
+                        approval_episodes, args.guardian_chart_prefix, theme=args.chart_theme
+                    )
+                    chart_files.extend([gpng, gsvg])
+                    generated_files.extend([gpng, gsvg])
+                except RuntimeError as exc:
+                    print(f"Guardian approval chart unavailable: {exc}", file=sys.stderr)
+            if guardian_period_costs:
+                try:
+                    ppng, psvg = render_guardian_period_chart(
+                        guardian_period_costs, args.guardian_period_chart_prefix,
+                        args.window_minutes, theme=args.chart_theme,
+                    )
+                    chart_files.extend([ppng, psvg])
+                    generated_files.extend([ppng, psvg])
+                except RuntimeError as exc:
+                    print(f"Guardian period-cost chart unavailable: {exc}", file=sys.stderr)
+
+    # Privacy-safe shareable outputs contain only aggregate data.
+    if args.summary_json:
+        write_summary_json(
+            args.summary_json, args, coverage, full_chart_rows, regimes,
+            approval_episodes, guardian_period_costs,
+        )
+        generated_files.append(args.summary_json)
+
+    if args.report:
+        write_markdown_report(
+            args.report, args, coverage, full_chart_rows, regimes,
+            approval_episodes, guardian_period_costs, chart_files,
+        )
+        generated_files.append(args.report)
+
+    if generated_files:
+        print("\nGenerated files")
+        print("---------------")
+        seen: set[str] = set()
+        for item in generated_files:
+            if item in seen:
+                continue
+            seen.add(item)
+            print(f"  {item}")
 
     return 0
 
