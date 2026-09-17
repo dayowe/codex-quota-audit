@@ -1,0 +1,18 @@
+# --- Python ---
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Generated data & artifacts ---
+*.jsonl
+*.csv
+*.png
+*.svg
+
+# --- OS / editor metadata ---
+.DS_Store
+Thumbs.db
+desktop.ini
+._*
+*:Zone.Identifier
