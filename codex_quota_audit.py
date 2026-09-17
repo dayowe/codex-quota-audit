@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.10.
+"""Codex quota audit v2.11.
 
-Analyze local Codex rollout logs and relate observed token usage to Codex quota
-meters. The main historical analysis defaults to the 7-day meter; the Guardian /
-auto-review audit also discovers 5-hour telemetry when present. Nothing leaves
-your machine.
+How much Codex work does your quota actually buy?
+
+Reads local Codex rollout logs and turns the raw telemetry into user-facing
+answers first: model/effort quota efficiency, quota-policy changes over time,
+and the estimated per-reset cost of Approve for me / Guardian. Detailed
+forensic diagnostics remain available with --diagnostics. Nothing leaves your
+machine.
 
 Quick start
 -----------
-Analysis only, no third-party dependencies:
+User-facing analysis, no third-party dependencies:
 
     python3 codex_quota_audit.py
 
@@ -22,39 +25,34 @@ Charts require matplotlib. A virtual environment is recommended:
 Useful commands:
 
     python3 codex_quota_audit.py --help
+    python3 codex_quota_audit.py --diagnostics
+    python3 codex_quota_audit.py --weight-details
     python3 codex_quota_audit.py --self-test
     python3 codex_quota_audit.py --charts --chart-all-regimes
     python3 codex_quota_audit.py --export-chart-data quota_chart_data.csv
-    python3 codex_quota_audit.py --export-buckets quota_buckets.csv
-    python3 codex_quota_audit.py --export-resets reset_ledger.csv
-    python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
     python3 codex_quota_audit.py --export-approval-episodes approval_episodes.csv
     python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
 
-What it does
-------------
-* Reconstructs effective quota resets while separating near-zero resets_at churn.
-* Uses high-water accounting so stale/backward meter readings do not double-count quota.
-* Detects replayed rollout history from cumulative total_token_usage and excludes it by default.
-* Tracks model and reasoning effort, including provenance/conflict diagnostics.
-* Pairs codex-auto-review / Guardian inference with likely parent work sessions.
-* Groups Guardian calls into approval episodes and measures incremental inference overhead.
-* Associates approval episodes with conservative 5-hour / 7-day quota envelopes.
-* Estimates Approve-for-me quota cost separately for each reconstructed reset period when identifiable.
-* Reports both percentage points of the 100-point allowance and share of quota actually consumed.
-* Prices codex-auto-review using the published GPT-5.4 auto-review rate-card mapping.
-* Reports public rate-card-equivalent Guardian cost per approval and per reset period.
-* Detects explicit linkage metadata when present, otherwise uses confidence-labelled temporal matching.
-* Discovers and analyzes 5-hour and 7-day quota snapshots when present.
-* Compares model/month and detected model-policy regimes.
-* Estimates token-type quota weights only when the data are identifiable enough to support them.
-* Produces model x effort chart data with whole-episode bootstrap intervals.
-* With --charts, writes model/effort, Guardian approval-overhead, and per-reset quota-cost charts when supported.
+Default output focuses on what most users care about
+----------------------------------------------------
+* Latest model x reasoning-effort quota efficiency.
+* Detected model-specific quota-policy changes over time.
+* Approve-for-me / Guardian inference overhead.
+* Estimated Guardian quota points lost in each reconstructed reset period.
+* Public GPT-5.4 rate-card-equivalent Guardian work.
+* Monthly quota-value trends and model x month comparisons.
+
+Detailed methodology / diagnostics
+----------------------------------
+Use --diagnostics (or --verbose) for the data audit, reset ledger, full quota
+episode table, replay sensitivity, detailed Guardian pairing/quota-envelope
+diagnostics, unpriced-model list, and interpretation notes. Use
+--weight-details for the experimental token-type quota-weight fits.
 
 Raw tokens/cache/model mix are direct observations. API-dollar values use public
 list-price equivalents only as a normalization ruler; they are never plan billing.
-For Guardian, the dedicated $eq estimate uses the published GPT-5.4 auto-review
-rates and applies the documented >272K-input long-context multiplier per request.
+For Guardian, the dedicated $eq estimate maps codex-auto-review to GPT-5.4 and
+applies the documented >272K-input long-context multiplier per request.
 Fast-mode/regional multipliers are not inferred when the logs do not expose them.
 
 By default the script reads ~/.codex/sessions and ~/.codex/archived_sessions.
@@ -90,7 +88,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.10"
+__version__ = "2.11"
 
 
 # ---------------------------------------------------------------------------
@@ -1457,20 +1455,27 @@ def episode_api_per_point(ep: EpisodeSummary, min_price_coverage: float) -> Tupl
     return (usd / points if points > EPS else float("nan"), points)
 
 
-def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis) -> None:
+def print_banner(args: argparse.Namespace) -> None:
+    print(f"Codex quota audit v{__version__}")
+    print("=" * len(f"Codex quota audit v{__version__}"))
+    source_display = "~/.codex" if args.home == os.path.expanduser("~/.codex") else args.home
+    print(f"Source: {source_display}")
+    print(f"Target limit: {window_label(args.window_minutes)} ({args.window_minutes} minutes)")
+    print("API $ values are public list-price-equivalent normalization, never plan billing.")
+    print(f"Auto review $eq maps codex-auto-review -> {AUTO_REVIEW_MODEL}.\n")
+
+
+def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis,
+                 include_banner: bool = True) -> None:
     kinds = Counter(r.kind for r in analysis.ledger[1:])
     total_backsteps = sum(ep.backstep_observations for ep in analysis.episodes)
     max_backstep = max((ep.max_backstep for ep in analysis.episodes), default=0.0)
     effective = kinds.get("scheduled", 0) + kinds.get("early", 0) + kinds.get("after-due", 0)
 
-    print(f"Codex quota audit v{__version__}")
-    print("=" * len(f"Codex quota audit v{__version__}"))
-    source_display = "~/.codex" if args.home == os.path.expanduser("~/.codex") else args.home
-    print(f"Source: {source_display}")
-    print(f"Target limit: {args.window_minutes} minutes ({args.window_minutes / 1440:.1f} days)")
-    print("API $ values are list-price-equivalent normalization only, never plan billing.")
-    print(f"Auto review $eq maps codex-auto-review -> {AUTO_REVIEW_MODEL}; >272K-input long-context multipliers are applied.\n")
-
+    if include_banner:
+        print_banner(args)
+    else:
+        print()
     print("Data audit")
     print("----------")
     print(f"files scanned:                 {stats.files:,}")
@@ -2991,7 +2996,8 @@ def print_guardian_audit(events: Sequence[Event], args: argparse.Namespace,
                          primary: Optional[Analysis] = None,
                          period_cost_rows: Optional[Sequence[Dict[str, object]]] = None,
                          target_guardian_fit: Optional[Dict[str, object]] = None,
-                         prices: Optional[Dict[str, Tuple[float, float, float]]] = None) -> None:
+                         prices: Optional[Dict[str, Tuple[float, float, float]]] = None,
+                         include_period_cost: bool = True) -> None:
     print("\
 Guardian / auto-review approval audit")
     print("-------------------------------------")
@@ -3154,7 +3160,7 @@ Incremental Guardian quota fit (exploratory)")
               f"(bootstrap median {med:.3f}, 80% {lo:.3f}-{hi:.3f}); ~{inv:.2f}M Guardian tok/pt")
         print("        This is an account-global observational fit, not an internal OpenAI quota formula.")
 
-    if primary is not None:
+    if primary is not None and include_period_cost:
         target_fit = fits.get(args.window_minutes, target_guardian_fit or {"status": "not identifiable"})
         pc_rows = list(period_cost_rows) if period_cost_rows is not None else \
             guardian_period_cost_rows(primary, episodes, target_fit, args)
@@ -3409,6 +3415,131 @@ def build_chart_rows(buckets: Sequence[Bucket], args: argparse.Namespace) -> Lis
             "api_p90": ci["api_hi"] if api_supported else float("nan"),
         })
     return rows
+
+
+def policy_regimes_for_buckets(buckets: Sequence[Bucket], args: argparse.Namespace) -> List[PolicyRegime]:
+    rows = _dominant_weight_rows(buckets, args.weight_model_purity)
+    return detect_policy_regimes(
+        rows, args.min_price_coverage, args.regime_min_episodes,
+        args.regime_min_points, args.regime_min_ratio, args.regime_min_improvement,
+    )
+
+
+def print_policy_regime_summary(regimes: Sequence[PolicyRegime]) -> None:
+    print("\nQuota policy regimes")
+    print("--------------------")
+    if not regimes:
+        print("No model has enough evidence for policy-regime detection.")
+        return
+    by_model: Dict[str, List[PolicyRegime]] = defaultdict(list)
+    for rg in regimes:
+        by_model[rg.model].append(rg)
+    changed = [m for m, rs in by_model.items() if len(rs) > 1]
+    if changed:
+        print("Detected historical quota-policy changes for: " + ", ".join(sorted(changed)))
+        print("Compare model efficiency within a regime rather than using one all-history average.\n")
+    else:
+        print("No model-specific regime break met the configured evidence thresholds.\n")
+    print(f"{'model':<20} {'reg':<4} {'span':<15} {'ep':>4} {'pt':>6} {'basis':>9}")
+    for rg in regimes:
+        span = f"{rg.start_ts.strftime('%m-%d')}..{rg.end_ts.strftime('%m-%d')}"
+        print(f"{rg.model:<20} {rg.label:<4} {span:<15} {rg.episodes:4d} {rg.points:6.0f} {rg.detection_basis:>9}")
+
+
+def _latest_model_effort_lookup(rows: Sequence[Dict[str, object]]) -> Dict[Tuple[str, str], Dict[str, object]]:
+    out: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for r in rows:
+        key = (str(r.get("model", "")), str(r.get("effort", "")))
+        prev = out.get(key)
+        if prev is None or str(r.get("regime_end", "")) > str(prev.get("regime_end", "")):
+            out[key] = r
+    return out
+
+
+def print_key_findings(args: argparse.Namespace,
+                       chart_rows: Sequence[Dict[str, object]],
+                       regimes: Sequence[PolicyRegime],
+                       approval_episodes: Sequence[Dict[str, object]],
+                       period_cost_rows: Sequence[Dict[str, object]],
+                       guardian_fit: Dict[str, object],
+                       guardian_enabled: bool = True) -> None:
+    print("Key findings")
+    print("============")
+
+    print("\nLatest model / effort quota value")
+    print("---------------------------------")
+    if not chart_rows:
+        print("No model x effort combinations meet the default purity/evidence thresholds.")
+    else:
+        print("Latest detected policy regime per model. Higher Mtok/1% or API$eq/1% means more work per quota point.\n")
+        print(f"{'model':<20} {'effort':<8} {'reg':<4} {'Mtok/1%':>9} {'API$eq/1%':>11} {'evidence':>13}")
+        for r in sorted(chart_rows, key=lambda x: (str(x['model']), EFFORT_ORDER.index(str(x['effort'])) if str(x['effort']) in EFFORT_ORDER else 99, str(x['effort']))):
+            mt = float(r.get("tokens_m_per_point", float("nan")))
+            api = float(r.get("api_usd_per_point", float("nan")))
+            api_s = f"${api:.2f}" if math.isfinite(api) else "n/a"
+            evidence = f"{float(r['quota_points']):.0f}pt/{int(r['episodes'])}ep"
+            print(f"{str(r['model']):<20} {str(r['effort']):<8} {str(r['regime']):<4} {mt:9.2f} {api_s:>11} {evidence:>13}")
+
+        lookup = _latest_model_effort_lookup(chart_rows)
+        sol = lookup.get(("gpt-5.6-sol", "high"))
+        astra = lookup.get(("gpt-6-astra", "high"))
+        if sol and astra:
+            sm = float(sol.get("tokens_m_per_point", float("nan")))
+            am = float(astra.get("tokens_m_per_point", float("nan")))
+            sa = float(sol.get("api_usd_per_point", float("nan")))
+            aa = float(astra.get("api_usd_per_point", float("nan")))
+            if sm > 0 and am > 0:
+                print(f"\nSol high vs Astra high: Astra used ~{sm/am:.2f}x as much quota per observed raw token")
+                if sa > 0 and aa > 0:
+                    print(f"and ~{sa/aa:.2f}x as much quota per API-list-equivalent dollar in these latest regimes.")
+
+    print("\nApprove for me / Guardian")
+    print("-------------------------")
+    if not guardian_enabled:
+        print("Guardian audit skipped (--no-guardian-audit).")
+    elif not approval_episodes:
+        print("No codex-auto-review approval episodes were detected after replay filtering.")
+    else:
+        good = [r for r in approval_episodes if r.get("pair_confidence") in {"high", "medium"}]
+        gt = sum(int(r.get("guardian_tokens", 0) or 0) for r in good)
+        usd_vals = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in good]
+        total_usd = sum(v for v in usd_vals if math.isfinite(v))
+        dollars = [v for v in usd_vals if math.isfinite(v)]
+        print(f"approval episodes:                 {len(approval_episodes):,}")
+        print(f"extra Guardian inference:          {gt/1e6:,.1f}M tokens")
+        if dollars:
+            print(f"public GPT-5.4 rate-card $eq:       ${total_usd:,.2f}")
+            print(f"$eq / approval median / p90:       ${_q(dollars,.50):.2f} / ${_q(dollars,.90):.2f}")
+
+        supported = [r for r in period_cost_rows if math.isfinite(float(r.get("estimated_guardian_points", float("nan"))))]
+        if supported:
+            used = sum(float(r.get("period_used_points", 0) or 0) for r in supported)
+            est = sum(float(r.get("estimated_guardian_points", 0) or 0) for r in supported)
+            lo = sum(float(r.get("estimated_guardian_points_lo", 0) or 0) for r in supported)
+            hi = sum(float(r.get("estimated_guardian_points_hi", 0) or 0) for r in supported)
+            share = 100.0 * est / used if used > EPS else float("nan")
+            median_est = _q([float(r["estimated_guardian_points"]) for r in supported], .50)
+            worst = max(supported, key=lambda r: float(r["estimated_guardian_points"]))
+            print(f"estimated share of consumed {window_label(args.window_minutes)} quota: {share:.1f}%")
+            print(f"median active reset-period cost:    {median_est:.1f} quota points out of 100")
+            print(f"largest estimated reset-period cost: {_period_label(worst)} = "
+                  f"{float(worst['estimated_guardian_points']):.1f} points "
+                  f"(80% {float(worst['estimated_guardian_points_lo']):.1f}-{float(worst['estimated_guardian_points_hi']):.1f})")
+            print(f"aggregate estimate across active periods: {est:.1f} points (80% {lo:.1f}-{hi:.1f})")
+        elif guardian_fit.get("status") != "supported":
+            print("Guardian quota cost:               not identifiable from the available meter data")
+
+    by_model: Dict[str, int] = Counter(rg.model for rg in regimes)
+    changed = sorted(m for m, n in by_model.items() if n > 1)
+    print("\nQuota policy over time")
+    print("----------------------")
+    if changed:
+        print("Detected model-specific policy-regime changes for: " + ", ".join(changed))
+        print("All-history model averages can therefore hide real quota-policy changes.")
+    else:
+        print("No model-specific policy-regime break met the configured evidence thresholds.")
+
+    print("\nUse --diagnostics for reset/replay/telemetry details and --weight-details for experimental token-weight fits.")
 
 
 def export_chart_data_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
@@ -4018,7 +4149,10 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
 def build_parser() -> argparse.ArgumentParser:
     epilog = """Examples:
   python3 codex_quota_audit.py
-      Run the full text analysis. No third-party packages required.
+      Run the user-facing analysis. No third-party packages required.
+
+  python3 codex_quota_audit.py --diagnostics
+      Add the detailed reset/replay/telemetry audit and Guardian diagnostics.
 
   python3 codex_quota_audit.py --charts
       Run the analysis and create quota_chart_data.csv plus PNG/SVG charts.
@@ -4028,7 +4162,7 @@ def build_parser() -> argparse.ArgumentParser:
       Plot every detected historical policy regime instead of only the latest.
 
   python3 codex_quota_audit.py --weight-details
-      Show detailed token-weight fit diagnostics.
+      Add the experimental token-type quota-weight fits.
 
   python3 codex_quota_audit.py --export-guardian-buckets guardian_buckets.csv
       Export conservative 5h/7d auto-review attribution buckets.
@@ -4049,9 +4183,9 @@ Everything except --charts uses only the Python standard library.
 """
     p = argparse.ArgumentParser(
         description=(
-            "Audit local Codex usage with effective-reset reconstruction, high-water quota "
-            "accounting, replay detection, model/effort comparisons, Guardian parent-pairing and "
-            "approval-episode overhead diagnostics, and experimental token-type quota-weight estimation."
+            "How much Codex work does your quota actually buy? Compare model/effort quota "
+            "efficiency, detect policy changes over time, and estimate Approve-for-me / Guardian "
+            "overhead from your local Codex telemetry."
         ),
         epilog=epilog,
         formatter_class=_HelpFormatter,
@@ -4063,12 +4197,16 @@ Everything except --charts uses only the Python standard library.
     common.add_argument("--include-replays", action="store_true",
                         help="include probable replay prefixes in the primary analysis (debug/sensitivity)")
     common.add_argument("--include-suspect-bursts", action="store_true", dest="include_replays", help=argparse.SUPPRESS)
+    common.add_argument("--diagnostics", action="store_true",
+                        help="show detailed reset/replay/telemetry and Guardian diagnostic sections")
+    common.add_argument("--verbose", action="store_true", dest="diagnostics",
+                        help="alias for --diagnostics")
     common.add_argument("--show-reset-churn", action="store_true",
-                        help="show near-zero resets_at churn rows in the reset ledger")
+                        help="show near-zero resets_at churn rows in the diagnostic reset ledger")
     common.add_argument("--weight-details", action="store_true",
-                        help="show every candidate token-weight model and its diagnostics")
+                        help="show experimental token-type quota-weight fits and diagnostics")
     common.add_argument("--no-weight-analysis", action="store_true",
-                        help="skip the experimental token-type quota-weight analysis")
+                        help="disable token-type quota-weight fitting even when --weight-details is requested")
     common.add_argument("--no-guardian-audit", action="store_true",
                         help="skip Guardian parent-pairing, approval episodes, and multi-window quota analysis")
     common.add_argument("--self-test", action="store_true", help="run built-in synthetic tests and exit")
@@ -4285,27 +4423,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stats.analyzed_events = len(primary_events)
 
     primary = analyze_events(primary_events, args)
-    print_header(args, stats, primary)
-    print_reset_ledger(primary.ledger, args.show_reset_churn)
-    print_episodes(primary.episodes, args.min_price_coverage)
-    print_monthly(primary.events, primary.buckets, args.min_price_coverage)
-    print_model_time(primary.buckets, args.min_price_coverage, args.model_purity,
-                     args.model_time_min_points)
-    if not args.no_weight_analysis:
-        print_weight_analysis(primary.buckets, args)
 
-    # Sensitivity comparison uses the exact same parsed/deduped dataset.
-    if stats.replay_events and filtered_target_events:
-        filtered_analysis = primary if not args.include_replays else analyze_events(filtered_target_events, args)
-        included_analysis = primary if args.include_replays else analyze_events(all_target_events, args)
-        print_replay_sensitivity(filtered_analysis, included_analysis, args.min_price_coverage)
+    # Build user-facing summaries before printing. The default model/effort summary
+    # does not bootstrap; --charts / --export-chart-data later builds the full rows.
+    summary_args = argparse.Namespace(**vars(args))
+    summary_args.chart_bootstraps = 0
+    summary_chart_rows = build_chart_rows(primary.buckets, summary_args)
+    regimes = policy_regimes_for_buckets(primary.buckets, args)
 
     guardian_rows: List[Dict[str, object]] = []
     approval_episodes: List[Dict[str, object]] = []
     guardian_period_costs: List[Dict[str, object]] = []
     guardian_target_fit: Dict[str, object] = {"status": "not identifiable", "reason": "no approval episodes"}
-    if (not args.no_guardian_audit or args.export_guardian_buckets or args.export_approval_episodes
-            or args.export_guardian_periods or args.charts):
+    guardian_needed = (not args.no_guardian_audit or args.export_guardian_buckets
+                       or args.export_approval_episodes or args.export_guardian_periods or args.charts)
+    if guardian_needed:
         guardian_rows = guardian_bucket_rows(primary_records, args)
         approval_episodes = build_approval_episodes(primary_records, stats, args, primary, prices)
         if approval_episodes:
@@ -4315,12 +4447,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             guardian_period_costs = guardian_period_cost_rows(
                 primary, approval_episodes, guardian_target_fit, args
             )
-    if not args.no_guardian_audit:
-        print_guardian_audit(primary_records, args, guardian_rows, stats, approval_episodes, primary,
-                             guardian_period_costs, guardian_target_fit, prices)
 
-    print_unpriced(primary.events, prices)
-    print_notes(primary)
+    # User-facing output first.
+    print_banner(args)
+    print_key_findings(
+        args, summary_chart_rows, regimes, approval_episodes,
+        guardian_period_costs, guardian_target_fit,
+        guardian_enabled=not args.no_guardian_audit,
+    )
+
+    if not args.no_guardian_audit and guardian_period_costs:
+        print_guardian_period_cost(guardian_period_costs, guardian_target_fit, args.window_minutes)
+
+    print_monthly(primary.events, primary.buckets, args.min_price_coverage)
+    print_policy_regime_summary(regimes)
+    print_model_time(primary.buckets, args.min_price_coverage, args.model_purity,
+                     args.model_time_min_points)
+
+    # Experimental token-type fitting is intentionally opt-in in the user-facing
+    # output because it is useful mainly for advanced investigation.
+    if args.weight_details and not args.no_weight_analysis:
+        print_weight_analysis(primary.buckets, args)
+
+    # Detailed methodology/forensics are available on demand rather than burying
+    # the answers most users came for.
+    if args.diagnostics:
+        print_header(args, stats, primary, include_banner=False)
+        print_reset_ledger(primary.ledger, args.show_reset_churn)
+        print_episodes(primary.episodes, args.min_price_coverage)
+
+        if stats.replay_events and filtered_target_events:
+            filtered_analysis = primary if not args.include_replays else analyze_events(filtered_target_events, args)
+            included_analysis = primary if args.include_replays else analyze_events(all_target_events, args)
+            print_replay_sensitivity(filtered_analysis, included_analysis, args.min_price_coverage)
+
+        if not args.no_guardian_audit:
+            print_guardian_audit(
+                primary_records, args, guardian_rows, stats, approval_episodes, primary,
+                guardian_period_costs, guardian_target_fit, prices,
+                include_period_cost=False,
+            )
+
+        print_unpriced(primary.events, prices)
+        print_notes(primary)
 
     if args.export_buckets:
         export_buckets_csv(args.export_buckets, primary.buckets)
