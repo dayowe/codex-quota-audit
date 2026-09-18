@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.14.
+"""Codex quota audit v2.15.
 
 How much Codex work does your quota actually buy?
 
@@ -36,6 +36,7 @@ Useful commands:
     python3 codex_quota_audit.py --report report.md
     python3 codex_quota_audit.py --summary-json summary.json
     python3 codex_quota_audit.py --banked-reset 2026-09-12T10:13
+    python3 codex_quota_audit.py --banked-reset 2026-09-12T10:13 --banked-slice-points 14
 
 Default output focuses on what most users care about
 ----------------------------------------------------
@@ -43,6 +44,7 @@ Default output focuses on what most users care about
 * Approve-for-me / Guardian inference overhead and per-reset quota cost.
 * Compact data-coverage and quota-policy summaries.
 * Banked-reset effective-capacity audit using user-confirmed reset timestamps.
+* Equal-quota boundary-slice audit before vs after each confirmed banked reset.
 
 Use --history for monthly trends, policy-regime tables, and model x month history.
 
@@ -93,7 +95,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.14"
+__version__ = "2.15"
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +144,10 @@ DEFAULT_BANKED_CAPACITY_EFFORT_PURITY = 0.90
 DEFAULT_BANKED_CAPACITY_MIN_POINTS = 10.0
 DEFAULT_BANKED_CAPACITY_BOOTSTRAPS = 1000
 DEFAULT_BANKED_CAPACITY_INTERVAL = 0.80
+DEFAULT_BANKED_SLICE_POINTS = (5.0, 10.0, 14.0, 20.0)
+DEFAULT_BANKED_SLICE_BOOTSTRAPS = 1000
+DEFAULT_BANKED_SLICE_INTERVAL = 0.80
+DEFAULT_BANKED_SLICE_START_USED_MAX = 1.0
 DEFAULT_WEIGHT_MODEL_PURITY = 0.95
 DEFAULT_WEIGHT_MIN_POINTS = 40.0
 DEFAULT_WEIGHT_MIN_EPISODES = 5
@@ -1948,6 +1954,411 @@ def export_banked_capacity_csv(path: str, rows: Sequence[Dict[str, object]]) -> 
             w.writerow({k: cooked.get(k, "") for k in fields})
 
 
+
+# ---------------------------------------------------------------------------
+# Banked-reset equal-quota boundary-slice audit
+# ---------------------------------------------------------------------------
+
+def _banked_slice_sizes(args: argparse.Namespace) -> List[float]:
+    vals = [float(x) for x in (getattr(args, "banked_slice_points", None) or DEFAULT_BANKED_SLICE_POINTS)]
+    vals = sorted({x for x in vals if x > EPS})
+    return vals
+
+
+def _fractional_counter_add(dst: Dict[str, float], src: Dict[str, int], frac: float) -> None:
+    for key, value in src.items():
+        dst[key] += float(value) * frac
+
+
+def _quota_slice_from_buckets(buckets: Sequence[Bucket], wanted_points: float, *, from_end: bool,
+                              min_price_coverage: float) -> Dict[str, object]:
+    """Take exactly ``wanted_points`` of high-water quota movement from one end.
+
+    Buckets can occasionally span more than one integer quota point. If a slice
+    boundary cuts through such a bucket, usage is allocated proportionally by
+    quota points. That interpolation is explicit in the returned metadata.
+    """
+    ordered = list(reversed(buckets)) if from_end else list(buckets)
+    remain = float(wanted_points)
+    used_points = 0.0
+    all_tokens = all_priced = all_usd = 0.0
+    core_tokens = core_priced = core_usd = 0.0
+    unc = cached = output = 0.0
+    core_unc = core_cached = core_output = 0.0
+    events = 0.0
+    guardian_tokens = 0.0
+    model_tokens: Dict[str, float] = defaultdict(float)
+    effort_tokens: Dict[str, float] = defaultdict(float)
+    core_model_tokens: Dict[str, float] = defaultdict(float)
+    core_effort_tokens: Dict[str, float] = defaultdict(float)
+    first_ts: Optional[datetime] = None
+    last_ts: Optional[datetime] = None
+    meter_start: Optional[float] = None
+    meter_end: Optional[float] = None
+    interpolated = False
+
+    for b in ordered:
+        if remain <= EPS:
+            break
+        if b.points <= EPS:
+            continue
+        take = min(remain, float(b.points))
+        frac = take / float(b.points)
+        if frac < 1.0 - EPS:
+            interpolated = True
+        used_points += take
+        remain -= take
+        all_tokens += b.total_tokens * frac
+        all_priced += b.priced_tokens * frac
+        all_usd += (b.usage.api_usd or 0.0) * frac
+        core_tokens += b.core_total_tokens * frac
+        core_priced += b.core_priced_tokens * frac
+        core_usd += (b.core_usage.api_usd or 0.0) * frac
+        unc += b.usage.uncached * frac
+        cached += b.usage.cached * frac
+        output += b.usage.output * frac
+        core_unc += b.core_usage.uncached * frac
+        core_cached += b.core_usage.cached * frac
+        core_output += b.core_usage.output * frac
+        events += b.events * frac
+        guardian_tokens += max(0, b.total_tokens - b.core_total_tokens) * frac
+        _fractional_counter_add(model_tokens, b.model_tokens, frac)
+        _fractional_counter_add(effort_tokens, b.effort_tokens, frac)
+        _fractional_counter_add(core_model_tokens, b.core_model_tokens, frac)
+        _fractional_counter_add(core_effort_tokens, b.core_effort_tokens, frac)
+        first_ts = b.start_ts if first_ts is None else min(first_ts, b.start_ts)
+        last_ts = b.end_ts if last_ts is None else max(last_ts, b.end_ts)
+
+        # Meter ranges are exact in quota-point space even when the bucket's
+        # token work has to be fractionally allocated at the slice boundary.
+        if from_end:
+            seg_end = float(b.end_used)
+            seg_start = seg_end - take
+        else:
+            seg_start = float(b.start_used)
+            seg_end = seg_start + take
+        meter_start = seg_start if meter_start is None else min(meter_start, seg_start)
+        meter_end = seg_end if meter_end is None else max(meter_end, seg_end)
+
+    complete = remain <= EPS
+    all_cov = all_priced / all_tokens if all_tokens > EPS else 1.0
+    core_cov = core_priced / core_tokens if core_tokens > EPS else 1.0
+    all_api = all_usd if all_tokens > EPS and all_cov + EPS >= min_price_coverage else float("nan")
+    core_api = core_usd if core_tokens > EPS and core_cov + EPS >= min_price_coverage else float("nan")
+
+    def dominant(counter: Dict[str, float]) -> Tuple[str, float]:
+        total = sum(counter.values())
+        if total <= EPS:
+            return "unknown", 0.0
+        key, value = max(counter.items(), key=lambda kv: kv[1])
+        return key, value / total
+
+    model, model_share = dominant(core_model_tokens)
+    effort, effort_share = dominant(core_effort_tokens)
+    return {
+        "requested_points": wanted_points,
+        "points": used_points,
+        "complete": complete,
+        "interpolated_boundary": interpolated,
+        "meter_start": meter_start if meter_start is not None else float("nan"),
+        "meter_end": meter_end if meter_end is not None else float("nan"),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "events": events,
+        "all_tokens": all_tokens,
+        "all_uncached": unc,
+        "all_cached": cached,
+        "all_output": output,
+        "all_api_usd": all_api,
+        "all_price_coverage": all_cov,
+        "core_tokens": core_tokens,
+        "core_uncached": core_unc,
+        "core_cached": core_cached,
+        "core_output": core_output,
+        "core_api_usd": core_api,
+        "core_price_coverage": core_cov,
+        "guardian_tokens": guardian_tokens,
+        "model": model,
+        "model_share": model_share,
+        "effort": effort,
+        "effort_share": effort_share,
+    }
+
+
+def build_banked_boundary_slice_rows(primary: Analysis, regimes: Sequence[PolicyRegime],
+                                     args: argparse.Namespace,
+                                     markers: Sequence[BankedResetMarker]) -> List[Dict[str, object]]:
+    """Reproduce an equal-quota before/after banked-reset comparison.
+
+    For each user-confirmed banked reset, compare the final N high-water quota
+    points immediately before the reset with the first N points immediately
+    afterward. Only same-model, same-effort, same-policy-regime slices are marked
+    eligible. The post-reset side must begin near 0% used so that "first N points"
+    really means the first N points of the restored allowance.
+    """
+    matches, _unmatched = match_banked_reset_markers(primary.ledger, args, markers)
+    eps = sorted(primary.episodes, key=lambda ep: ep.activation_at)
+    index_by_key = {ep.reset_key: i for i, ep in enumerate(eps)}
+    rows: List[Dict[str, object]] = []
+    for reset_k, match in sorted(matches.items(), key=lambda kv: kv[1]["record"].activation_at):
+        idx = index_by_key.get(reset_k)
+        if idx is None or idx <= 0:
+            continue
+        before_ep = eps[idx - 1]
+        after_ep = eps[idx]
+        marker = match.get("marker")
+        for points in _banked_slice_sizes(args):
+            before = _quota_slice_from_buckets(before_ep.buckets, points, from_end=True,
+                                                min_price_coverage=args.min_price_coverage)
+            after = _quota_slice_from_buckets(after_ep.buckets, points, from_end=False,
+                                               min_price_coverage=args.min_price_coverage)
+            same_model = before["model"] == after["model"] and before["model"] != "unknown"
+            same_effort = before["effort"] == after["effort"] and before["effort"] != "unknown"
+            model = str(after["model"]) if same_model else "mixed"
+            effort = str(after["effort"]) if same_effort else "mixed"
+            before_regime = _regime_label(regimes, model, before_ep.last_ts) if same_model else "unknown"
+            after_regime = _regime_label(regimes, model, after_ep.first_ts) if same_model else "unknown"
+            same_regime = before_regime == after_regime and before_regime != "unknown"
+            after_start_used = float(after.get("meter_start", float("nan")))
+            eligible = bool(
+                before["complete"] and after["complete"]
+                and math.isfinite(after_start_used)
+                and after_start_used <= args.banked_slice_start_used_max + EPS
+                and same_model and same_effort and same_regime
+                and float(before["model_share"]) + EPS >= args.banked_capacity_model_purity
+                and float(after["model_share"]) + EPS >= args.banked_capacity_model_purity
+                and float(before["effort_share"]) + EPS >= args.banked_capacity_effort_purity
+                and float(after["effort_share"]) + EPS >= args.banked_capacity_effort_purity
+            )
+
+            def ratio(a: object, b: object) -> float:
+                av, bv = float(a), float(b)
+                return av / bv if math.isfinite(av) and math.isfinite(bv) and bv > EPS else float("nan")
+
+            row = {
+                "reset_key": reset_k,
+                "reset_time": after_ep.activation_at,
+                "banked_marker": marker.text if isinstance(marker, BankedResetMarker) else "",
+                "banked_marker_precision": marker.precision if isinstance(marker, BankedResetMarker) else "",
+                "slice_points": points,
+                "eligible": eligible,
+                "model": model,
+                "effort": effort,
+                "regime": after_regime if same_regime else "unknown",
+                "same_model": same_model,
+                "same_effort": same_effort,
+                "same_regime": same_regime,
+                "before_period_start": before_ep.activation_at,
+                "after_period_start": after_ep.activation_at,
+                "before_meter_start": before["meter_start"],
+                "before_meter_end": before["meter_end"],
+                "after_meter_start": after["meter_start"],
+                "after_meter_end": after["meter_end"],
+                "before_interpolated": before["interpolated_boundary"],
+                "after_interpolated": after["interpolated_boundary"],
+            }
+            for prefix, data in (("before", before), ("after", after)):
+                for key in (
+                    "points", "events", "all_tokens", "all_uncached", "all_cached", "all_output",
+                    "all_api_usd", "all_price_coverage", "core_tokens", "core_uncached", "core_cached",
+                    "core_output", "core_api_usd", "core_price_coverage", "guardian_tokens",
+                    "model_share", "effort_share",
+                ):
+                    row[f"{prefix}_{key}"] = data[key]
+            row.update({
+                "ratio_all_raw": ratio(after["all_tokens"], before["all_tokens"]),
+                "ratio_all_api": ratio(after["all_api_usd"], before["all_api_usd"]),
+                "ratio_core_raw": ratio(after["core_tokens"], before["core_tokens"]),
+                "ratio_core_api": ratio(after["core_api_usd"], before["core_api_usd"]),
+            })
+            rows.append(row)
+    return rows
+
+
+def _boundary_metric_ratio(rows: Sequence[Dict[str, object]], before_key: str, after_key: str) -> float:
+    good = [r for r in rows if r.get("eligible")
+            and math.isfinite(float(r.get(before_key, float("nan"))))
+            and math.isfinite(float(r.get(after_key, float("nan"))))
+            and float(r.get(before_key, 0.0) or 0.0) > EPS]
+    before = sum(float(r[before_key]) for r in good)
+    after = sum(float(r[after_key]) for r in good)
+    return after / before if before > EPS else float("nan")
+
+
+def banked_boundary_slice_summary(rows: Sequence[Dict[str, object]], args: argparse.Namespace) -> Dict[str, object]:
+    specs = [
+        ("all_raw", "before_all_tokens", "after_all_tokens", "Raw tokens, all work"),
+        ("all_api", "before_all_api_usd", "after_all_api_usd", "API $eq, all work"),
+        ("core_raw", "before_core_tokens", "after_core_tokens", "Raw tokens, excluding Guardian"),
+        ("core_api", "before_core_api_usd", "after_core_api_usd", "API $eq, excluding Guardian"),
+    ]
+    grouped: Dict[float, List[Dict[str, object]]] = defaultdict(list)
+    for r in rows:
+        if r.get("eligible"):
+            grouped[float(r["slice_points"])].append(r)
+    rng = random.Random(215013)
+    slices: Dict[float, Dict[str, object]] = {}
+    for points in sorted(grouped):
+        group = grouped[points]
+        metrics: Dict[str, Dict[str, object]] = {}
+        for key, before_key, after_key, label in specs:
+            ratio = _boundary_metric_ratio(group, before_key, after_key)
+            boots: List[float] = []
+            if len(group) >= 2 and args.banked_slice_bootstraps > 0 and math.isfinite(ratio):
+                for _ in range(args.banked_slice_bootstraps):
+                    sample = [rng.choice(group) for _i in range(len(group))]
+                    rv = _boundary_metric_ratio(sample, before_key, after_key)
+                    if math.isfinite(rv):
+                        boots.append(rv)
+            alpha = (1.0 - args.banked_slice_interval) / 2.0
+            lo = _q(boots, alpha) if boots else float("nan")
+            hi = _q(boots, 1.0-alpha) if boots else float("nan")
+            metrics[key] = {"label": label, "ratio": ratio, "lo": lo, "hi": hi, "bootstrap_n": len(boots)}
+        slices[points] = {"pairs": len(group), "metrics": metrics}
+
+    preferred = 14.0 if 14.0 in slices else (max(slices) if slices else None)
+    strongest = None
+    if preferred is not None:
+        for key in ("core_api", "all_api", "core_raw", "all_raw"):
+            if math.isfinite(float(slices[preferred]["metrics"][key]["ratio"])):
+                strongest = key
+                break
+    interpretation = "insufficient eligible equal-quota before/after slices"
+    if preferred is not None and strongest:
+        m = slices[preferred]["metrics"][strongest]
+        ratio, lo, hi = float(m["ratio"]), float(m["lo"]), float(m["hi"])
+        if math.isfinite(lo) and math.isfinite(hi):
+            if lo > .5 + EPS:
+                interpretation = (
+                    f"the {preferred:g}-point boundary slices put the 0.50x half-capacity prediction below the "
+                    f"{args.banked_slice_interval:.0%} interval for {m['label']}; the immediate before/after evidence argues against the claim"
+                )
+            elif hi < .5 - EPS:
+                interpretation = (
+                    f"the {preferred:g}-point boundary slices show less than 0.50x capacity for {m['label']}; "
+                    "capacity is reduced, but not specifically by a half-capacity rule"
+                )
+            else:
+                interpretation = (
+                    f"the {preferred:g}-point boundary-slice interval for {m['label']} includes 0.50x; the direct boundary test is inconclusive"
+                )
+        else:
+            interpretation = f"the {preferred:g}-point boundary-slice point estimate for {m['label']} is {ratio:.2f}x; too few reset pairs for an interval"
+
+    # Detect a possible transient effect: a small slice near half that recovers at
+    # larger slices. This is descriptive only, but is exactly the pattern the
+    # multi-slice test was added to reveal.
+    transient = False
+    if strongest and len(slices) >= 2:
+        pts_sorted = sorted(slices)
+        first = float(slices[pts_sorted[0]]["metrics"][strongest]["ratio"])
+        last = float(slices[pts_sorted[-1]]["metrics"][strongest]["ratio"])
+        transient = math.isfinite(first) and math.isfinite(last) and first <= .65 and last >= .80
+
+    return {
+        "slice_points": sorted(slices),
+        "slices": slices,
+        "preferred_points": preferred,
+        "strongest_metric": strongest,
+        "interpretation": interpretation,
+        "possible_transient_recovery": transient,
+        "eligible_rows": sum(len(v) for v in grouped.values()),
+    }
+
+
+def _meter_span(row: Dict[str, object], prefix: str) -> str:
+    lo = float(row.get(f"{prefix}_meter_start", float("nan")))
+    hi = float(row.get(f"{prefix}_meter_end", float("nan")))
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return "?"
+    return f"{lo:.0f}->{hi:.0f}%"
+
+
+def print_banked_boundary_slice_audit(rows: Sequence[Dict[str, object]], summary: Dict[str, object],
+                                     args: argparse.Namespace) -> None:
+    print("\nBanked-reset equal-quota boundary-slice audit")
+    print("----------------------------------------------")
+    print("Directly compares the final N quota points before each user-confirmed banked reset")
+    print("with the first N points afterward. This reproduces the equal-quota-slice methodology")
+    print("while also checking multiple slice sizes and excluding Guardian in the strongest metric.\n")
+    if not args.banked_reset:
+        print("Not tested: no user-confirmed banked-reset timestamps supplied.")
+        return
+    if not summary.get("slice_points"):
+        print("No eligible same-model / same-effort / same-policy before/after slices were available.")
+        return
+
+    preferred = float(summary.get("preferred_points") or 14.0)
+    detail = [r for r in rows if r.get("eligible") and abs(float(r["slice_points"])-preferred) <= EPS]
+    detail.sort(key=lambda r: r["reset_time"])
+    if detail:
+        print(f"Direct {preferred:g}-point before/after slices")
+        print(f"{'reset':<17} {'model/effort':<22} {'before meter':>12} {'after meter':>11} "
+              f"{'raw M B/A':>16} {'raw x':>7} {'API$eq B/A':>18} {'API x':>7} {'core API x':>10}")
+        for r in detail:
+            bt = float(r["before_all_tokens"])/1e6; at = float(r["after_all_tokens"])/1e6
+            ba = float(r["before_all_api_usd"]); aa = float(r["after_all_api_usd"])
+            rawx = float(r["ratio_all_raw"]); apix = float(r["ratio_all_api"]); corex = float(r["ratio_core_api"])
+            api_pair = f"${ba:.1f}/${aa:.1f}" if math.isfinite(ba) and math.isfinite(aa) else "n/a"
+            print(f"{fmt_dt(r['reset_time']):<17} {str(r['model'])+' '+str(r['effort']):<22} "
+                  f"{_meter_span(r,'before'):>12} {_meter_span(r,'after'):>11} "
+                  f"{bt:7.1f}/{at:<7.1f} {rawx:7.2f} {api_pair:>18} {apix:7.2f} {corex:10.2f}")
+        print()
+
+    print("Aggregate after / before capacity ratio by equal quota-slice size")
+    print("0.50x = half-capacity prediction; 1.00x = equal work per quota point.")
+    print(f"{'slice':>7} {'pairs':>6} {'raw x':>9} {'core raw x':>11} {'API x':>9} {'core API x':>11} {'core API interval':>19}")
+    for points in summary["slice_points"]:
+        sr = summary["slices"][points]
+        m = sr["metrics"]
+        def val(k: str) -> str:
+            x = float(m[k]["ratio"])
+            return f"{x:.2f}" if math.isfinite(x) else "n/a"
+        cm = m["core_api"]
+        lo, hi = float(cm["lo"]), float(cm["hi"])
+        rng = f"{lo:.2f}-{hi:.2f}" if math.isfinite(lo) and math.isfinite(hi) else "n/a"
+        print(f"{points:6g}pt {int(sr['pairs']):6d} {val('all_raw'):>9} {val('core_raw'):>11} {val('all_api'):>9} {val('core_api'):>11} {rng:>19}")
+
+    preferred = summary.get("preferred_points")
+    strongest = summary.get("strongest_metric")
+    if preferred is not None and strongest:
+        m = summary["slices"][preferred]["metrics"][strongest]
+        ratio, lo, hi = float(m["ratio"]), float(m["lo"]), float(m["hi"])
+        print(f"\nPreferred direct test: {float(preferred):g}-point slices, {m['label']} = {ratio:.2f}x")
+        if math.isfinite(lo) and math.isfinite(hi):
+            print(f"{args.banked_slice_interval:.0%} whole-reset-pair interval: {lo:.2f}-{hi:.2f}x")
+            print(f"Half-capacity prediction (0.50x): {'inside' if lo <= .5 <= hi else 'outside'} interval")
+        print("Interpretation: " + str(summary.get("interpretation", "n/a")) + ".")
+        if summary.get("possible_transient_recovery"):
+            print("Pattern note: the smallest slice is much weaker than the largest slice; this could indicate a temporary post-reset effect rather than a full-period capacity change.")
+    print("Slice boundaries that cut a multi-point meter jump allocate that bucket's work proportionally by quota points.")
+
+
+def export_banked_boundary_slices_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    fields = [
+        "reset_key", "reset_time", "banked_marker", "banked_marker_precision", "slice_points", "eligible",
+        "model", "effort", "regime", "same_model", "same_effort", "same_regime",
+        "before_period_start", "after_period_start", "before_meter_start", "before_meter_end",
+        "after_meter_start", "after_meter_end", "before_interpolated", "after_interpolated",
+        "before_points", "after_points", "before_all_tokens", "after_all_tokens",
+        "before_all_uncached", "after_all_uncached", "before_all_cached", "after_all_cached",
+        "before_all_output", "after_all_output", "before_all_api_usd", "after_all_api_usd",
+        "before_core_tokens", "after_core_tokens", "before_core_api_usd", "after_core_api_usd",
+        "before_guardian_tokens", "after_guardian_tokens", "ratio_all_raw", "ratio_all_api",
+        "ratio_core_raw", "ratio_core_api", "before_model_share", "after_model_share",
+        "before_effort_share", "after_effort_share",
+    ]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            cooked = dict(row)
+            for key in ("reset_time", "before_period_start", "after_period_start"):
+                value = cooked.get(key)
+                cooked[key] = value.isoformat() if isinstance(value, datetime) else ""
+            w.writerow({k: cooked.get(k, "") for k in fields})
+
 def print_episodes(episodes: Sequence[EpisodeSummary], min_price_coverage: float) -> None:
     print("\nQuota episodes (high-water accounting)")
     print("--------------------------------------")
@@ -3474,6 +3885,65 @@ def render_banked_capacity_chart(rows: Sequence[Dict[str, object]], summary: Dic
 
 
 
+
+def render_banked_boundary_slice_chart(rows: Sequence[Dict[str, object]], summary: Dict[str, object],
+                                      prefix: str, args: argparse.Namespace,
+                                      theme: str = "light") -> Tuple[str, str]:
+    """Render boundary-slice capacity ratio as slice size grows."""
+    if not summary.get("slice_points") or not summary.get("strongest_metric"):
+        raise RuntimeError("no eligible banked-reset boundary slices")
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("banked-reset boundary-slice charts require matplotlib") from exc
+    pal = chart_palette(theme)
+    points = [float(x) for x in summary["slice_points"]]
+    strongest = str(summary["strongest_metric"])
+    core_key = strongest
+    raw_key = "core_raw" if strongest.startswith("core_") else "all_raw"
+    ratios = [float(summary["slices"][p]["metrics"][core_key]["ratio"]) for p in points]
+    raw_ratios = [float(summary["slices"][p]["metrics"][raw_key]["ratio"]) for p in points]
+    los = [float(summary["slices"][p]["metrics"][core_key]["lo"]) for p in points]
+    his = [float(summary["slices"][p]["metrics"][core_key]["hi"]) for p in points]
+    pairs = [int(summary["slices"][p]["pairs"]) for p in points]
+
+    fig, ax = plt.subplots(figsize=(10.8, 6.2))
+    fig.patch.set_facecolor(pal["bg"]); _style_axis(ax, pal)
+    ax.axhline(.5, color=pal["warm"], linestyle="--", linewidth=1.3, zorder=1)
+    ax.axhline(1.0, color=pal["muted"], linestyle=":", linewidth=1.25, zorder=1)
+    ax.plot(points, raw_ratios, marker="o", markersize=5.5, linewidth=1.3,
+            color=pal["accent_soft"], alpha=.9, label="Raw tokens, excluding Guardian")
+    for x, ratio, lo, hi, n in zip(points, ratios, los, his, pairs):
+        if math.isfinite(lo) and math.isfinite(hi):
+            ax.errorbar(x, ratio, yerr=[[max(0, ratio-lo)], [max(0, hi-ratio)]],
+                        fmt="o", markersize=7.2, color=pal["accent"], ecolor=pal["whisker"],
+                        elinewidth=1.5, capsize=3.5, zorder=3)
+        else:
+            ax.plot(x, ratio, "o", color=pal["accent"], markersize=7.2, zorder=3)
+        ax.text(x, ratio + .035, f"{ratio:.2f}x · {n} reset{'s' if n != 1 else ''}",
+                color=pal["fg"], fontsize=8.5, ha="center", va="bottom")
+    ax.plot(points, ratios, linewidth=1.7, color=pal["accent"], label=str(summary["slices"][points[0]]["metrics"][core_key]["label"]))
+    ax.set_ylim(0, max(1.2, max([x for x in his+ratios if math.isfinite(x)] + [1.0]) * 1.16))
+    ax.set_xticks(points)
+    ax.set_xlabel("Equal quota points compared immediately before vs after banked reset", color=pal["muted"], labelpad=9)
+    ax.set_ylabel("After / before effective-capacity ratio", color=pal["muted"], labelpad=9)
+    ax.set_title("Does the post-reset penalty persist as the slice grows?\n0.50x = half capacity · 1.00x = equal capacity",
+                 color=pal["fg"], fontsize=13, fontweight="bold", loc="left", pad=12)
+    ax.legend(frameon=False, labelcolor=pal["fg"], fontsize=8.6, loc="lower right")
+    fig.text(.075, .965, "Banked-reset equal-quota boundary-slice audit", color=pal["fg"],
+             fontsize=17, fontweight="bold", ha="left", va="top")
+    fig.text(.075, .035,
+             "User-confirmed banked resets only · same model / effort / policy regime · whiskers resample whole reset pairs.",
+             color=pal["muted"], fontsize=8.4, ha="left")
+    fig.subplots_adjust(left=.12, right=.96, bottom=.16, top=.79)
+    png, svg = prefix + ".png", prefix + ".svg"
+    Path(png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=190, facecolor=pal["bg"], bbox_inches="tight")
+    fig.savefig(svg, facecolor=pal["bg"], bbox_inches="tight")
+    plt.close(fig)
+    return png, svg
+
+
 def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> List[Dict[str, object]]:
     """Build conservative attribution rows for every requested/discovered limit window.
 
@@ -4106,6 +4576,7 @@ def print_key_findings(args: argparse.Namespace,
                        period_cost_rows: Sequence[Dict[str, object]],
                        guardian_fit: Dict[str, object],
                        banked_summary: Dict[str, object],
+                       banked_slice_summary: Dict[str, object],
                        guardian_enabled: bool = True) -> None:
     print("Key findings")
     print("============")
@@ -4195,6 +4666,16 @@ def print_key_findings(args: argparse.Namespace,
                 print(f"{args.banked_capacity_interval:.0%} whole-period interval:                {lo:.2f}-{hi:.2f}x")
                 print(f"half-capacity prediction (0.50x):       {'inside' if lo <= .5 <= hi else 'outside'} interval")
             print("Interpretation: " + str(banked_summary.get("interpretation", "n/a")) + ".")
+        pref = banked_slice_summary.get("preferred_points")
+        skey = banked_slice_summary.get("strongest_metric")
+        if pref is not None and skey:
+            sm = banked_slice_summary["slices"][pref]["metrics"][skey]
+            sr = float(sm.get("ratio", float("nan")))
+            slo, shi = float(sm.get("lo", float("nan"))), float(sm.get("hi", float("nan")))
+            if math.isfinite(sr):
+                print(f"direct {float(pref):g}-point before/after slice:       {sr:.2f}x ({sm['label']})")
+                if math.isfinite(slo) and math.isfinite(shi):
+                    print(f"{args.banked_slice_interval:.0%} boundary-slice interval:             {slo:.2f}-{shi:.2f}x")
 
     print("\nUse --history for monthly/regime history, --diagnostics for telemetry details,")
     print("and --weight-details for experimental token-weight fits.")
@@ -4211,7 +4692,9 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
                        approval_episodes: Sequence[Dict[str, object]],
                        period_cost_rows: Sequence[Dict[str, object]],
                        banked_rows: Sequence[Dict[str, object]],
-                       banked_summary: Dict[str, object]) -> None:
+                       banked_summary: Dict[str, object],
+                       banked_slice_rows: Sequence[Dict[str, object]],
+                       banked_slice_summary: Dict[str, object]) -> None:
     windows_out = {}
     windows = coverage.get("windows", {})
     if isinstance(windows, dict):
@@ -4271,6 +4754,18 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
             "core_mtokens_per_point": _json_float(float(r.get("core_mtokens_per_point", float("nan")))),
             "core_api_usd_per_point": _json_float(float(r.get("core_api_usd_per_point", float("nan")))),
         })
+    boundary_out = {
+        "preferred_points": _json_float(float(banked_slice_summary.get("preferred_points"))) if banked_slice_summary.get("preferred_points") is not None else None,
+        "strongest_metric": banked_slice_summary.get("strongest_metric"),
+        "interpretation": str(banked_slice_summary.get("interpretation", "not tested")),
+        "slices": {},
+    }
+    for points, sr in (banked_slice_summary.get("slices", {}) or {}).items():
+        boundary_out["slices"][str(points)] = {
+            "pairs": int(sr.get("pairs", 0)),
+            "metrics": {k: {kk: _json_float(vv) for kk, vv in m.items()} for k, m in sr.get("metrics", {}).items()},
+        }
+
     payload = {
         "schema": "codex-quota-audit-summary-v2",
         "version": __version__,
@@ -4286,6 +4781,7 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
         "guardian": {k: _json_float(v) for k, v in gs.items()},
         "guardian_periods": periods,
         "banked_reset_capacity": banked_out,
+        "banked_reset_boundary_slices": boundary_out,
         "notes": [
             "API-dollar values are public list-price-equivalent normalization, not subscription billing.",
             "Guardian quota estimates are observational, not server billing data.",
@@ -4302,6 +4798,8 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
                           period_cost_rows: Sequence[Dict[str, object]],
                           banked_rows: Sequence[Dict[str, object]],
                           banked_summary: Dict[str, object],
+                          banked_slice_rows: Sequence[Dict[str, object]],
+                          banked_slice_summary: Dict[str, object],
                           chart_files: Sequence[str]) -> None:
     """Write a privacy-safe, shareable report containing headline aggregates only."""
     lines: List[str] = ["# Codex quota report", "", f"Generated by `codex_quota_audit.py` v{__version__}.", ""]
@@ -4392,6 +4890,24 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
             rng = f"{lo:.2f}-{hi:.2f}x" if math.isfinite(lo) and math.isfinite(hi) else "n/a"
             lines.append(f"| {m['label']} | {ratio:.2f}x | {rng} |")
         lines += ["", f"Interpretation: {banked_summary.get('interpretation','n/a')}.", ""]
+
+    lines += ["## Banked-reset equal-quota boundary slices", ""]
+    if not args.banked_reset:
+        lines += ["Not tested because no user-confirmed banked-reset timestamps were supplied.", ""]
+    elif not banked_slice_summary.get("slice_points"):
+        lines += ["No eligible same-model / same-effort / same-policy before/after slices were available.", ""]
+    else:
+        lines += ["The direct test compares equal quota slices immediately before and after each confirmed banked reset.", "",
+                  "| Slice | Reset pairs | Raw ratio | Core raw ratio | API $eq ratio | Core API $eq ratio | Core API interval |",
+                  "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+        for points in banked_slice_summary["slice_points"]:
+            sr = banked_slice_summary["slices"][points]; m = sr["metrics"]
+            cm = m["core_api"]; lo, hi = float(cm["lo"]), float(cm["hi"])
+            rng = f"{lo:.2f}-{hi:.2f}x" if math.isfinite(lo) and math.isfinite(hi) else "n/a"
+            def rr(k: str) -> str:
+                v = float(m[k]["ratio"]); return f"{v:.2f}x" if math.isfinite(v) else "n/a"
+            lines.append(f"| {float(points):g}pt | {int(sr['pairs'])} | {rr('all_raw')} | {rr('core_raw')} | {rr('all_api')} | {rr('core_api')} | {rng} |")
+        lines += ["", f"Interpretation: {banked_slice_summary.get('interpretation','n/a')}.", ""]
 
     changed = Counter(rg.model for rg in regimes)
     changed_models = sorted(m for m,n in changed.items() if n>1)
@@ -5069,6 +5585,41 @@ def run_self_test() -> None:
     cratio = float(csum["metrics"]["core_api"]["ratio"])
     assert .90 < cratio < 1.10, cratio
 
+
+    # Equal-quota boundary-slice test. Construct two 20-point episodes where the
+    # first/last slices have equal work per quota point, then verify the direct
+    # after/before ratio is ~1 rather than 0.5. Multi-point buckets exercise the
+    # fractional boundary allocation path.
+    def _slice_bucket(start_used: float, points: float, tokens: int, api: float, start_dt: datetime,
+                      model: str = "gpt-x", effort: str = "high") -> Bucket:
+        usage = Usage(int(tokens*.1), int(tokens*.89), tokens-int(tokens*.99), api)
+        return Bucket(1, reset, start_dt, start_dt+timedelta(minutes=1), start_used, start_used+points,
+                      points, 1, usage, tokens, tokens, {model: tokens}, {effort: tokens},
+                      core_usage=usage, core_priced_tokens=tokens, core_total_tokens=tokens,
+                      core_model_tokens={model: tokens}, core_effort_tokens={effort: tokens})
+    sb = [_slice_bucket(0, 7, 70_000_000, 7.0, d1), _slice_bucket(7, 13, 130_000_000, 13.0, d1+timedelta(minutes=2))]
+    sa = [_slice_bucket(0, 9, 90_000_000, 9.0, d2), _slice_bucket(9, 11, 110_000_000, 11.0, d2+timedelta(minutes=2))]
+    bef = _quota_slice_from_buckets(sb, 14, from_end=True, min_price_coverage=.95)
+    aft = _quota_slice_from_buckets(sa, 14, from_end=False, min_price_coverage=.95)
+    assert bef["complete"] and aft["complete"]
+    assert abs(float(aft["all_tokens"])/float(bef["all_tokens"]) - 1.0) < 1e-9
+    slice_rows = [{
+        "eligible": True, "slice_points": 14.0,
+        "before_all_tokens": bef["all_tokens"], "after_all_tokens": aft["all_tokens"],
+        "before_all_api_usd": bef["all_api_usd"], "after_all_api_usd": aft["all_api_usd"],
+        "before_core_tokens": bef["core_tokens"], "after_core_tokens": aft["core_tokens"],
+        "before_core_api_usd": bef["core_api_usd"], "after_core_api_usd": aft["core_api_usd"],
+    }, {
+        "eligible": True, "slice_points": 14.0,
+        "before_all_tokens": bef["all_tokens"], "after_all_tokens": aft["all_tokens"],
+        "before_all_api_usd": bef["all_api_usd"], "after_all_api_usd": aft["all_api_usd"],
+        "before_core_tokens": bef["core_tokens"], "after_core_tokens": aft["core_tokens"],
+        "before_core_api_usd": bef["core_api_usd"], "after_core_api_usd": aft["core_api_usd"],
+    }]
+    bsargs = argparse.Namespace(banked_slice_bootstraps=50, banked_slice_interval=.80)
+    bss = banked_boundary_slice_summary(slice_rows, bsargs)
+    assert .99 < float(bss["slices"][14.0]["metrics"]["core_api"]["ratio"]) < 1.01
+
     print("self-test: OK")
 
 
@@ -5116,6 +5667,10 @@ def build_parser() -> argparse.ArgumentParser:
 
   python3 codex_quota_audit.py --banked-reset 2026-09-10T08:23 --export-banked-capacity banked_capacity.csv
       Test user-confirmed banked-reset capacity against same-model/effort/policy comparison periods.
+
+  python3 codex_quota_audit.py --banked-reset 2026-09-10T08:23 --banked-slice-points 14
+      Reproduce an equal-14-point before/after banked-reset slice comparison.
+      Repeat --banked-slice-points to choose multiple slice sizes; defaults are 5,10,14,20.
 
   python3 codex_quota_audit.py --charts --report report.md --summary-json summary.json
       Create publication-ready charts plus privacy-safe shareable summaries.
@@ -5167,6 +5722,8 @@ Everything except --charts uses only the Python standard library.
     output.add_argument("--export-resets", metavar="PATH", help="write inferred reset ledger to CSV")
     output.add_argument("--export-banked-capacity", metavar="PATH",
                         help="write per-reset-period banked/comparison capacity audit to CSV")
+    output.add_argument("--export-banked-slices", metavar="PATH",
+                        help="write equal-quota before/after banked-reset boundary slices to CSV")
     output.add_argument("--export-chart-data", metavar="PATH", help="write model x effort chart aggregates to CSV")
     output.add_argument("--export-guardian-buckets", metavar="PATH",
                         help="write Guardian/auto-review high-water attribution buckets to CSV")
@@ -5188,6 +5745,8 @@ Everything except --charts uses only the Python standard library.
                         help="output path prefix for per-reset-period Guardian quota-cost PNG/SVG")
     output.add_argument("--banked-capacity-chart-prefix", default="banked_reset_capacity",
                         help="output path prefix for banked-reset capacity PNG/SVG")
+    output.add_argument("--banked-slice-chart-prefix", default="banked_reset_boundary_slices",
+                        help="output path prefix for equal-quota banked-reset boundary-slice PNG/SVG")
     output.add_argument("--chart-all-regimes", action="store_true",
                         help="include every detected policy regime instead of only the latest per model")
     output.add_argument("--chart-theme", choices=("light", "dark"), default="light",
@@ -5254,6 +5813,14 @@ Everything except --charts uses only the Python standard library.
                        help="whole-reset-period bootstrap replicates for banked/comparison capacity ratios")
     reset.add_argument("--banked-capacity-interval", type=float, default=DEFAULT_BANKED_CAPACITY_INTERVAL,
                        help="central bootstrap interval width for banked/comparison capacity ratios")
+    reset.add_argument("--banked-slice-points", type=float, action="append", default=[], metavar="POINTS",
+                       help="equal quota points to compare immediately before/after each confirmed banked reset; repeatable; default 5,10,14,20")
+    reset.add_argument("--banked-slice-bootstraps", type=int, default=DEFAULT_BANKED_SLICE_BOOTSTRAPS,
+                       help="whole-reset-pair bootstrap replicates for boundary-slice intervals")
+    reset.add_argument("--banked-slice-interval", type=float, default=DEFAULT_BANKED_SLICE_INTERVAL,
+                       help="central bootstrap interval width for boundary-slice ratios")
+    reset.add_argument("--banked-slice-start-used-max", type=float, default=DEFAULT_BANKED_SLICE_START_USED_MAX,
+                       help="maximum post-reset high-water baseline used_percent for treating a slice as starting from the restored allowance")
 
     weights = p.add_argument_group("Advanced token-weight and regime fitting")
     weights.add_argument("--weight-model-purity", type=float, default=DEFAULT_WEIGHT_MODEL_PURITY,
@@ -5332,6 +5899,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("banked-capacity point/bootstrap settings must be non-negative")
     if not (0.0 < args.banked_capacity_interval < 1.0):
         raise SystemExit("--banked-capacity-interval must be between 0 and 1")
+    if any(x <= 0 for x in args.banked_slice_points):
+        raise SystemExit("--banked-slice-points values must be positive")
+    if args.banked_slice_bootstraps < 0:
+        raise SystemExit("--banked-slice-bootstraps must be non-negative")
+    if not (0.0 < args.banked_slice_interval < 1.0):
+        raise SystemExit("--banked-slice-interval must be between 0 and 1")
+    if args.banked_slice_start_used_max < 0:
+        raise SystemExit("--banked-slice-start-used-max must be non-negative")
     if args.model_time_min_points < 0:
         raise SystemExit("--model-time-min-points must be non-negative")
     if not (0.0 <= args.weight_model_purity <= 1.0):
@@ -5424,6 +5999,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     banked_capacity_result = banked_capacity_summary(
         banked_capacity_rows, unmatched_banked_markers, args
     )
+    banked_slice_rows = build_banked_boundary_slice_rows(
+        primary, regimes, args, banked_reset_markers
+    )
+    banked_slice_result = banked_boundary_slice_summary(banked_slice_rows, args)
 
     guardian_rows: List[Dict[str, object]] = []
     approval_episodes: List[Dict[str, object]] = []
@@ -5450,7 +6029,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print_data_coverage(coverage, args.window_minutes)
     print_key_findings(
         args, summary_chart_rows, regimes, approval_episodes,
-        guardian_period_costs, guardian_target_fit, banked_capacity_result,
+        guardian_period_costs, guardian_target_fit, banked_capacity_result, banked_slice_result,
         guardian_enabled=not args.no_guardian_audit,
     )
 
@@ -5458,6 +6037,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_banked_capacity_audit(
             banked_capacity_rows, unmatched_banked_markers, banked_capacity_result, args
         )
+        print_banked_boundary_slice_audit(banked_slice_rows, banked_slice_result, args)
 
     if not args.no_guardian_audit and guardian_period_costs:
         print_guardian_period_cost(guardian_period_costs, guardian_target_fit, args.window_minutes)
@@ -5506,6 +6086,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.export_banked_capacity:
         export_banked_capacity_csv(args.export_banked_capacity, banked_capacity_rows)
         generated_files.append(args.export_banked_capacity)
+    if args.export_banked_slices:
+        export_banked_boundary_slices_csv(args.export_banked_slices, banked_slice_rows)
+        generated_files.append(args.export_banked_slices)
     if args.export_guardian_buckets:
         export_guardian_buckets_csv(args.export_guardian_buckets, guardian_rows)
         generated_files.append(args.export_guardian_buckets)
@@ -5570,19 +6153,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     generated_files.extend([bpng, bsvg])
                 except RuntimeError as exc:
                     print(f"Banked-reset capacity chart unavailable: {exc}", file=sys.stderr)
+                try:
+                    spng, ssvg = render_banked_boundary_slice_chart(
+                        banked_slice_rows, banked_slice_result, args.banked_slice_chart_prefix, args,
+                        theme=args.chart_theme,
+                    )
+                    chart_files.extend([spng, ssvg])
+                    generated_files.extend([spng, ssvg])
+                except RuntimeError as exc:
+                    print(f"Banked-reset boundary-slice chart unavailable: {exc}", file=sys.stderr)
 
     # Privacy-safe shareable outputs contain only aggregate data.
     if args.summary_json:
         write_summary_json(
             args.summary_json, args, coverage, full_chart_rows, regimes,
             approval_episodes, guardian_period_costs, banked_capacity_rows, banked_capacity_result,
+            banked_slice_rows, banked_slice_result,
         )
         generated_files.append(args.summary_json)
 
     if args.report:
         write_markdown_report(
             args.report, args, coverage, full_chart_rows, regimes,
-            approval_episodes, guardian_period_costs, banked_capacity_rows, banked_capacity_result, chart_files,
+            approval_episodes, guardian_period_costs, banked_capacity_rows, banked_capacity_result,
+            banked_slice_rows, banked_slice_result, chart_files,
         )
         generated_files.append(args.report)
 
