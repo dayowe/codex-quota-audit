@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex quota audit v2.12.
+"""Codex quota audit v2.14.
 
 How much Codex work does your quota actually buy?
 
@@ -35,12 +35,14 @@ Useful commands:
     python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
     python3 codex_quota_audit.py --report report.md
     python3 codex_quota_audit.py --summary-json summary.json
+    python3 codex_quota_audit.py --banked-reset 2026-09-12T10:13
 
 Default output focuses on what most users care about
 ----------------------------------------------------
 * Latest model x reasoning-effort quota efficiency.
 * Approve-for-me / Guardian inference overhead and per-reset quota cost.
 * Compact data-coverage and quota-policy summaries.
+* Banked-reset effective-capacity audit using user-confirmed reset timestamps.
 
 Use --history for monthly trends, policy-regime tables, and model x month history.
 
@@ -91,7 +93,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-__version__ = "2.12"
+__version__ = "2.14"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +136,12 @@ DEFAULT_MIN_PRICE_COVERAGE = 0.95
 DEFAULT_MODEL_PURITY = 0.90
 DEFAULT_NOOP_USAGE_MAX = 1.0
 DEFAULT_EFFECTIVE_RESET_DROP = 2.0
+DEFAULT_BANKED_RESET_MATCH_MINUTES = 90.0
+DEFAULT_BANKED_CAPACITY_MODEL_PURITY = 0.90
+DEFAULT_BANKED_CAPACITY_EFFORT_PURITY = 0.90
+DEFAULT_BANKED_CAPACITY_MIN_POINTS = 10.0
+DEFAULT_BANKED_CAPACITY_BOOTSTRAPS = 1000
+DEFAULT_BANKED_CAPACITY_INTERVAL = 0.80
 DEFAULT_WEIGHT_MODEL_PURITY = 0.95
 DEFAULT_WEIGHT_MIN_POINTS = 40.0
 DEFAULT_WEIGHT_MIN_EPISODES = 5
@@ -324,6 +332,11 @@ class Bucket:
     activity_tokens: Dict[str, int] = field(default_factory=dict)
     activity_events: Dict[str, int] = field(default_factory=dict)
     reviewer_tokens: Dict[str, int] = field(default_factory=dict)
+    core_usage: Usage = field(default_factory=Usage)
+    core_priced_tokens: int = 0
+    core_total_tokens: int = 0
+    core_model_tokens: Dict[str, int] = field(default_factory=dict)
+    core_effort_tokens: Dict[str, int] = field(default_factory=dict)
 
     @property
     def price_coverage(self) -> float:
@@ -402,6 +415,20 @@ class ResetRecord:
     observed_drop: Optional[float]
     raw_reset_key: int
     accounting_reset_key: int
+
+
+@dataclass(frozen=True)
+class BankedResetMarker:
+    """User-confirmed reset timestamp with the precision actually supplied.
+
+    Hour-only input describes the whole hour, minute input describes the whole
+    minute, and second-level input is treated as an exact timestamp. This avoids
+    pretending the UI provided precision it did not expose.
+    """
+    start: datetime
+    end: datetime
+    text: str
+    precision: str
 
 
 @dataclass
@@ -1198,12 +1225,25 @@ def make_bucket(reset_k: int, reset_at: float,
     activity_tokens: Dict[str, int] = defaultdict(int)
     activity_events: Dict[str, int] = defaultdict(int)
     reviewer_tokens: Dict[str, int] = defaultdict(int)
+    core_model_tokens: Dict[str, int] = defaultdict(int)
+    core_effort_tokens: Dict[str, int] = defaultdict(int)
+    core_events = [e for e in events if not e.is_auto_review_inference]
+    core_unc = sum(e.uncached for e in core_events)
+    core_cached = sum(e.cached for e in core_events)
+    core_output = sum(e.output for e in core_events)
+    core_priced_tokens = sum(e.tokens for e in core_events if e.priced)
+    core_total_tokens = sum(e.tokens for e in core_events)
+    core_usd = sum(e.api_usd or 0.0 for e in core_events if e.priced)
+    core_any_priced = any(e.priced for e in core_events)
     for e in events:
         model_tokens[e.model] += e.tokens
         effort_tokens[e.effort] += e.tokens
         activity_tokens[e.activity_class] += e.tokens
         activity_events[e.activity_class] += 1
         reviewer_tokens[e.approvals_reviewer] += e.tokens
+        if not e.is_auto_review_inference:
+            core_model_tokens[e.model] += e.tokens
+            core_effort_tokens[e.effort] += e.tokens
     return Bucket(
         reset_key=reset_k,
         reset_at=reset_at,
@@ -1221,6 +1261,11 @@ def make_bucket(reset_k: int, reset_at: float,
         activity_tokens=dict(activity_tokens),
         activity_events=dict(activity_events),
         reviewer_tokens=dict(reviewer_tokens),
+        core_usage=Usage(core_unc, core_cached, core_output, core_usd if core_any_priced else None),
+        core_priced_tokens=core_priced_tokens,
+        core_total_tokens=core_total_tokens,
+        core_model_tokens=dict(core_model_tokens),
+        core_effort_tokens=dict(core_effort_tokens),
     )
 
 
@@ -1538,6 +1583,369 @@ def print_reset_ledger(ledger: Sequence[ResetRecord], show_churn: bool = False) 
         delta = "-" if r.relative_to_previous_due is None else fmt_hours(r.relative_to_previous_due)
         lag = fmt_hours(r.first_seen_lag)
         print(f"{fmt_dt(r.activation_at):<17} {r.kind:<11} {used:>18} {prev_due:<17} {fmt_dt(r.new_due_at):<17} {delta:>9} {lag:>9}")
+
+
+
+def parse_banked_reset_marker(value: str) -> BankedResetMarker:
+    """Parse a user-confirmed banked reset while preserving timestamp precision.
+
+    Examples:
+      2026-09-13T15       -> any time during 15:00-15:59 local time
+      2026-09-13T15:03    -> any time during 15:03 local time
+      2026-09-13T15:03:27 -> exact second
+
+    Naive values use the machine's local timezone, matching timestamps printed by
+    this script. Explicit Z/UTC offsets are respected.
+    """
+    text = value.strip()
+    if not text:
+        raise ValueError("empty timestamp")
+    m = re.match(
+        r"^\d{4}-\d{2}-\d{2}T(\d{2})(?::(\d{2}))?(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$",
+        text,
+    )
+    if not m:
+        raise ValueError(
+            f"invalid timestamp {value!r}; use ISO-8601 such as 2026-09-12T10:13"
+        )
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid timestamp {value!r}; use ISO-8601 such as 2026-09-12T10:13"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    dt = dt.astimezone()
+    if m.group(2) is None:
+        precision, width = "hour", timedelta(hours=1)
+    elif m.group(3) is None:
+        precision, width = "minute", timedelta(minutes=1)
+    else:
+        precision, width = "second", timedelta(seconds=1)
+    return BankedResetMarker(dt, dt + width, text, precision)
+
+
+def _marker_distance_seconds(marker: BankedResetMarker, when: datetime) -> float:
+    if marker.start <= when < marker.end:
+        return 0.0
+    if when < marker.start:
+        return (marker.start - when).total_seconds()
+    return (when - marker.end).total_seconds()
+
+
+def match_banked_reset_markers(ledger: Sequence[ResetRecord], args: argparse.Namespace,
+                               markers: Sequence[BankedResetMarker]) -> Tuple[Dict[int, Dict[str, object]], List[Dict[str, object]]]:
+    """Match user-confirmed reset times to effective accounting boundaries."""
+    candidates = [r for r in ledger if r.kind != "initial" and r.creates_episode]
+    max_match_s = args.banked_reset_match_minutes * 60.0
+    matched: Dict[int, Dict[str, object]] = {}
+    unmatched: List[Dict[str, object]] = []
+    for marker in markers:
+        best: Optional[ResetRecord] = None
+        best_s = float("inf")
+        for rec in candidates:
+            dist = min(_marker_distance_seconds(marker, rec.activation_at),
+                       _marker_distance_seconds(marker, rec.first_seen_at))
+            if dist < best_s:
+                best, best_s = rec, dist
+        if best is not None and best_s <= max_match_s + EPS:
+            item = {
+                "marker": marker,
+                "record": best,
+                "offset_minutes": best_s / 60.0,
+            }
+            prev = matched.get(best.accounting_reset_key)
+            if prev is None or float(item["offset_minutes"]) < float(prev["offset_minutes"]):
+                matched[best.accounting_reset_key] = item
+        else:
+            unmatched.append({
+                "marker": marker,
+                "nearest_minutes": best_s / 60.0 if math.isfinite(best_s) else float("nan"),
+            })
+    return matched, unmatched
+
+
+def _dominant_counter(counter: Dict[str, int]) -> Tuple[str, float]:
+    total = sum(counter.values())
+    if total <= 0:
+        return "unknown", 0.0
+    name, n = max(counter.items(), key=lambda kv: kv[1])
+    return name, n / total
+
+
+def build_banked_capacity_rows(primary: Analysis, regimes: Sequence[PolicyRegime],
+                               args: argparse.Namespace,
+                               markers: Sequence[BankedResetMarker]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Build one effective-capacity row per reconstructed quota reset period.
+
+    The claim under test is not whether the meter visually returns to 100%, but
+    whether a user-confirmed banked-reset period buys materially less actual work
+    per quota point than comparable periods under the same model, effort and
+    detected policy regime.
+    """
+    matches, unmatched = match_banked_reset_markers(primary.ledger, args, markers)
+    rec_by_key: Dict[int, ResetRecord] = {}
+    for rec in primary.ledger:
+        if rec.creates_episode:
+            rec_by_key[rec.accounting_reset_key] = rec
+
+    eps = sorted(primary.episodes, key=lambda ep: ep.activation_at)
+    rows: List[Dict[str, object]] = []
+    for i, ep in enumerate(eps):
+        bs = ep.buckets
+        points = sum(b.points for b in bs)
+        all_tokens = sum(b.total_tokens for b in bs)
+        all_priced = sum(b.priced_tokens for b in bs)
+        all_usd = sum((b.usage.api_usd or 0.0) for b in bs)
+        core_tokens = sum(b.core_total_tokens for b in bs)
+        core_priced = sum(b.core_priced_tokens for b in bs)
+        core_usd = sum((b.core_usage.api_usd or 0.0) for b in bs)
+        model_tokens: Dict[str, int] = defaultdict(int)
+        effort_tokens: Dict[str, int] = defaultdict(int)
+        for b in bs:
+            for k, v in b.core_model_tokens.items():
+                model_tokens[k] += v
+            for k, v in b.core_effort_tokens.items():
+                effort_tokens[k] += v
+        model, model_share = _dominant_counter(dict(model_tokens))
+        effort, effort_share = _dominant_counter(dict(effort_tokens))
+        regime = _regime_label(regimes, model, ep.first_ts) if model != "unknown" else "unknown"
+        rec = rec_by_key.get(ep.reset_key)
+        match = matches.get(ep.reset_key)
+        end = eps[i + 1].activation_at if i + 1 < len(eps) else None
+        all_cov = all_priced / all_tokens if all_tokens else 1.0
+        core_cov = core_priced / core_tokens if core_tokens else 1.0
+        all_api = all_usd if all_tokens and all_cov + EPS >= args.min_price_coverage else float("nan")
+        core_api = core_usd if core_tokens and core_cov + EPS >= args.min_price_coverage else float("nan")
+        eligible = (
+            points + EPS >= args.banked_capacity_min_points
+            and model_share + EPS >= args.banked_capacity_model_purity
+            and effort_share + EPS >= args.banked_capacity_effort_purity
+            and model != "unknown" and effort != "unknown" and regime != "unknown"
+        )
+        marker = match.get("marker") if match else None
+        rows.append({
+            "reset_key": ep.reset_key,
+            "period_start": ep.activation_at,
+            "period_end": end,
+            "first_seen": ep.first_ts,
+            "last_seen": ep.last_ts,
+            "reset_kind": rec.kind if rec else "unknown",
+            "confirmed_banked": bool(match),
+            "banked_marker": marker.text if isinstance(marker, BankedResetMarker) else "",
+            "banked_marker_precision": marker.precision if isinstance(marker, BankedResetMarker) else "",
+            "banked_match_offset_minutes": float(match["offset_minutes"]) if match else float("nan"),
+            "quota_points": points,
+            "all_tokens": all_tokens,
+            "all_mtokens_per_point": all_tokens / 1e6 / points if points > EPS else float("nan"),
+            "all_api_usd": all_api,
+            "all_api_usd_per_point": all_api / points if points > EPS and math.isfinite(all_api) else float("nan"),
+            "all_price_coverage": all_cov,
+            "core_tokens": core_tokens,
+            "core_mtokens_per_point": core_tokens / 1e6 / points if points > EPS else float("nan"),
+            "core_api_usd": core_api,
+            "core_api_usd_per_point": core_api / points if points > EPS and math.isfinite(core_api) else float("nan"),
+            "core_price_coverage": core_cov,
+            "guardian_tokens": max(0, all_tokens - core_tokens),
+            "model": model,
+            "model_share": model_share,
+            "effort": effort,
+            "effort_share": effort_share,
+            "regime": regime,
+            "eligible": eligible,
+            "complete_period": end is not None,
+        })
+    return rows, unmatched
+
+
+def _capacity_efficiency(rows: Sequence[Dict[str, object]], numerator_key: str) -> float:
+    good = [r for r in rows if float(r.get("quota_points", 0.0) or 0.0) > EPS
+            and math.isfinite(float(r.get(numerator_key, float("nan"))))]
+    points = sum(float(r["quota_points"]) for r in good)
+    if points <= EPS:
+        return float("nan")
+    return sum(float(r[numerator_key]) for r in good) / points
+
+
+def _combine_stratum_ratios(strata: Sequence[Tuple[List[Dict[str, object]], List[Dict[str, object]]]],
+                            numerator_key: str) -> float:
+    weighted_logs: List[Tuple[float, float]] = []
+    for banked, comp in strata:
+        be = _capacity_efficiency(banked, numerator_key)
+        ce = _capacity_efficiency(comp, numerator_key)
+        if not (math.isfinite(be) and math.isfinite(ce) and be > 0 and ce > 0):
+            continue
+        weight = sum(float(r["quota_points"]) for r in banked)
+        if weight > EPS:
+            weighted_logs.append((math.log(be / ce), weight))
+    if not weighted_logs:
+        return float("nan")
+    return math.exp(sum(v * w for v, w in weighted_logs) / sum(w for _v, w in weighted_logs))
+
+
+def banked_capacity_summary(rows: Sequence[Dict[str, object]], unmatched: Sequence[Dict[str, object]],
+                            args: argparse.Namespace) -> Dict[str, object]:
+    """Matched banked/comparison capacity ratios, controlling by model/effort/regime."""
+    eligible = [r for r in rows if r.get("eligible")]
+    banked_all = [r for r in eligible if r.get("confirmed_banked")]
+    comps_all = [r for r in eligible if not r.get("confirmed_banked")]
+    by_stratum_b: Dict[Tuple[str, str, str], List[Dict[str, object]]] = defaultdict(list)
+    by_stratum_c: Dict[Tuple[str, str, str], List[Dict[str, object]]] = defaultdict(list)
+    for r in banked_all:
+        by_stratum_b[(str(r["model"]), str(r["effort"]), str(r["regime"]))].append(r)
+    for r in comps_all:
+        by_stratum_c[(str(r["model"]), str(r["effort"]), str(r["regime"]))].append(r)
+    keys = sorted(k for k in by_stratum_b if by_stratum_c.get(k))
+    strata = [(by_stratum_b[k], by_stratum_c[k]) for k in keys]
+    matched_banked = [r for b, _c in strata for r in b]
+    matched_comps = [r for _b, c in strata for r in c]
+
+    specs = [
+        ("all_raw", "all_tokens", "Raw tokens, all work"),
+        ("all_api", "all_api_usd", "API $eq, all work"),
+        ("core_raw", "core_tokens", "Raw tokens, excluding Guardian"),
+        ("core_api", "core_api_usd", "API $eq, excluding Guardian"),
+    ]
+    metrics: Dict[str, Dict[str, object]] = {}
+    rng = random.Random(214013)
+    for key, numerator, label in specs:
+        ratio = _combine_stratum_ratios(strata, numerator)
+        boots: List[float] = []
+        if strata and args.banked_capacity_bootstraps > 0 and math.isfinite(ratio):
+            for _ in range(args.banked_capacity_bootstraps):
+                sampled = []
+                for b, c in strata:
+                    sb = [rng.choice(b) for _i in range(len(b))]
+                    sc = [rng.choice(c) for _i in range(len(c))]
+                    sampled.append((sb, sc))
+                rv = _combine_stratum_ratios(sampled, numerator)
+                if math.isfinite(rv):
+                    boots.append(rv)
+        alpha = (1.0 - args.banked_capacity_interval) / 2.0
+        lo = _q(boots, alpha) if boots else float("nan")
+        hi = _q(boots, 1.0 - alpha) if boots else float("nan")
+        metrics[key] = {"label": label, "ratio": ratio, "lo": lo, "hi": hi, "bootstrap_n": len(boots)}
+
+    strongest = next((k for k in ("core_api", "all_api", "core_raw", "all_raw")
+                      if math.isfinite(float(metrics[k]["ratio"]))), None)
+    interpretation = "insufficient matched banked and comparison periods"
+    if strongest:
+        m = metrics[strongest]
+        ratio, lo, hi = float(m["ratio"]), float(m["lo"]), float(m["hi"])
+        if math.isfinite(lo) and math.isfinite(hi):
+            if lo > 0.50 + EPS:
+                interpretation = (
+                    f"the 0.50x half-capacity prediction is below the {args.banked_capacity_interval:.0%} "
+                    f"interval for {m['label']}; these matched periods argue against the claim"
+                )
+            elif hi < 0.50 - EPS:
+                interpretation = (
+                    f"the observed capacity is below even the 0.50x prediction for {m['label']}; "
+                    "the data show reduced capacity but not specifically a half-capacity rule"
+                )
+            else:
+                interpretation = (
+                    f"the 0.50x half-capacity prediction lies inside the {args.banked_capacity_interval:.0%} "
+                    f"interval for {m['label']}; the data are inconclusive"
+                )
+        else:
+            interpretation = f"matched point estimate for {m['label']} is {ratio:.2f}x, but uncertainty is unavailable"
+
+    return {
+        "supplied_markers": len(args.banked_reset),
+        "matched_markers": sum(1 for r in rows if r.get("confirmed_banked")),
+        "unmatched_markers": len(unmatched),
+        "eligible_banked_periods": len(banked_all),
+        "matched_banked_periods": len(matched_banked),
+        "matched_comparison_periods": len(matched_comps),
+        "matched_strata": keys,
+        "metrics": metrics,
+        "strongest_metric": strongest,
+        "interpretation": interpretation,
+    }
+
+
+def print_banked_capacity_audit(rows: Sequence[Dict[str, object]], unmatched: Sequence[Dict[str, object]],
+                                summary: Dict[str, object], args: argparse.Namespace) -> None:
+    print("\nBanked-reset effective-capacity audit")
+    print("--------------------------------------")
+    print("Tests the claim that a user-confirmed banked reset returns the meter to 100%")
+    print("but that 100% buys only ~0.50x as much actual work as comparable reset periods.")
+    print("Comparison periods are not user-confirmed banked resets; they are not assumed to be scheduled resets.\n")
+    if not args.banked_reset:
+        print("Not tested: no user-confirmed banked-reset timestamps supplied.")
+        print("Use --banked-reset TIMESTAMP (repeatable) for reset times shown in your reset history.")
+        return
+    print(f"user-confirmed timestamps matched: {summary['matched_markers']}/{summary['supplied_markers']}")
+    if summary["unmatched_markers"]:
+        print(f"unmatched timestamps:               {summary['unmatched_markers']}")
+    print(f"eligible confirmed-banked periods:  {summary['eligible_banked_periods']}")
+    print(f"matched banked periods:             {summary['matched_banked_periods']}")
+    print(f"matched comparison periods:         {summary['matched_comparison_periods']}")
+    if not summary["matched_strata"]:
+        print("No same-model + same-effort + same-policy-regime comparison periods were available.")
+        return
+    print("matched strata: " + ", ".join(f"{m} {e} {r}" for m, e, r in summary["matched_strata"]))
+    print(f"minimum evidence per period: {args.banked_capacity_min_points:g} quota points; "
+          f"model/effort purity >= {args.banked_capacity_model_purity:.0%}/{args.banked_capacity_effort_purity:.0%}\n")
+
+    relevant_keys = set(summary["matched_strata"])
+    relevant = [r for r in rows if r.get("eligible") and
+                (str(r["model"]), str(r["effort"]), str(r["regime"])) in relevant_keys]
+    relevant.sort(key=lambda r: r["period_start"])
+    print(f"{'period':<15} {'type':<9} {'quota pt':>8} {'model/effort':<22} {'reg':<4} {'Mtok/1%':>9} {'API$eq/1%':>11} {'core API$eq/1%':>15}")
+    for r in relevant:
+        typ = "BANKED" if r.get("confirmed_banked") else "compare"
+        me = f"{r['model']} {r['effort']}"
+        api = float(r.get("all_api_usd_per_point", float("nan")))
+        core_api = float(r.get("core_api_usd_per_point", float("nan")))
+        api_s = f"${api:.2f}" if math.isfinite(api) else "n/a"
+        core_s = f"${core_api:.2f}" if math.isfinite(core_api) else "n/a"
+        print(f"{_period_label(r):<15} {typ:<9} {float(r['quota_points']):8.0f} {me:<22} {str(r['regime']):<4} "
+              f"{float(r['all_mtokens_per_point']):9.2f} {api_s:>11} {core_s:>15}")
+
+    print("\nMatched banked / comparison capacity ratio")
+    print("------------------------------------------")
+    print("1.00x = same capacity; 0.50x = the rumor's half-capacity prediction.")
+    metrics = summary["metrics"]
+    for key in ("all_raw", "all_api", "core_raw", "core_api"):
+        m = metrics[key]
+        ratio = float(m["ratio"])
+        if not math.isfinite(ratio):
+            continue
+        lo, hi = float(m["lo"]), float(m["hi"])
+        rng = f"{lo:.2f}-{hi:.2f}" if math.isfinite(lo) and math.isfinite(hi) else "n/a"
+        print(f"{str(m['label']):<32} {ratio:5.2f}x   {args.banked_capacity_interval:.0%} interval {rng}")
+    strongest = summary.get("strongest_metric")
+    if strongest:
+        m = metrics[strongest]
+        lo, hi = float(m["lo"]), float(m["hi"])
+        if math.isfinite(lo) and math.isfinite(hi):
+            print(f"\nHalf-capacity prediction (0.50x): {'inside' if lo <= .5 <= hi else 'outside'} the "
+                  f"{args.banked_capacity_interval:.0%} interval of the strongest available metric.")
+        print("Interpretation: " + str(summary["interpretation"]) + ".")
+    print("Core metrics exclude codex-auto-review so unusual Approve-for-me overhead does not masquerade as a banked-reset capacity change.")
+
+
+def export_banked_capacity_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    fields = [
+        "reset_key", "period_start", "period_end", "first_seen", "last_seen", "reset_kind",
+        "confirmed_banked", "banked_marker", "banked_marker_precision", "banked_match_offset_minutes",
+        "quota_points", "model", "model_share", "effort", "effort_share", "regime", "eligible", "complete_period",
+        "all_tokens", "all_mtokens_per_point", "all_api_usd", "all_api_usd_per_point", "all_price_coverage",
+        "core_tokens", "core_mtokens_per_point", "core_api_usd", "core_api_usd_per_point", "core_price_coverage",
+        "guardian_tokens",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            cooked = dict(row)
+            for key in ("period_start", "period_end", "first_seen", "last_seen"):
+                value = cooked.get(key)
+                cooked[key] = value.isoformat() if isinstance(value, datetime) else ""
+            w.writerow({k: cooked.get(k, "") for k in fields})
 
 
 def print_episodes(episodes: Sequence[EpisodeSummary], min_price_coverage: float) -> None:
@@ -2925,10 +3333,10 @@ def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
     ax.set_title(
         "Estimated weekly allowance consumed by Approve for me\n"
         "Point = estimate · whisker = 80% bootstrap interval",
-        color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12,
+        color=pal["fg"], fontsize=12.5, fontweight="bold", loc="left", pad=12,
     )
     fig.text(.08, .965, f"Approve-for-me cost by {window_label(minutes)} reset period",
-             color=pal["fg"], fontsize=17, fontweight="semibold", ha="left", va="top")
+             color=pal["fg"], fontsize=17, fontweight="bold", ha="left", va="top")
     fig.text(.08, .028,
              "Estimated from local quota telemetry; not a server billing field. Hollow marker = current incomplete period.",
              color=pal["muted"], fontsize=8.7, ha="left")
@@ -2939,6 +3347,132 @@ def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
     fig.savefig(svg, facecolor=pal["bg"], bbox_inches="tight")
     plt.close(fig)
     return png, svg
+
+
+def render_banked_capacity_chart(rows: Sequence[Dict[str, object]], summary: Dict[str, object],
+                                 prefix: str, args: argparse.Namespace,
+                                 theme: str = "light") -> Tuple[str, str]:
+    """Render matched period capacity plus the direct 0.50x hypothesis test."""
+    if not summary.get("matched_strata") or not summary.get("strongest_metric"):
+        raise RuntimeError("no matched banked/comparison capacity evidence")
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ImportError as exc:
+        raise RuntimeError("banked-reset capacity charts require matplotlib") from exc
+
+    pal = chart_palette(theme)
+    strongest = str(summary["strongest_metric"])
+    period_metric = {
+        "core_api": ("core_api_usd_per_point", "API-list-equivalent dollars per 1% quota", "$"),
+        "all_api": ("all_api_usd_per_point", "API-list-equivalent dollars per 1% quota", "$"),
+        "core_raw": ("core_mtokens_per_point", "Million observed tokens per 1% quota", ""),
+        "all_raw": ("all_mtokens_per_point", "Million observed tokens per 1% quota", ""),
+    }[strongest]
+    value_key, xlabel, prefix_label = period_metric
+    relevant_keys = set(summary["matched_strata"])
+    relevant = [r for r in rows if r.get("eligible") and
+                (str(r["model"]), str(r["effort"]), str(r["regime"])) in relevant_keys and
+                math.isfinite(float(r.get(value_key, float("nan"))))]
+    relevant.sort(key=lambda r: r["period_start"])
+    if not relevant:
+        raise RuntimeError("no matched period values for banked-reset chart")
+
+    fig_h = max(6.1, .46 * len(relevant) + 2.7)
+    fig, axes = plt.subplots(1, 2, figsize=(15.2, fig_h), gridspec_kw={"width_ratios": [1.25, .9]})
+    fig.patch.set_facecolor(pal["bg"])
+    for ax in axes:
+        _style_axis(ax, pal)
+
+    # Left: actual comparable reset periods.
+    ax = axes[0]
+    ys = list(range(len(relevant)))[::-1]
+    vals = [float(r[value_key]) for r in relevant]
+    xmax = max(vals) * 1.30 if vals else 1.0
+    for y, r in zip(ys, relevant):
+        v = float(r[value_key])
+        banked = bool(r.get("confirmed_banked"))
+        current = not isinstance(r.get("period_end"), datetime)
+        marker = "*" if banked else "o"
+        edge = pal["warm"] if banked else pal["accent"]
+        face = pal["ax"] if current else edge
+        size = 10 if banked else 7
+        ax.plot(v, y, marker=marker, markersize=size, markerfacecolor=face,
+                markeredgecolor=edge, markeredgewidth=1.5, linestyle="None", zorder=3)
+        kind = "BANKED" if banked else "compare"
+        cur = " · current" if current else ""
+        label = f"{prefix_label}{v:.2f} · {kind}{cur}"
+        ax.text(min(xmax*.98, v + xmax*.018), y, label,
+                color=pal["fg"], fontsize=8.5, va="center", ha="left")
+    ax.set_xlim(0, max(1.0, xmax))
+    ax.set_yticks(ys)
+    ax.set_yticklabels([_period_label(r) for r in relevant], color=pal["fg"], fontsize=9.2)
+    ax.set_xlabel(xlabel, color=pal["muted"], labelpad=9)
+    core_note = "excluding Guardian" if strongest.startswith("core_") else "all observed work"
+    ax.set_title(f"Comparable reset periods\n{core_note} · same model / effort / policy regime",
+                 color=pal["fg"], fontsize=12.2, fontweight="bold", loc="left", pad=12)
+
+    # Right: capacity ratios. This is the direct rumor test.
+    ax = axes[1]
+    metric_order = ["all_raw", "all_api", "core_raw", "core_api"]
+    metric_rows = []
+    for key in metric_order:
+        m = summary["metrics"][key]
+        ratio = float(m["ratio"])
+        if math.isfinite(ratio):
+            metric_rows.append((key, m))
+    y2 = list(range(len(metric_rows)))[::-1]
+    max_hi = max([float(m["hi"]) if math.isfinite(float(m["hi"])) else float(m["ratio"])
+                  for _k, m in metric_rows] + [1.0])
+    xmax2 = max(1.25, max_hi * 1.18)
+    ax.axvline(.5, color=pal["warm"], linestyle="--", linewidth=1.25, alpha=.95, zorder=1)
+    ax.axvline(1.0, color=pal["muted"], linestyle=":", linewidth=1.2, alpha=.9, zorder=1)
+    for y, (key, m) in zip(y2, metric_rows):
+        ratio = float(m["ratio"])
+        lo, hi = float(m["lo"]), float(m["hi"])
+        if math.isfinite(lo) and math.isfinite(hi):
+            ax.errorbar(ratio, y, xerr=[[max(0, ratio-lo)], [max(0, hi-ratio)]],
+                        fmt="o", markersize=7, markerfacecolor=pal["accent"],
+                        markeredgecolor=pal["accent"], ecolor=pal["whisker"],
+                        elinewidth=1.45, capsize=3.2, zorder=3)
+        else:
+            ax.plot(ratio, y, "o", color=pal["accent"], markersize=7, zorder=3)
+        ax.text(min(xmax2*.98, max(ratio, hi if math.isfinite(hi) else ratio)+xmax2*.018), y,
+                f"{ratio:.2f}x", color=pal["fg"], fontsize=8.8, va="center")
+    ax.set_xlim(0, xmax2)
+    ax.set_yticks(y2)
+    ax.set_yticklabels([str(m["label"]).replace(", ", "\n") for _k, m in metric_rows],
+                       color=pal["fg"], fontsize=8.9)
+    ax.set_xlabel("Banked / comparison capacity ratio", color=pal["muted"], labelpad=9)
+    ax.set_title(f"Direct hypothesis test\n0.50x = half capacity · 1.00x = equal capacity",
+                 color=pal["fg"], fontsize=12.2, fontweight="bold", loc="left", pad=12)
+    ax.text(.5, 1.01, "0.50x", transform=ax.get_xaxis_transform(), color=pal["warm"],
+            fontsize=8.2, ha="center", va="bottom")
+    ax.text(1.0, 1.01, "1.00x", transform=ax.get_xaxis_transform(), color=pal["muted"],
+            fontsize=8.2, ha="center", va="bottom")
+
+    handles = [
+        Line2D([0], [0], marker="*", linestyle="None", markersize=10,
+               markerfacecolor=pal["warm"], markeredgecolor=pal["warm"], label="confirmed banked"),
+        Line2D([0], [0], marker="o", linestyle="None", markersize=7,
+               markerfacecolor=pal["accent"], markeredgecolor=pal["accent"], label="comparison"),
+    ]
+    fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(.965, .955),
+               frameon=False, ncol=2, labelcolor=pal["fg"], fontsize=8.8)
+    fig.text(.06, .965, "Banked-reset effective-capacity audit", color=pal["fg"],
+             fontsize=18, fontweight="bold", ha="left", va="top")
+    fig.text(.06, .035,
+             "Comparison periods are not user-confirmed banked resets. Ratios control for model, effort and detected policy regime; whiskers are whole-period bootstrap intervals.",
+             color=pal["muted"], fontsize=8.2, ha="left")
+    fig.subplots_adjust(left=.08, right=.965, bottom=.16, top=.79, wspace=.32)
+    png, svg = prefix + ".png", prefix + ".svg"
+    Path(png).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, dpi=190, facecolor=pal["bg"], bbox_inches="tight")
+    fig.savefig(svg, facecolor=pal["bg"], bbox_inches="tight")
+    plt.close(fig)
+    return png, svg
+
+
 
 def guardian_bucket_rows(events: Sequence[Event], args: argparse.Namespace) -> List[Dict[str, object]]:
     """Build conservative attribution rows for every requested/discovered limit window.
@@ -3571,6 +4105,7 @@ def print_key_findings(args: argparse.Namespace,
                        approval_episodes: Sequence[Dict[str, object]],
                        period_cost_rows: Sequence[Dict[str, object]],
                        guardian_fit: Dict[str, object],
+                       banked_summary: Dict[str, object],
                        guardian_enabled: bool = True) -> None:
     print("Key findings")
     print("============")
@@ -3639,6 +4174,28 @@ def print_key_findings(args: argparse.Namespace,
     else:
         print("No model-specific policy-regime break met the configured evidence thresholds.")
 
+    print("\nBanked-reset capacity")
+    print("---------------------")
+    if not args.banked_reset:
+        print("Not tested. Add --banked-reset TIMESTAMP for resets you personally triggered.")
+    elif not banked_summary.get("matched_strata"):
+        print(f"Matched {banked_summary.get('matched_markers', 0)}/{banked_summary.get('supplied_markers', 0)} supplied timestamps, "
+              "but no same-model / same-effort / same-policy comparison periods were available.")
+    else:
+        strongest = banked_summary.get("strongest_metric")
+        metric = banked_summary.get("metrics", {}).get(strongest, {}) if strongest else {}
+        ratio = float(metric.get("ratio", float("nan")))
+        lo = float(metric.get("lo", float("nan")))
+        hi = float(metric.get("hi", float("nan")))
+        label = str(metric.get("label", "capacity"))
+        if math.isfinite(ratio):
+            print(f"strongest matched metric:               {label}")
+            print(f"banked / comparison capacity:           {ratio:.2f}x")
+            if math.isfinite(lo) and math.isfinite(hi):
+                print(f"{args.banked_capacity_interval:.0%} whole-period interval:                {lo:.2f}-{hi:.2f}x")
+                print(f"half-capacity prediction (0.50x):       {'inside' if lo <= .5 <= hi else 'outside'} interval")
+            print("Interpretation: " + str(banked_summary.get("interpretation", "n/a")) + ".")
+
     print("\nUse --history for monthly/regime history, --diagnostics for telemetry details,")
     print("and --weight-details for experimental token-weight fits.")
 
@@ -3652,7 +4209,9 @@ def _json_float(value: object) -> object:
 def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, object],
                        chart_rows: Sequence[Dict[str, object]], regimes: Sequence[PolicyRegime],
                        approval_episodes: Sequence[Dict[str, object]],
-                       period_cost_rows: Sequence[Dict[str, object]]) -> None:
+                       period_cost_rows: Sequence[Dict[str, object]],
+                       banked_rows: Sequence[Dict[str, object]],
+                       banked_summary: Dict[str, object]) -> None:
     windows_out = {}
     windows = coverage.get("windows", {})
     if isinstance(windows, dict):
@@ -3688,8 +4247,32 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
             "tokens_m_per_point": _json_float(float(r.get("tokens_m_per_point", float("nan")))),
             "api_usd_per_point": _json_float(float(r.get("api_usd_per_point", float("nan")))),
         })
+    banked_out = {
+        "supplied_markers": int(banked_summary.get("supplied_markers", 0) or 0),
+        "matched_markers": int(banked_summary.get("matched_markers", 0) or 0),
+        "eligible_banked_periods": int(banked_summary.get("eligible_banked_periods", 0) or 0),
+        "matched_banked_periods": int(banked_summary.get("matched_banked_periods", 0) or 0),
+        "matched_comparison_periods": int(banked_summary.get("matched_comparison_periods", 0) or 0),
+        "interpretation": str(banked_summary.get("interpretation", "not tested")),
+        "metrics": {},
+        "periods": [],
+    }
+    for key, m in (banked_summary.get("metrics", {}) or {}).items():
+        banked_out["metrics"][key] = {k: _json_float(v) for k, v in m.items()}
+    for r in banked_rows:
+        if not r.get("confirmed_banked") and not r.get("eligible"):
+            continue
+        banked_out["periods"].append({
+            "period": _period_label(r), "confirmed_banked": bool(r.get("confirmed_banked")),
+            "quota_points": _json_float(float(r.get("quota_points", float("nan")))),
+            "model": str(r.get("model", "")), "effort": str(r.get("effort", "")), "regime": str(r.get("regime", "")),
+            "all_mtokens_per_point": _json_float(float(r.get("all_mtokens_per_point", float("nan")))),
+            "all_api_usd_per_point": _json_float(float(r.get("all_api_usd_per_point", float("nan")))),
+            "core_mtokens_per_point": _json_float(float(r.get("core_mtokens_per_point", float("nan")))),
+            "core_api_usd_per_point": _json_float(float(r.get("core_api_usd_per_point", float("nan")))),
+        })
     payload = {
-        "schema": "codex-quota-audit-summary-v1",
+        "schema": "codex-quota-audit-summary-v2",
         "version": __version__,
         "target_limit": {"window_minutes": args.window_minutes, "label": window_label(args.window_minutes)},
         "coverage": {
@@ -3702,9 +4285,11 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
         "policy_regime_changes": sorted(m for m, n in changed.items() if n > 1),
         "guardian": {k: _json_float(v) for k, v in gs.items()},
         "guardian_periods": periods,
+        "banked_reset_capacity": banked_out,
         "notes": [
             "API-dollar values are public list-price-equivalent normalization, not subscription billing.",
             "Guardian quota estimates are observational, not server billing data.",
+            "Banked-reset comparisons use only user-confirmed timestamps and same-model/effort/policy comparison periods.",
         ],
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -3715,6 +4300,8 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
                           chart_rows: Sequence[Dict[str, object]], regimes: Sequence[PolicyRegime],
                           approval_episodes: Sequence[Dict[str, object]],
                           period_cost_rows: Sequence[Dict[str, object]],
+                          banked_rows: Sequence[Dict[str, object]],
+                          banked_summary: Dict[str, object],
                           chart_files: Sequence[str]) -> None:
     """Write a privacy-safe, shareable report containing headline aggregates only."""
     lines: List[str] = ["# Codex quota report", "", f"Generated by `codex_quota_audit.py` v{__version__}.", ""]
@@ -3771,6 +4358,41 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
                              f"{format(lo,'.1f')+'-'+format(hi,'.1f') if math.isfinite(lo) and math.isfinite(hi) else 'n/a'} |")
             lines += [""]
 
+    lines += ["## Banked-reset effective capacity", ""]
+    if not args.banked_reset:
+        lines += ["Not tested because no user-confirmed banked-reset timestamps were supplied.", ""]
+    elif not banked_summary.get("matched_strata"):
+        lines += [f"Matched {banked_summary.get('matched_markers',0)}/{banked_summary.get('supplied_markers',0)} supplied reset timestamps, "
+                  "but no same-model / same-effort / same-policy comparison periods were available.", ""]
+    else:
+        lines += ["The rumor predicts a banked/comparison capacity ratio of **0.50x**. "
+                  "Comparison periods are not user-confirmed banked resets.", "",
+                  "| Period | Type | Quota points | Model / effort | Regime | Tokens / 1% | API $eq / 1% | Core API $eq / 1% |",
+                  "| --- | --- | ---: | --- | --- | ---: | ---: | ---: |"]
+        keys = set(banked_summary["matched_strata"])
+        relevant = [r for r in banked_rows if r.get("eligible") and
+                    (str(r["model"]), str(r["effort"]), str(r["regime"])) in keys]
+        for r in sorted(relevant, key=lambda x: x["period_start"]):
+            a = float(r.get("all_api_usd_per_point", float("nan")))
+            c = float(r.get("core_api_usd_per_point", float("nan")))
+            lines.append(f"| {_period_label(r)} | {'BANKED' if r.get('confirmed_banked') else 'compare'} | "
+                         f"{float(r.get('quota_points',0)):.0f} | {r.get('model')} {r.get('effort')} | {r.get('regime')} | "
+                         f"{float(r.get('all_mtokens_per_point',0)):.2f}M | "
+                         f"{'$'+format(a,'.2f') if math.isfinite(a) else 'n/a'} | "
+                         f"{'$'+format(c,'.2f') if math.isfinite(c) else 'n/a'} |")
+        lines += ["", "### Matched capacity ratios", "",
+                  "| Metric | Banked / comparison | Interval |",
+                  "| --- | ---: | ---: |"]
+        for key in ("all_raw","all_api","core_raw","core_api"):
+            m = banked_summary["metrics"][key]
+            ratio = float(m["ratio"])
+            if not math.isfinite(ratio):
+                continue
+            lo, hi = float(m["lo"]), float(m["hi"])
+            rng = f"{lo:.2f}-{hi:.2f}x" if math.isfinite(lo) and math.isfinite(hi) else "n/a"
+            lines.append(f"| {m['label']} | {ratio:.2f}x | {rng} |")
+        lines += ["", f"Interpretation: {banked_summary.get('interpretation','n/a')}.", ""]
+
     changed = Counter(rg.model for rg in regimes)
     changed_models = sorted(m for m,n in changed.items() if n>1)
     lines += ["## Quota policy", ""]
@@ -3792,13 +4414,12 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
                 rel = cp.name
             label = cp.stem.replace("_", " ").title()
             lines += [f"### {label}", "", f"![{label}]({rel})", ""]
-
-    lines += ["## Notes", "",
-              "- API `$eq` values are public list-price-equivalent normalization, not subscription billing or internal compute cost.",
-              "- Guardian quota estimates are observational estimates from local telemetry, not OpenAI server billing fields.",
-              "- Replayed rollout history is excluded by default.", ""]
+    lines += ["---", "",
+              "API-dollar values are public list-price-equivalent normalization, not subscription billing. "
+              "Guardian quota estimates are observational. Banked-reset ratios use only user-confirmed timestamps and matched comparison periods."]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
+    Path(path).write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
 
 def export_chart_data_csv(path: str, rows: Sequence[Dict[str, object]]) -> None:
     fields = [
@@ -3990,18 +4611,18 @@ def render_quota_chart(rows: Sequence[Dict[str, object]], prefix: str,
             yticks.append(n_groups - 1 - group_index[(model, regime)])
             labels.append(f"{model} {regime}" if model in multi_regime_models else model)
         ax.set_yticks(yticks)
-        ax.set_yticklabels(labels, color=pal["fg"], fontsize=10.5, fontweight="semibold")
+        ax.set_yticklabels(labels, color=pal["fg"], fontsize=10.5, fontweight="bold")
         ax.set_ylim(-.6, n_groups-.4)
         ax.set_xlim(0, xmax)
 
     axes[0].set_title("Token throughput\nHigher = more work per 1% quota",
-                      color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12)
+                      color=pal["fg"], fontsize=12.5, fontweight="bold", loc="left", pad=12)
     axes[1].set_title("API-list-equivalent value\nHigher = more work per 1% quota",
-                      color=pal["fg"], fontsize=12.5, fontweight="semibold", loc="left", pad=12)
+                      color=pal["fg"], fontsize=12.5, fontweight="bold", loc="left", pad=12)
     axes[0].set_xlabel("Million observed tokens per 1% quota", color=pal["muted"], fontsize=9.5, labelpad=9)
     axes[1].set_xlabel("API-list-equivalent dollars per 1% quota", color=pal["muted"], fontsize=9.5, labelpad=9)
 
-    fig.text(.06,.965,title,color=pal["fg"],fontsize=18,fontweight="semibold",ha="left",va="top")
+    fig.text(.06,.965,title,color=pal["fg"],fontsize=18,fontweight="bold",ha="left",va="top")
     scope = "Detected policy regimes" if all_regimes or multi_regime_models else "Latest detected policy regime per model"
     fig.text(.06,.905,
              f"{scope} · high-water quota buckets · whiskers show {interval:.0%} whole-episode bootstrap intervals",
@@ -4088,14 +4709,14 @@ def render_guardian_episode_chart(rows: Sequence[Dict[str, object]], prefix: str
     axes[1].set_xlim(0, max(1.0, share_hi * 1.38))
     for ax in axes:
         ax.set_yticks(ys)
-        ax.set_yticklabels(labels,color=pal["fg"],fontsize=9.8,fontweight="semibold")
+        ax.set_yticklabels(labels,color=pal["fg"],fontsize=9.8,fontweight="bold")
     axes[0].set_title("Guardian tokens per approval\nMedian point · p10-p90 whisker",
-                      color=pal["fg"],fontweight="semibold",fontsize=12,loc="left",pad=10)
+                      color=pal["fg"],fontweight="bold",fontsize=12,loc="left",pad=10)
     axes[1].set_title("Guardian share of local approval context\nMedian point · p10-p90 whisker",
-                      color=pal["fg"],fontweight="semibold",fontsize=12,loc="left",pad=10)
+                      color=pal["fg"],fontweight="bold",fontsize=12,loc="left",pad=10)
     axes[0].set_xlabel("Million codex-auto-review tokens",color=pal["muted"],labelpad=9)
     axes[1].set_xlabel("Guardian share of Guardian + paired parent context (%)",color=pal["muted"],labelpad=9)
-    fig.text(.06,.965,"Auto-review approval overhead",color=pal["fg"],fontsize=17,fontweight="semibold",ha="left",va="top")
+    fig.text(.06,.965,"Auto-review approval overhead",color=pal["fg"],fontsize=17,fontweight="bold",ha="left",va="top")
     fig.text(.06,.035,"Medium/high-confidence parent pairs only · quota causality is not implied",
              color=pal["muted"],fontsize=8.5,ha="left")
     fig.subplots_adjust(left=.18,right=.965,bottom=.17,top=.82,wspace=.25)
@@ -4422,6 +5043,32 @@ def run_self_test() -> None:
     base_rc, adj_rc, lc = guardian_ratecard_event_cost(rc, DEFAULT_PRICES)
     assert lc and adj_rc > base_rc > 0, (base_rc, adj_rc, lc)
 
+    # Banked-reset capacity test: user-confirmed periods buy the same work per
+    # quota point as same-model/effort/regime comparison periods. The 0.50x rumor
+    # should therefore fall below the bootstrap interval in this synthetic case.
+    bm = parse_banked_reset_marker("2026-03-01T12")
+    assert bm.precision == "hour" and (bm.end - bm.start) == timedelta(hours=1)
+    bm2 = parse_banked_reset_marker("2026-03-01T12:34")
+    assert bm2.precision == "minute" and (bm2.end - bm2.start) == timedelta(minutes=1)
+    cap_rows = []
+    for i, (banked, api, tok) in enumerate([
+        (True, 100.0, 800_000_000), (True, 102.0, 820_000_000), (True, 98.0, 790_000_000),
+        (False, 99.0, 805_000_000), (False, 101.0, 810_000_000),
+    ]):
+        cap_rows.append({
+            "eligible": True, "confirmed_banked": banked, "model": "gpt-x", "effort": "high", "regime": "R1",
+            "quota_points": 10.0, "all_tokens": tok, "all_api_usd": api,
+            "core_tokens": tok, "core_api_usd": api,
+        })
+    cargs = argparse.Namespace(
+        banked_reset=["x","y","z"], banked_capacity_bootstraps=200,
+        banked_capacity_interval=.80,
+    )
+    csum = banked_capacity_summary(cap_rows, [], cargs)
+    assert csum["matched_banked_periods"] == 3 and csum["matched_comparison_periods"] == 2, csum
+    cratio = float(csum["metrics"]["core_api"]["ratio"])
+    assert .90 < cratio < 1.10, cratio
+
     print("self-test: OK")
 
 
@@ -4444,6 +5091,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py --diagnostics
       Add the detailed reset/replay/telemetry audit and Guardian diagnostics.
 
+  python3 codex_quota_audit.py --banked-reset 2026-09-12T10:13
+      Mark a banked reset you personally triggered (repeatable) and match it to telemetry.
+
   python3 codex_quota_audit.py --charts
       Run the analysis and create quota_chart_data.csv plus PNG/SVG charts.
       Charts require matplotlib.
@@ -4463,6 +5113,9 @@ def build_parser() -> argparse.ArgumentParser:
   python3 codex_quota_audit.py --export-guardian-periods guardian_periods.csv
       Export estimated Approve-for-me quota cost and public-rate-card $ equivalent
       for each reconstructed reset period.
+
+  python3 codex_quota_audit.py --banked-reset 2026-09-10T08:23 --export-banked-capacity banked_capacity.csv
+      Test user-confirmed banked-reset capacity against same-model/effort/policy comparison periods.
 
   python3 codex_quota_audit.py --charts --report report.md --summary-json summary.json
       Create publication-ready charts plus privacy-safe shareable summaries.
@@ -4498,6 +5151,8 @@ Everything except --charts uses only the Python standard library.
                         help="alias for --diagnostics")
     common.add_argument("--show-reset-churn", action="store_true",
                         help="show near-zero resets_at churn rows in the diagnostic reset ledger")
+    common.add_argument("--banked-reset", action="append", default=[], metavar="TIMESTAMP",
+                        help="mark a manually triggered banked reset by ISO-8601 local time; hour/minute/second precision accepted; repeatable")
     common.add_argument("--weight-details", action="store_true",
                         help="show experimental token-type quota-weight fits and diagnostics")
     common.add_argument("--no-weight-analysis", action="store_true",
@@ -4510,6 +5165,8 @@ Everything except --charts uses only the Python standard library.
     output = p.add_argument_group("Output and charts")
     output.add_argument("--export-buckets", metavar="PATH", help="write high-water quota buckets to CSV")
     output.add_argument("--export-resets", metavar="PATH", help="write inferred reset ledger to CSV")
+    output.add_argument("--export-banked-capacity", metavar="PATH",
+                        help="write per-reset-period banked/comparison capacity audit to CSV")
     output.add_argument("--export-chart-data", metavar="PATH", help="write model x effort chart aggregates to CSV")
     output.add_argument("--export-guardian-buckets", metavar="PATH",
                         help="write Guardian/auto-review high-water attribution buckets to CSV")
@@ -4529,6 +5186,8 @@ Everything except --charts uses only the Python standard library.
                         help="output path prefix for Guardian approval-overhead PNG/SVG")
     output.add_argument("--guardian-period-chart-prefix", default="guardian_quota_by_period",
                         help="output path prefix for per-reset-period Guardian quota-cost PNG/SVG")
+    output.add_argument("--banked-capacity-chart-prefix", default="banked_reset_capacity",
+                        help="output path prefix for banked-reset capacity PNG/SVG")
     output.add_argument("--chart-all-regimes", action="store_true",
                         help="include every detected policy regime instead of only the latest per model")
     output.add_argument("--chart-theme", choices=("light", "dark"), default="light",
@@ -4583,6 +5242,18 @@ Everything except --charts uses only the Python standard library.
                        help="max used_percent on both sides for treating an early resets_at change as no-op churn")
     reset.add_argument("--effective-reset-drop", type=float, default=DEFAULT_EFFECTIVE_RESET_DROP,
                        help="minimum observed used_percent drop for calling a non-scheduled transition an effective reset")
+    reset.add_argument("--banked-reset-match-minutes", type=float, default=DEFAULT_BANKED_RESET_MATCH_MINUTES,
+                       help="maximum distance between --banked-reset time/range and an effective reset boundary")
+    reset.add_argument("--banked-capacity-model-purity", type=float, default=DEFAULT_BANKED_CAPACITY_MODEL_PURITY,
+                       help="minimum non-Guardian model-token share for a reset period used in the banked-capacity test")
+    reset.add_argument("--banked-capacity-effort-purity", type=float, default=DEFAULT_BANKED_CAPACITY_EFFORT_PURITY,
+                       help="minimum non-Guardian effort-token share for a reset period used in the banked-capacity test")
+    reset.add_argument("--banked-capacity-min-points", type=float, default=DEFAULT_BANKED_CAPACITY_MIN_POINTS,
+                       help="minimum observed quota points in a reset period used in the banked-capacity test")
+    reset.add_argument("--banked-capacity-bootstraps", type=int, default=DEFAULT_BANKED_CAPACITY_BOOTSTRAPS,
+                       help="whole-reset-period bootstrap replicates for banked/comparison capacity ratios")
+    reset.add_argument("--banked-capacity-interval", type=float, default=DEFAULT_BANKED_CAPACITY_INTERVAL,
+                       help="central bootstrap interval width for banked/comparison capacity ratios")
 
     weights = p.add_argument_group("Advanced token-weight and regime fitting")
     weights.add_argument("--weight-model-purity", type=float, default=DEFAULT_WEIGHT_MODEL_PURITY,
@@ -4651,6 +5322,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--noop-usage-max must be non-negative")
     if args.effective_reset_drop < 0:
         raise SystemExit("--effective-reset-drop must be non-negative")
+    if args.banked_reset_match_minutes < 0:
+        raise SystemExit("--banked-reset-match-minutes must be non-negative")
+    if not (0.0 <= args.banked_capacity_model_purity <= 1.0):
+        raise SystemExit("--banked-capacity-model-purity must be between 0 and 1")
+    if not (0.0 <= args.banked_capacity_effort_purity <= 1.0):
+        raise SystemExit("--banked-capacity-effort-purity must be between 0 and 1")
+    if args.banked_capacity_min_points < 0 or args.banked_capacity_bootstraps < 0:
+        raise SystemExit("banked-capacity point/bootstrap settings must be non-negative")
+    if not (0.0 < args.banked_capacity_interval < 1.0):
+        raise SystemExit("--banked-capacity-interval must be between 0 and 1")
     if args.model_time_min_points < 0:
         raise SystemExit("--model-time-min-points must be non-negative")
     if not (0.0 <= args.weight_model_purity <= 1.0):
@@ -4696,6 +5377,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error(f"could not load prices: {exc}")
         return 2
 
+    try:
+        banked_reset_markers = [parse_banked_reset_marker(x) for x in args.banked_reset]
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
+
     all_records, stats = load_events(
         os.path.expanduser(args.home), prices, args.window_minutes,
         args.replay_scan_seconds, args.replay_min_events,
@@ -4731,6 +5418,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_args.chart_bootstraps = 0
     summary_chart_rows = build_chart_rows(primary.buckets, summary_args)
     regimes = policy_regimes_for_buckets(primary.buckets, args)
+    banked_capacity_rows, unmatched_banked_markers = build_banked_capacity_rows(
+        primary, regimes, args, banked_reset_markers
+    )
+    banked_capacity_result = banked_capacity_summary(
+        banked_capacity_rows, unmatched_banked_markers, args
+    )
 
     guardian_rows: List[Dict[str, object]] = []
     approval_episodes: List[Dict[str, object]] = []
@@ -4757,9 +5450,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print_data_coverage(coverage, args.window_minutes)
     print_key_findings(
         args, summary_chart_rows, regimes, approval_episodes,
-        guardian_period_costs, guardian_target_fit,
+        guardian_period_costs, guardian_target_fit, banked_capacity_result,
         guardian_enabled=not args.no_guardian_audit,
     )
+
+    if args.banked_reset:
+        print_banked_capacity_audit(
+            banked_capacity_rows, unmatched_banked_markers, banked_capacity_result, args
+        )
 
     if not args.no_guardian_audit and guardian_period_costs:
         print_guardian_period_cost(guardian_period_costs, guardian_target_fit, args.window_minutes)
@@ -4805,6 +5503,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.export_resets:
         export_resets_csv(args.export_resets, primary.ledger)
         generated_files.append(args.export_resets)
+    if args.export_banked_capacity:
+        export_banked_capacity_csv(args.export_banked_capacity, banked_capacity_rows)
+        generated_files.append(args.export_banked_capacity)
     if args.export_guardian_buckets:
         export_guardian_buckets_csv(args.export_guardian_buckets, guardian_rows)
         generated_files.append(args.export_guardian_buckets)
@@ -4859,18 +5560,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 except RuntimeError as exc:
                     print(f"Guardian period-cost chart unavailable: {exc}", file=sys.stderr)
 
+            if args.banked_reset and banked_capacity_result.get("matched_strata"):
+                try:
+                    bpng, bsvg = render_banked_capacity_chart(
+                        banked_capacity_rows, banked_capacity_result, args.banked_capacity_chart_prefix, args,
+                        theme=args.chart_theme,
+                    )
+                    chart_files.extend([bpng, bsvg])
+                    generated_files.extend([bpng, bsvg])
+                except RuntimeError as exc:
+                    print(f"Banked-reset capacity chart unavailable: {exc}", file=sys.stderr)
+
     # Privacy-safe shareable outputs contain only aggregate data.
     if args.summary_json:
         write_summary_json(
             args.summary_json, args, coverage, full_chart_rows, regimes,
-            approval_episodes, guardian_period_costs,
+            approval_episodes, guardian_period_costs, banked_capacity_rows, banked_capacity_result,
         )
         generated_files.append(args.summary_json)
 
     if args.report:
         write_markdown_report(
             args.report, args, coverage, full_chart_rows, regimes,
-            approval_episodes, guardian_period_costs, chart_files,
+            approval_episodes, guardian_period_costs, banked_capacity_rows, banked_capacity_result, chart_files,
         )
         generated_files.append(args.report)
 

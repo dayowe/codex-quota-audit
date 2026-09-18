@@ -1,56 +1,40 @@
 # Codex Quota Audit
 
-Analyze your local Codex logs to see how much work your quota buys across models, reasoning-effort levels, and time.
+**How much Codex work does your quota actually buy?**
 
-The script reads Codex `token_count` and rate-limit data from `~/.codex`, reconstructs effective quota resets, filters replayed rollout history, and relates observed token usage to changes in the 7-day quota meter.
+`codex_quota_audit.py` analyzes your local Codex session logs to measure quota efficiency across models, reasoning-effort levels, and time.
 
-It can also generate a model/effort chart showing:
+It can help answer questions such as:
 
-- **Token throughput:** million observed tokens per 1% quota
-- **API-list-equivalent value:** API-list-price-equivalent dollars per 1% quota
+- Which model and reasoning-effort combination gives me the most work per 1% of quota?
+- Did Codex quota generosity change over time?
+- How much extra inference did **Approve for me / Guardian** create?
+- How much of each 7-day allowance was plausibly spent on auto-review?
+- Do user-confirmed **banked resets** provide less effective capacity than comparable reset periods?
+- Are replayed rollout histories or stale quota readings distorting a simple tokens-per-percent calculation?
 
-> API prices are only a normalization ruler so different models can be compared. They are **not** what your Codex plan bills and are not a claim about OpenAI's internal costs.
+The script reads local Codex JSONL telemetry under `~/.codex`, reconstructs effective quota accounting periods, filters replayed history, and relates observed token usage to the Codex rate-limit meter.
 
-## Example chart
+Nothing leaves your machine.
 
-Running with `--charts` produces a chart like this:
+> [!IMPORTANT]
+> This is an empirical analysis of local telemetry. It is not documentation of OpenAI's internal quota formula, billing system, or compute costs.
 
-```text
-quota_value_by_model_effort.png
-quota_value_by_model_effort.svg
-quota_chart_data.csv
-```
+---
 
-If you commit one of the generated images to the repo, you can show it here with:
+## Quick start
 
-```markdown
-![Quota value by model and effort](quota_value_by_model_effort.png)
-```
-
-## Why this script is more careful than a simple tokens-per-percent calculation
-
-Codex logs are messier than they initially look. The script accounts for several things that can otherwise distort the result:
-
-- **Effective resets:** `resets_at` changes are not automatically treated as real quota resets. Near-zero timestamp churn is merged, while scheduled or material quota drops create new accounting episodes.
-- **High-water accounting:** stale or backward `used_percent` readings do not create extra quota consumption. A sequence such as `40 -> 39 -> 41` counts as a high-water increase from 40 to 41, not two separate increases.
-- **Replayed rollout history:** resumed/forked sessions can rapidly reconstruct large amounts of historical `total_token_usage`. These replay prefixes are detected from their cumulative-token sequence and excluded by default.
-- **Policy-regime changes:** quota generosity can change over time. The script detects model-specific regime shifts rather than blindly averaging all historical usage together.
-- **Reasoning effort:** model and effort (`low`, `medium`, `high`, `xhigh`, etc.) are tracked separately when available in the logs.
-- **Identifiability checks:** token-type weight estimates are only reported when the data contain enough independent variation to support them.
-
-## Requirements
-
-### Text analysis
-
-No third-party packages are required. A normal run uses only the Python standard library.
+For most users, the recommended command is:
 
 ```bash
-python3 codex_quota_audit.py
+python3 codex_quota_audit.py --charts
 ```
 
-### Charts
+This gives you the high-value console summary plus publication-ready PNG/SVG charts.
 
-Charts require `matplotlib`. A virtual environment is recommended:
+### Install chart support
+
+The text analysis uses only the Python standard library. Charts require `matplotlib`.
 
 ```bash
 python3 -m venv .venv
@@ -60,172 +44,416 @@ python3 -m pip install matplotlib
 python3 codex_quota_audit.py --charts
 ```
 
-On Windows PowerShell, activate the environment with:
+On Windows PowerShell:
 
 ```powershell
+python -m venv .venv
 .venv\Scripts\Activate.ps1
+python -m pip install matplotlib
+
+python codex_quota_audit.py --charts
 ```
 
-## Quick start
-
-Download `codex_quota_audit.py`, then run:
+If you do not want to install `matplotlib`, just run:
 
 ```bash
 python3 codex_quota_audit.py
 ```
 
-By default it reads all available JSONL logs under:
+---
+
+## What you get
+
+### 1. Model and reasoning-effort quota efficiency
+
+The script compares sufficiently clean model/effort combinations using:
+
+- **Mtok/1%**: million observed tokens per 1% quota
+- **API$eq/1%**: public API-list-price-equivalent work per 1% quota
+
+Higher values mean more observed work for the same quota movement.
+
+The default comparison uses the **latest detected quota-policy regime for each model** instead of mixing all historical usage together.
+
+This is useful for questions like:
+
+> Does Sol high buy materially more work per quota point than Astra high?
+
+or:
+
+> Is the difference still present after normalizing for public API token prices?
+
+### 2. Quota-policy changes over time
+
+Quota behavior can change independently of model choice.
+
+The script detects model-specific **policy regimes** so historical changes are not hidden inside one all-time average.
+
+Use:
+
+```bash
+python3 codex_quota_audit.py --history
+```
+
+to add:
+
+- monthly quota-efficiency trends
+- detected policy-regime tables
+- model-by-month results
+
+This is useful if you are trying to answer:
+
+> Did Codex actually become more or less generous, or am I comparing different models/time periods?
+
+### 3. Approve for me / Guardian overhead
+
+If your logs contain `codex-auto-review` activity, the script detects and analyzes it separately from ordinary parent work.
+
+It can report:
+
+- number of auto-review approval episodes
+- extra Guardian inference tokens
+- cached vs uncached input
+- Guardian share of local approval context
+- public GPT-5.4 rate-card-equivalent work
+- estimated quota overhead per 7-day reset period
+- median and high-end approval overhead
+
+For example, the report can estimate:
+
+```text
+typical active reset period:       ~1.0 / 100 quota points
+worst observed reset period:      ~10.4 / 100
+share of consumed quota while active: ~4.2%
+```
+
+These quota estimates are observational and include uncertainty intervals. They are not server-provided billing data.
+
+If no auto-review / Guardian inference exists in the analyzed logs, the script says so and skips the Guardian-specific tables and charts.
+
+### 4. Banked-reset effective-capacity audit
+
+The script can test the claim that a **banked reset visually restores the meter to 100%, but that 100% buys only half as much actual work as a comparable allowance**.
+
+To do this, provide timestamps for resets you personally triggered:
+
+```bash
+python3 codex_quota_audit.py --charts \
+  --banked-reset 2026-09-05T23:11 \
+  --banked-reset 2026-09-10T08:23 \
+  --banked-reset 2026-09-13T15:03
+```
+
+`--banked-reset` is repeatable.
+
+Timestamps without a timezone are interpreted in the machine's local timezone. Minute-resolution timestamps are fine. The script matches them to nearby reset transitions in the telemetry.
+
+The audit compares user-confirmed banked periods against nearby comparison periods with the same:
+
+- dominant model
+- reasoning effort
+- detected policy regime
+
+It reports capacity ratios for:
+
+- raw tokens, all work
+- API-list-equivalent work, all work
+- raw tokens excluding Guardian
+- API-list-equivalent work excluding Guardian
+
+Interpretation:
+
+```text
+1.00x = same effective capacity
+0.50x = half-capacity prediction
+```
+
+The comparison periods are **not assumed to be normal/scheduled resets**. They are simply periods that were not user-confirmed as banked resets.
+
+This makes the test conservative and avoids pretending the logs reveal a reset's cause when they do not.
+
+---
+
+## Example generated charts
+
+Running:
+
+```bash
+python3 codex_quota_audit.py --charts
+```
+
+can generate:
+
+```text
+quota_value_by_model_effort.png
+quota_value_by_model_effort.svg
+quota_chart_data.csv
+
+guardian_approval_overhead.png
+guardian_approval_overhead.svg
+
+guardian_quota_by_period.png
+guardian_quota_by_period.svg
+
+banked_reset_capacity.png
+banked_reset_capacity.svg
+```
+
+Guardian charts are only created when relevant Guardian data exists.
+
+The banked-reset chart is only useful when you provide one or more `--banked-reset` timestamps with enough comparable evidence.
+
+The default chart theme is a light, restrained report style intended for GitHub/Reddit sharing.
+
+Use dark mode with:
+
+```bash
+python3 codex_quota_audit.py --charts --chart-theme dark
+```
+
+If you commit generated images to the repo, you can embed them in this README:
+
+```markdown
+![Quota value by model and effort](quota_value_by_model_effort.png)
+![Approve-for-me cost by reset period](guardian_quota_by_period.png)
+![Banked-reset effective-capacity audit](banked_reset_capacity.png)
+```
+
+---
+
+## Recommended commands
+
+### Most users
+
+```bash
+python3 codex_quota_audit.py --charts
+```
+
+### Text-only analysis
+
+```bash
+python3 codex_quota_audit.py
+```
+
+### Historical trends and policy regimes
+
+```bash
+python3 codex_quota_audit.py --history
+```
+
+You can combine it with charts:
+
+```bash
+python3 codex_quota_audit.py --charts --history
+```
+
+### Detailed forensic diagnostics
+
+```bash
+python3 codex_quota_audit.py --diagnostics
+```
+
+This adds detailed reset/replay/telemetry and Guardian diagnostics.
+
+`--verbose` is an alias for `--diagnostics`.
+
+### Experimental token-weight analysis
+
+```bash
+python3 codex_quota_audit.py --weight-details
+```
+
+This shows the identifiability-aware cached/uncached/output token-weight fits.
+
+### Publication-ready report and machine-readable summary
+
+```bash
+python3 codex_quota_audit.py --charts \
+  --report codex_quota_report.md \
+  --summary-json codex_quota_summary.json
+```
+
+The generated report and summary contain privacy-safe aggregate results rather than prompts or model responses.
+
+### Show all options
+
+```bash
+python3 codex_quota_audit.py --help
+```
+
+### Run synthetic self-tests
+
+```bash
+python3 codex_quota_audit.py --self-test
+```
+
+### Show version
+
+```bash
+python3 codex_quota_audit.py --version
+```
+
+---
+
+## Data source
+
+By default the script reads all available JSONL files under:
 
 ```text
 ~/.codex/sessions/**/*.jsonl
 ~/.codex/archived_sessions/*.jsonl
 ```
 
-There is no built-in "last N months" cutoff. If six months of logs are present, six months are analyzed; if more are present, those are analyzed too.
+There is no built-in "last N months" cutoff.
 
-To see all commands and tuning options:
+If six months of logs are present, six months are analyzed. If more history is present, that history is analyzed too.
 
-```bash
-python3 codex_quota_audit.py --help
-```
-
-To check the version:
-
-```bash
-python3 codex_quota_audit.py --version
-```
-
-To run the built-in synthetic tests:
-
-```bash
-python3 codex_quota_audit.py --self-test
-```
-
-## Common commands
-
-Run the full text analysis:
-
-```bash
-python3 codex_quota_audit.py
-```
-
-Generate chart data plus PNG/SVG charts:
-
-```bash
-python3 codex_quota_audit.py --charts
-```
-
-Plot all detected historical policy regimes instead of only the latest regime for each model:
-
-```bash
-python3 codex_quota_audit.py --charts --chart-all-regimes
-```
-
-Show detailed token-weight fit diagnostics:
-
-```bash
-python3 codex_quota_audit.py --weight-details
-```
-
-Export high-water quota buckets:
-
-```bash
-python3 codex_quota_audit.py --export-buckets quota_buckets.csv
-```
-
-Export the inferred reset ledger:
-
-```bash
-python3 codex_quota_audit.py --export-resets reset_ledger.csv
-```
-
-Export chart aggregates without rendering charts:
-
-```bash
-python3 codex_quota_audit.py --export-chart-data quota_chart_data.csv
-```
-
-Use a different Codex data directory:
+Use a different Codex directory with:
 
 ```bash
 python3 codex_quota_audit.py --home /path/to/.codex
 ```
 
-## What the report contains
+The default analysis targets the 7-day (`10080` minute) Codex limit.
 
-### Data audit
+The parser also records other rate-limit windows when present, including historical 5-hour telemetry, for diagnostics and Guardian analysis.
 
-Shows how many files and token records were found, how many duplicate records were removed, how much probable replayed history was detected, and how much data remains in the primary analysis.
+---
 
-### Reset audit and reset ledger
+## Why a simple tokens-per-percent calculation is not enough
 
-Reconstructs accounting episodes from `used_percent` and `resets_at`.
+Codex logs contain several behaviors that can badly distort naive calculations.
 
-Resets are classified as:
+### High-water quota accounting
 
-- **scheduled/on-time**
-- **early**
-- **after-due**
-- **ambiguous**
-- **no-op `resets_at` churn**
+`used_percent` can briefly move backward because of stale or out-of-order telemetry.
 
-An early reset is observable from the timestamps, but the logs do not reveal whether it was a banked/user-triggered reset or a reset granted by OpenAI.
+For example:
 
-### Quota episodes
-
-For each accounting episode the script reports the observed high-water quota movement, tokens, cache ratio, model mix, pricing coverage, and API-list-equivalent value per quota point where enough of the usage can be priced.
-
-### Monthly trend
-
-Aggregates high-water quota buckets by month to show how quota generosity changed over time.
-
-### Model x month
-
-Shows token throughput and API-list-equivalent value for sufficiently model-pure observations, without hiding time-dependent quota-policy changes inside one all-history model average.
-
-### Token-type quota weights
-
-Experimental fits compare several possible quota models:
-
-- one weight for all tokens
-- uncached vs cached input
-- input vs output
-- uncached input + cached input + output
-
-Fits hold out whole reset episodes for validation and bootstrap whole episodes for uncertainty intervals. If the predictors are too collinear or the coefficients are unstable, the script reports the fit as weak or not identifiable rather than presenting a precise-looking number.
-
-### Replay-filter sensitivity
-
-Runs a comparison with probable replay prefixes included to show how much replayed historical usage would inflate the results if it were counted as fresh work.
-
-## Charts
-
-The default chart uses the **latest detected policy regime for each model**. This avoids mixing periods where quota accounting appears to have changed materially.
-
-Each plotted model/effort combination must meet minimum model purity, effort purity, quota-point, and independent-episode thresholds.
-
-Whiskers are generated by resampling **whole accounting episodes**, not individual turns or individual 1% meter changes.
-
-The labels use:
-
-- `pt` = observed quota percentage points supporting the estimate
-- `ep` = independent accounting episodes supporting the estimate
-
-Use:
-
-```bash
-python3 codex_quota_audit.py --charts --chart-all-regimes
+```text
+40 -> 39 -> 41
 ```
 
-if you want historical regimes shown separately.
+is treated as a high-water increase from `40` to `41`, not as multiple independent quota movements.
+
+### Effective reset reconstruction
+
+A changed `resets_at` value is not automatically treated as a new quota allowance.
+
+The script distinguishes:
+
+- scheduled/on-time resets
+- early resets
+- after-due resets
+- ambiguous boundaries
+- near-zero `resets_at` churn
+
+Near-zero churn is merged rather than allowed to restart the accounting baseline.
+
+### Replayed rollout history
+
+Some resumed/forked rollout files rapidly reconstruct historical cumulative `total_token_usage`.
+
+Without filtering, this can make hundreds of millions of historical tokens look like fresh work.
+
+The script detects probable replay prefixes from their cumulative-token sequence and excludes them by default.
+
+Dense activity without positive replay evidence remains included.
+
+### Policy-regime detection
+
+Quota generosity can change over time.
+
+The script detects model-specific regime shifts and avoids blindly pooling incompatible historical periods.
+
+### Model and effort purity
+
+Model/effort comparisons only use buckets that are sufficiently dominated by one model and reasoning-effort state.
+
+### Whole-episode uncertainty
+
+Chart intervals and several statistical analyses resample whole accounting/reset episodes instead of pretending individual 1% meter changes are independent observations.
+
+---
+
+## Approve for me / Guardian methodology
+
+Auto-review inference is identified from local session metadata and `codex-auto-review` activity.
+
+The script:
+
+1. detects Guardian/auto-review sessions
+2. pairs Guardian activity back to its likely parent Codex session
+3. groups related activity into approval episodes
+4. measures Guardian token overhead
+5. associates approval episodes with available quota telemetry
+6. estimates per-reset-period quota overhead conservatively
+
+The quota meter is account-global, so the script does **not** claim that every meter movement surrounding a Guardian event was caused solely by Guardian.
+
+Where the data cannot support a clean inference, the script reports that limitation rather than manufacturing a precise attribution.
+
+### Public rate-card equivalent
+
+For comparison purposes, `codex-auto-review` is mapped to GPT-5.4 in the script's public rate-card-equivalent calculation.
+
+`Guardian $eq` is:
+
+- a comparison ruler
+- not a Pro subscription charge
+- not OpenAI's internal compute cost
+
+The script can apply documented long-context multipliers when the local telemetry provides enough information.
+
+---
+
+## Banked-reset methodology
+
+The logs can show that a reset happened early, but `used_percent + resets_at` alone cannot prove **why** it happened.
+
+That is why the script does not automatically label early resets as banked resets.
+
+Instead, users can provide reset-history timestamps they personally know were banked resets:
+
+```bash
+--banked-reset YYYY-MM-DDTHH:MM
+```
+
+The effective-capacity audit then compares those confirmed periods with sufficiently comparable non-confirmed periods.
+
+The core test is:
+
+```text
+banked capacity / comparison capacity
+```
+
+A result near:
+
+- `1.00x` suggests similar capacity
+- `0.50x` is what a literal half-capacity claim predicts
+
+The script also computes the comparison after excluding `codex-auto-review`, so unusual Approve-for-me activity does not masquerade as a banked-reset capacity change.
+
+---
 
 ## API price normalization
 
-The script contains a price table used to translate token usage into an API-list-price-equivalent value. This makes workloads using differently priced models easier to compare.
+Public API list prices are used as a common normalization ruler across differently priced models.
 
-You can override or extend the table with `--prices`.
+They are **not**:
 
-Accepted JSON formats:
+- your ChatGPT/Codex bill
+- subscription value
+- OpenAI's internal cost
+- proof of the server's actual quota formula
+
+You can override or extend the built-in price table:
+
+```bash
+python3 codex_quota_audit.py --prices prices.json
+```
+
+Accepted formats:
 
 ```json
 {
@@ -245,17 +473,93 @@ or:
 }
 ```
 
-Values are dollars per 1 million tokens for uncached input, cached input, and output respectively.
+Values are dollars per 1 million tokens for uncached input, cached input, and output.
 
-If a model has no configured price, its raw usage can still be analyzed, but API-normalized metrics that lack sufficient priced-token coverage are omitted.
+If a model has no configured price, raw-token analysis still works, but API-normalized results may be unavailable for observations that lack sufficient pricing coverage.
+
+---
+
+## Exports
+
+### High-water quota buckets
+
+```bash
+python3 codex_quota_audit.py \
+  --export-buckets quota_buckets.csv
+```
+
+### Reset ledger
+
+```bash
+python3 codex_quota_audit.py \
+  --export-resets reset_ledger.csv
+```
+
+### Model/effort chart aggregates
+
+```bash
+python3 codex_quota_audit.py \
+  --export-chart-data quota_chart_data.csv
+```
+
+### Guardian approval episodes
+
+```bash
+python3 codex_quota_audit.py \
+  --export-approval-episodes approval_episodes.csv
+```
+
+### Guardian quota cost by reset period
+
+```bash
+python3 codex_quota_audit.py \
+  --export-guardian-periods guardian_periods.csv
+```
+
+### Banked-reset capacity periods
+
+```bash
+python3 codex_quota_audit.py \
+  --banked-reset 2026-09-10T08:23 \
+  --export-banked-capacity banked_capacity.csv
+```
+
+CSV exports contain timestamps and detailed usage patterns. Review them before publishing if that information is sensitive.
+
+---
+
+## Advanced / diagnostic analysis
+
+### Replay-filter sensitivity
+
+With diagnostics enabled, the script compares normal replay-filtered results with the same parsed logs including probable replay prefixes.
+
+This shows how badly replayed history would distort the result if it were counted as fresh work.
+
+### Token-type quota weights
+
+The experimental weight analysis compares candidate models such as:
+
+- one weight for all tokens
+- uncached vs cached input
+- input vs output
+- uncached input + cached input + output
+
+Validation holds out whole reset episodes and bootstraps whole episodes.
+
+If predictors are too collinear or coefficients are unstable, the script reports a fit as weak or not identifiable instead of presenting a precise-looking coefficient.
+
+---
 
 ## Privacy
 
-The script reads local Codex logs only. It does not upload your logs or make network requests.
+The script reads local Codex logs only.
+
+It does not upload your session data and does not make network requests.
 
 Normal console output does not print prompts or model responses.
 
-The default source path is displayed as:
+The default source is displayed as:
 
 ```text
 Source: ~/.codex
@@ -263,21 +567,42 @@ Source: ~/.codex
 
 rather than expanding your home-directory username.
 
-CSV exports contain timestamps and detailed usage patterns, so review them before sharing if that information is sensitive to you.
+The generated Markdown report and summary JSON are designed around aggregate, privacy-safe results.
+
+CSV exports can contain timestamps and detailed usage patterns, so review them before sharing.
+
+---
 
 ## Important caveats
 
-- This is an empirical analysis of logged Codex behavior, not documentation of OpenAI's internal quota formula.
-- `used_percent` is quantized and can contain stale/backward observations, which is why the analysis uses high-water accounting.
-- API-list-equivalent dollars are a comparison unit only. They are not subscription value, billing, or internal cost.
-- Quality is not measured. More tokens or more API-list-equivalent work does not necessarily mean a better answer.
-- Some model/effort combinations may be omitted because there is not enough clean evidence.
-- Automatic policy-regime detection is statistical. Use `--chart-all-regimes` and `--weight-details` when inspecting edge cases.
+- This is observational analysis of local telemetry, not authoritative documentation of OpenAI's quota implementation.
+- `used_percent` is low-resolution/quantized telemetry and can contain stale or backward readings.
+- An early reset's cause is not identifiable unless the user independently confirms that it was a banked reset.
+- A user-confirmed banked-reset comparison is still observational. Comparison periods are not guaranteed to be scheduled resets.
+- The current incomplete reset period can differ from completed periods simply because it is incomplete.
+- API-list-equivalent dollars are a normalization unit, not billing or internal cost.
+- More tokens or more API-equivalent work does not imply better answer quality.
+- Some model/effort combinations are omitted when there is not enough clean evidence.
+- Automatic policy-regime detection is statistical.
+- Guardian quota attribution is estimated from account-global telemetry and should be interpreted with its uncertainty interval.
 - Replay detection is deliberately conservative. Dense activity without positive replay-sequence evidence remains included.
 
-## Advanced options
+---
 
-The script exposes tuning controls for replay detection, reset reconstruction, model/effort purity, policy-regime detection, token-weight fitting, and chart bootstrapping.
+## Full CLI reference
+
+The script exposes additional tuning controls for:
+
+- replay detection
+- reset reconstruction
+- model/effort purity
+- policy-regime detection
+- Guardian/approval pairing
+- Guardian quota attribution
+- banked-reset matching and capacity comparison
+- token-weight fitting
+- chart bootstrapping
+- chart theme and output paths
 
 Run:
 
@@ -287,10 +612,26 @@ python3 codex_quota_audit.py --help
 
 for the complete list and current defaults.
 
+---
+
 ## Version
 
 Current version:
 
 ```text
-2.6
+2.14
 ```
+
+Check locally with:
+
+```bash
+python3 codex_quota_audit.py --version
+```
+
+---
+
+## Disclaimer
+
+This project is an independent analysis tool for locally recorded Codex telemetry.
+
+Results should be treated as empirical evidence from the available logs, not as authoritative documentation of Codex quota policy or OpenAI's internal accounting.
