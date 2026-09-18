@@ -11,11 +11,12 @@ It can help answer questions such as:
 - How much extra inference did **Approve for me / Guardian** create?
 - How much of each 7-day allowance was plausibly spent on auto-review?
 - Do user-confirmed **banked resets** provide less effective capacity than comparable reset periods?
+- Does the same number of quota points buy less work immediately after a banked reset?
 - Are replayed rollout histories or stale quota readings distorting a simple tokens-per-percent calculation?
 
 The script reads local Codex JSONL telemetry under `~/.codex`, reconstructs effective quota accounting periods, filters replayed history, and relates observed token usage to the Codex rate-limit meter.
 
-Nothing leaves your machine.
+**Nothing leaves your machine.**
 
 > [!IMPORTANT]
 > This is an empirical analysis of local telemetry. It is not documentation of OpenAI's internal quota formula, billing system, or compute costs.
@@ -30,11 +31,11 @@ For most users, the recommended command is:
 python3 codex_quota_audit.py --charts
 ```
 
-This gives you the high-value console summary plus publication-ready PNG/SVG charts.
+This prints the highest-value findings and creates publication-ready PNG/SVG charts.
 
 ### Install chart support
 
-The text analysis uses only the Python standard library. Charts require `matplotlib`.
+Text analysis uses only the Python standard library. Charts require `matplotlib`.
 
 ```bash
 python3 -m venv .venv
@@ -54,7 +55,7 @@ python -m pip install matplotlib
 python codex_quota_audit.py --charts
 ```
 
-If you do not want to install `matplotlib`, just run:
+If you do not want to install `matplotlib`, run:
 
 ```bash
 python3 codex_quota_audit.py
@@ -75,13 +76,15 @@ Higher values mean more observed work for the same quota movement.
 
 The default comparison uses the **latest detected quota-policy regime for each model** instead of mixing all historical usage together.
 
-This is useful for questions like:
+This helps answer questions such as:
 
 > Does Sol high buy materially more work per quota point than Astra high?
 
 or:
 
 > Is the difference still present after normalizing for public API token prices?
+
+---
 
 ### 2. Quota-policy changes over time
 
@@ -101,9 +104,11 @@ to add:
 - detected policy-regime tables
 - model-by-month results
 
-This is useful if you are trying to answer:
+This is useful when asking:
 
-> Did Codex actually become more or less generous, or am I comparing different models/time periods?
+> Did Codex actually become more or less generous, or am I comparing different models or time periods?
+
+---
 
 ### 3. Approve for me / Guardian overhead
 
@@ -119,23 +124,25 @@ It can report:
 - estimated quota overhead per 7-day reset period
 - median and high-end approval overhead
 
-For example, the report can estimate:
+For example, the report can estimate values such as:
 
 ```text
-typical active reset period:       ~1.0 / 100 quota points
-worst observed reset period:      ~10.4 / 100
+typical active reset period:          ~1.0 / 100 quota points
+worst observed reset period:         ~10.4 / 100
 share of consumed quota while active: ~4.2%
 ```
 
 These quota estimates are observational and include uncertainty intervals. They are not server-provided billing data.
 
-If no auto-review / Guardian inference exists in the analyzed logs, the script says so and skips the Guardian-specific tables and charts.
+If no auto-review / Guardian inference exists in the analyzed logs, the script says so and skips Guardian-specific tables and charts.
+
+---
 
 ### 4. Banked-reset effective-capacity audit
 
 The script can test the claim that a **banked reset visually restores the meter to 100%, but that 100% buys only half as much actual work as a comparable allowance**.
 
-To do this, provide timestamps for resets you personally triggered:
+Provide timestamps for resets you personally triggered:
 
 ```bash
 python3 codex_quota_audit.py --charts \
@@ -146,13 +153,15 @@ python3 codex_quota_audit.py --charts \
 
 `--banked-reset` is repeatable.
 
-Timestamps without a timezone are interpreted in the machine's local timezone. Minute-resolution timestamps are fine. The script matches them to nearby reset transitions in the telemetry.
+Timestamps without a timezone are interpreted in the machine's local timezone. Hour-, minute-, or second-resolution timestamps are accepted and matched to nearby reset transitions.
 
-The audit compares user-confirmed banked periods against nearby comparison periods with the same:
+#### Whole-reset-period comparison
+
+The first banked-reset test compares confirmed banked periods with comparison periods that have the same:
 
 - dominant model
 - reasoning effort
-- detected policy regime
+- detected quota-policy regime
 
 It reports capacity ratios for:
 
@@ -165,16 +174,65 @@ Interpretation:
 
 ```text
 1.00x = same effective capacity
-0.50x = half-capacity prediction
+0.50x = literal half-capacity prediction
 ```
 
 The comparison periods are **not assumed to be normal/scheduled resets**. They are simply periods that were not user-confirmed as banked resets.
 
-This makes the test conservative and avoids pretending the logs reveal a reset's cause when they do not.
+#### Equal-quota before/after boundary slices
+
+Version 2.15 also directly tests the immediate before/after behavior around each confirmed banked reset.
+
+For each reset it compares:
+
+> the final N quota points before the reset
+>
+> vs
+>
+> the first N quota points after the reset
+
+By default it tests **5, 10, 14, and 20 quota-point slices**. This is useful for reproducing claims based on a fixed-size quota slice while checking whether the result is stable across other slice sizes.
+
+The audit reports before/after ratios for:
+
+- raw tokens
+- API-list-equivalent work
+- raw tokens excluding Guardian
+- API-list-equivalent work excluding Guardian
+
+The strongest default metric excludes `codex-auto-review`, so unusual Approve-for-me activity does not masquerade as a banked-reset capacity change.
+
+A pattern such as:
+
+```text
+ 5pt   ~0.50x
+10pt   ~0.50x
+14pt   ~0.50x
+20pt   ~0.50x
+```
+
+would be evidence consistent with a persistent half-capacity effect.
+
+A pattern near `1.00x` across slice sizes argues against that claim.
+
+A result that starts low and rises toward `1.00x` could instead suggest a temporary post-reset effect.
+
+To reproduce only a 14-point test:
+
+```bash
+python3 codex_quota_audit.py --charts \
+  --banked-reset 2026-09-10T08:23 \
+  --banked-slice-points 14
+```
+
+`--banked-slice-points` is repeatable for custom slice sizes.
+
+> [!NOTE]
+> If a slice boundary cuts through a multi-point quota-meter jump, the script allocates that bucket's work proportionally by quota points.
 
 ---
 
-## Example generated charts
+## Generated charts
 
 Running:
 
@@ -197,13 +255,16 @@ guardian_quota_by_period.svg
 
 banked_reset_capacity.png
 banked_reset_capacity.svg
+
+banked_reset_boundary_slices.png
+banked_reset_boundary_slices.svg
 ```
 
 Guardian charts are only created when relevant Guardian data exists.
 
-The banked-reset chart is only useful when you provide one or more `--banked-reset` timestamps with enough comparable evidence.
+Banked-reset charts require user-confirmed `--banked-reset` timestamps and enough usable comparison data.
 
-The default chart theme is a light, restrained report style intended for GitHub/Reddit sharing.
+The default chart theme is a restrained light report style intended for GitHub/Reddit sharing.
 
 Use dark mode with:
 
@@ -217,6 +278,7 @@ If you commit generated images to the repo, you can embed them in this README:
 ![Quota value by model and effort](quota_value_by_model_effort.png)
 ![Approve-for-me cost by reset period](guardian_quota_by_period.png)
 ![Banked-reset effective-capacity audit](banked_reset_capacity.png)
+![Banked-reset boundary-slice audit](banked_reset_boundary_slices.png)
 ```
 
 ---
@@ -241,7 +303,7 @@ python3 codex_quota_audit.py
 python3 codex_quota_audit.py --history
 ```
 
-You can combine it with charts:
+or with charts:
 
 ```bash
 python3 codex_quota_audit.py --charts --history
@@ -273,7 +335,7 @@ python3 codex_quota_audit.py --charts \
   --summary-json codex_quota_summary.json
 ```
 
-The generated report and summary contain privacy-safe aggregate results rather than prompts or model responses.
+The generated report and summary contain aggregate results rather than prompts or model responses.
 
 ### Show all options
 
@@ -413,26 +475,22 @@ The logs can show that a reset happened early, but `used_percent + resets_at` al
 
 That is why the script does not automatically label early resets as banked resets.
 
-Instead, users can provide reset-history timestamps they personally know were banked resets:
+Instead, users provide reset-history timestamps they personally know were banked resets:
 
 ```bash
 --banked-reset YYYY-MM-DDTHH:MM
 ```
 
-The effective-capacity audit then compares those confirmed periods with sufficiently comparable non-confirmed periods.
+Hour-, minute-, and second-resolution ISO timestamps are accepted.
 
-The core test is:
+The script then performs two complementary tests:
 
-```text
-banked capacity / comparison capacity
-```
+1. **Whole-period effective capacity**: compares banked periods with same-model/effort/policy-regime comparison periods.
+2. **Equal-quota boundary slices**: compares equal quota-point slices immediately before and after each confirmed banked reset.
 
-A result near:
+The second test is particularly useful for checking whether an apparent post-reset penalty is immediate and temporary or persists through larger portions of the allowance.
 
-- `1.00x` suggests similar capacity
-- `0.50x` is what a literal half-capacity claim predicts
-
-The script also computes the comparison after excluding `codex-auto-review`, so unusual Approve-for-me activity does not masquerade as a banked-reset capacity change.
+Both tests also calculate metrics excluding `codex-auto-review` so Guardian overhead does not masquerade as a banked-reset effect.
 
 ---
 
@@ -516,12 +574,20 @@ python3 codex_quota_audit.py \
   --export-guardian-periods guardian_periods.csv
 ```
 
-### Banked-reset capacity periods
+### Banked-reset whole-period capacity
 
 ```bash
 python3 codex_quota_audit.py \
   --banked-reset 2026-09-10T08:23 \
   --export-banked-capacity banked_capacity.csv
+```
+
+### Banked-reset equal-quota boundary slices
+
+```bash
+python3 codex_quota_audit.py \
+  --banked-reset 2026-09-10T08:23 \
+  --export-banked-slices banked_boundary_slices.csv
 ```
 
 CSV exports contain timestamps and detailed usage patterns. Review them before publishing if that information is sensitive.
@@ -579,6 +645,8 @@ CSV exports can contain timestamps and detailed usage patterns, so review them b
 - `used_percent` is low-resolution/quantized telemetry and can contain stale or backward readings.
 - An early reset's cause is not identifiable unless the user independently confirms that it was a banked reset.
 - A user-confirmed banked-reset comparison is still observational. Comparison periods are not guaranteed to be scheduled resets.
+- Boundary-slice tests compare equal quota-point windows, but the workload inside those windows can still differ.
+- Multi-point meter jumps require proportional allocation when a requested slice cuts through a bucket.
 - The current incomplete reset period can differ from completed periods simply because it is incomplete.
 - API-list-equivalent dollars are a normalization unit, not billing or internal cost.
 - More tokens or more API-equivalent work does not imply better answer quality.
@@ -599,7 +667,8 @@ The script exposes additional tuning controls for:
 - policy-regime detection
 - Guardian/approval pairing
 - Guardian quota attribution
-- banked-reset matching and capacity comparison
+- banked-reset matching and whole-period capacity comparison
+- equal-quota banked-reset boundary slices
 - token-weight fitting
 - chart bootstrapping
 - chart theme and output paths
@@ -619,7 +688,7 @@ for the complete list and current defaults.
 Current version:
 
 ```text
-2.14
+2.15
 ```
 
 Check locally with:
