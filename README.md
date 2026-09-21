@@ -13,6 +13,7 @@ It can help answer questions such as:
 - Do user-confirmed **banked resets** provide less effective capacity than comparable reset periods?
 - Does the same number of quota points buy less work immediately after a banked reset?
 - Are replayed rollout histories or stale quota readings distorting a simple tokens-per-percent calculation?
+- Where inside a multi-agent workflow are orchestration, implementation, validation, context rereads, and re-entry consuming the most work?
 
 The script reads local Codex JSONL telemetry under `~/.codex`, reconstructs effective quota accounting periods, filters replayed history, and relates observed token usage to the Codex rate-limit meter.
 
@@ -357,6 +358,636 @@ python3 codex_quota_audit.py --version
 
 ---
 
+## Experimental workflow candidate finder
+
+The repository also includes `find_workflow_candidates.py`, a privacy-conscious helper for locating representative multi-agent workflows before building or tuning a workflow cost profile.
+
+It reconstructs parent → subagent families from session/thread/rollout linkage metadata rather than grouping sessions only by time. It also recognizes configurable role labels such as `orchestrator`, `planner`, `implementer`, and `validator`, while avoiding prompt/response text in its output.
+
+Run:
+
+```bash
+python3 find_workflow_candidates.py
+```
+
+The default output shows the 10 best recent graph-linked workflow families, including:
+
+- root and child session structure
+- inferred child roles when strong metadata supports them
+- model and reasoning effort
+- approximate token scale and cache share
+- spawn/send/wait/resume/close lifecycle signals
+- parent-link method and confidence
+
+For a shareable machine-readable manifest:
+
+```bash
+python3 find_workflow_candidates.py \
+  --export-json workflow_candidates.json
+```
+
+The helper one-way hashes linkage identifiers and does not print prompts, responses, source code, tool stdout, or raw session/thread IDs. It is a **sample-selection tool**; use `extract_workflow_lifecycle.py` for conservative per-workflow lifecycle and cost analysis.
+
+Useful options:
+
+```bash
+python3 find_workflow_candidates.py --top 15
+python3 find_workflow_candidates.py --recent-days 45
+python3 find_workflow_candidates.py --show-link-schema
+python3 find_workflow_candidates.py --self-test
+```
+
+---
+
+
+## Experimental workflow profiling helpers
+
+The repository also includes three read-only helper scripts for investigating expensive multi-agent Codex workflows. These remain separate from the main quota audit while the workflow event schema is being validated against real rollout logs.
+
+### 1. Find graph-linked workflow families
+
+```bash
+python3 find_workflow_candidates.py
+```
+
+`find_workflow_candidates.py` scans local rollout metadata and reconstructs candidate parent/subagent families from session/thread/rollout linkage IDs. It does not print prompts, model responses, source code, tool stdout, or raw linkage IDs.
+
+For each recent family it reports:
+
+- root and linked child sessions
+- strong role labels when present
+- model and reasoning effort
+- approximate token scale and cache share
+- structural lifecycle action counts such as spawn/send/wait
+- link method and confidence
+
+The generated `W-...` family IDs are useful for selecting a representative workflow. A root/member `S-...` session key is more stable if a family later grows as new linked logs are added.
+
+Optional privacy-safe JSON manifest:
+
+```bash
+python3 find_workflow_candidates.py \
+  --export-json workflow_candidates.json
+```
+
+### 2. Extract one workflow's structural lifecycle and cost profile
+
+After choosing a family, run:
+
+```bash
+python3 extract_workflow_lifecycle.py \
+  --family W-e7af89b98f
+```
+
+You can also select a family using any member/root session key:
+
+```bash
+python3 extract_workflow_lifecycle.py \
+  --family S-644a110a4f
+```
+
+This is useful when an older `W-...` family ID changes because additional linked rollout files were created later.
+
+The v2 lifecycle extractor is deliberately conservative. It rescans only the selected family's rollout files and separates lifecycle evidence into three classes:
+
+- **trusted**: exact action/result target IDs, or a unique child session beginning within the very tight spawn/start window
+- **diagnostic**: plausible hints such as a single active agent or broad graph/time proximity
+- **unresolved**: no sufficiently reliable target could be established
+
+Only **trusted** actions are allowed to create follow-up phases or role-targeted supervision totals. Low-confidence `single-active-agent` guesses remain visible for debugging but are never used for cost attribution. A caller is also never allowed to resolve itself as its own action target.
+
+The extractor also deduplicates repeated representations of the same lifecycle action and keeps `codex-auto-review` explicitly labeled as Guardian. Root position is separate from responsibility: a root may be Coordinator, Orchestrator or unknown. Exported sessions include immediate-parent evidence and identity conflicts; routing to an orchestrator does not establish the caller's role.
+
+It reports:
+
+- trusted / diagnostic / unresolved lifecycle coverage by action type
+- structural ID availability (`call_id`, target IDs, result IDs)
+- number of duplicate lifecycle representations removed
+- token usage by root/orchestrator, implementer, validator, Guardian, and other roles
+- initial agent work vs **trusted** follow-up rounds
+- number of trusted follow-ups sent to each agent
+- parent inference occurring around spawn/send/wait/close decisions
+- large-context, small-output inference requests that may represent expensive supervision/context rereads
+- the most expensive individual inference requests
+- a privacy-safe structural timeline with attribution class shown on every action
+
+For a shareable machine-readable extract:
+
+```bash
+python3 extract_workflow_lifecycle.py \
+  --family W-e7af89b98f \
+  --export-json workflow_lifecycle.json
+```
+
+The JSON export contains structural metadata and token counts only. It does not contain prompts, responses, source code, tool output, or raw agent/session/thread IDs. The v2 export also includes an `action_match_audit` and separates `target` from `diagnostic_target`.
+
+Useful options:
+
+```bash
+python3 extract_workflow_lifecycle.py --help
+```
+
+The default trusted temporal fallback for a spawn requires a unique child session to begin within 2 seconds of the spawn call. You can tune that diagnostic boundary with:
+
+```bash
+python3 extract_workflow_lifecycle.py \
+  --family W-e7af89b98f \
+  --tight-spawn-seconds 2
+```
+
+Parent/action inference association is still a timing heuristic and is explicitly reported as non-causal. Lifecycle schemas can change between Codex versions, so unresolved events are retained instead of being silently assigned to whichever agent happens to be active.
+
+### 3. Profile workflow cost by active-role state
+
+Once a representative family has been validated, use `profile_workflow_cost.py` to answer the workflow-optimization question directly:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-e7af89b98f \
+  --export-json workflow_cost_profile.json
+```
+
+A stable member/root session key works too:
+
+```bash
+python3 profile_workflow_cost.py --family S-644a110a4f
+```
+
+Or pass the coordinator's exact Codex session/thread ID directly; no finder step is needed:
+
+```bash
+python3 profile_workflow_cost.py \
+  --session YOUR_COORDINATOR_SESSION_ID \
+  --export-json workflow_cost_profile_new.json
+```
+
+`--session-id` is an alias; `--family` also accepts the raw ID. The lifecycle
+extractor supports the same selectors. Matching fingerprints the supplied ID
+locally and resolves its containing family, rejecting ambiguous metadata matches.
+Reports retain hashed IDs. A session selector does not change the analysis root
+or isolate a subtree; existing root-selection and date-window rules still apply.
+The matching logs must be available under `--home` (default `~/.codex`).
+
+The workflow cost profiler is currently **v5.1.1**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
+
+### Coordinated workflows: v5
+
+v5 adds `workflow_attribution.py` for explicit assignment identity and nested
+Coordinator → Orchestrator → Implementer/Validator accounting. It also supports
+historical direct-orchestrator families. Run the usual profiler command with a
+**new output filename**; historical reports are not upgraded or overwritten automatically.
+
+```bash
+python3 profile_workflow_cost.py --family W-... --export-json workflow_cost_profile_v5.json
+```
+
+The new `nested_attribution` section reports:
+
+- Each session's **direct** usage, responsibility, immediate parent and identity evidence.
+- **Inclusive subtree** usage, including that session and all resolved descendants.
+  These totals overlap: never sum parent and child subtree totals.
+- Additive unit buckets, separated by explicit run and chunk/group identity,
+  with a by-role breakdown and an unattributed remainder. Named-group lead work
+  stays with the group; it is not distributed across its chunks.
+- Each parent's own activity by the number of observed active **immediate** children.
+  This is time-window association, not proof of supervision cost or waste.
+- Assignment/parent conflicts, unresolved coverage, and optional activity after
+  an explicitly declared completion. An idle/open session is not a completion event.
+
+Direct session totals reconcile to the selected primary total. Unit buckets plus
+unattributed usage also reconcile. Root-wide work remains unattributed to chunks
+unless supported by explicit assignment evidence; it is never allocated by time
+alone. Cached input remains a subset of input; reasoning remains a subset of output.
+Missing model prices do not erase tokens and are exposed through price coverage.
+
+The output schema is `codex-workflow-cost-profile-v5.1`. Old root-only
+`orchestrator_*` comparison keys are now `root_*`; `analysis_root` replaces
+`analysis_orchestrator`. Family-wide concurrency describes recognized descendants,
+while the nested view distinguishes each immediate-parent relationship. Root role
+is reported separately. Use `--analysis-root S-...` when selection is ambiguous;
+`--orchestrator` remains a command-line alias. A unique explicitly identified active
+Coordinator takes precedence over its bounded Orchestrators in cutoff selection.
+
+Full-family reports now include the final observed event. An inferred upper bound
+is advanced by one microsecond; an explicit `--before` remains exclusive. Usage and
+actions before a trusted child activation are excluded from primary totals and
+counted in `pre_activation_records_excluded`. Existing carry-in exclusions still
+apply. These changes can alter totals relative to v4.2; that is not evidence of
+workflow savings. They do not prove arbitrary inherited/replayed history has been
+identified when no reliable activation boundary exists.
+
+#### v5.1 attribution correction
+
+Role inference now uses only the leaf of this session's own task path in
+`session_meta`. Ancestor names and message-sender/recipient paths cannot supply
+self-role evidence. Exact role fields in that session's metadata are retained
+separately from naming heuristics.
+
+An unambiguous trusted assignment label or explicit mapping takes precedence over
+weaker inferred naming evidence. The nested report preserves `inferred_role`,
+`inferred_role_confidence`, `explicit_self_roles` and nonblocking `role_diagnostics`;
+these describe responsibility evidence, not the actual activity of every request.
+Conflicting explicit role declarations, labels, assignments or parents still block
+unit attribution. No assignment is invented from a generic task name.
+
+Correcting roles can change every role-based view, including recognized active
+windows and concurrency. Compare the same topology level and reporting window:
+family-wide descendant concurrency is not bounded-orchestrator concurrency. Raw
+usage totals should remain unchanged for identical source records and boundaries.
+This correction does not improve missing recipient attribution or prove savings.
+
+### Tool-compatible assignment identity
+
+The audit parser supports this versioned label convention:
+
+```text
+si1_<UTF-8 hex run ID>_<c or g>_<UTF-8 hex unit ID>_<role>_<attempt>
+```
+
+`c` identifies a chunk and `g` an explicitly named group. Hex uses lowercase digits
+and preserves original case/punctuation without slug collisions. Roles use configured
+lowercase names; attempts are positive decimal integers without leading zeroes.
+Run/unit IDs are nonempty, at most 96 UTF-8 bytes each, without control characters;
+the complete label is at most 512 characters. Respect any stricter tool limits and
+use an explicit mapping if it cannot fit. Same-worker repair/revalidation retains
+the assignment; a fresh replacement increments the attempt. A recorded parent
+distinguishes the same role/attempt under different bounded leads.
+
+Generate a label without maintaining another agent report:
+
+```bash
+python3 -c 'from workflow_attribution import encode_label; print(encode_label("O-03", "implementer", 1, run_id="run-a"))'
+```
+
+The corresponding logical identity is run `run-a`, assignment `O-03:implementer:1`.
+Legacy colon labels remain readable but lack explicit run identity (reported as
+null); they are scoped to the selected family and cannot prove separation of
+multiple runs within that family. Arbitrary slugged names such as
+`o_03_implementer_1` are **not guessed**. Labels and unit IDs are not exported;
+the report uses local `R01`/`U01` labels. Parent/session keys are one-way hashes.
+
+Use labels actually recorded by the workflow, or supply its existing
+assignment-to-worker mapping through the optional import below. Support for this
+convention does not imply that an older run emitted these labels.
+
+### Optional mapping import
+
+Use `--assignment-map mapping.json` only when explicit identity information is
+available from the existing handoff. This is an audit-side adapter, not a mandatory
+second workflow ledger. Use hashed family/session keys from the finder or lifecycle
+export. The map is validated against the selected source family, with no cross-family
+joins. Conflicts with explicit self-role declarations, labels or parents are
+reported and withheld from unit attribution rather than silently overwritten.
+Disagreement with weaker inferred naming evidence is retained as a diagnostic,
+without discarding an otherwise unambiguous explicit assignment.
+
+```json
+{
+  "schema": "workflow-assignment-map-v1",
+  "family": "W-...",
+  "assignments": [
+    {"session": "S-root...", "role": "coordinator"},
+    {
+      "session": "S-worker...",
+      "parent_session": "S-parent...",
+      "run_id": "run-a",
+      "unit_id": "O-03",
+      "scope": "chunk",
+      "role": "implementer",
+      "attempt": 1,
+      "completed_at": "2026-09-20T12:00:00Z"
+    }
+  ]
+}
+```
+
+`completed_at` is optional and must denote an explicitly recorded assignment end,
+not the last observed request. Later usage is exposure requiring interpretation,
+not automatically waste. An entry without `unit_id` can declare a role/parent only.
+One session reused for different assignments cannot be split from this map: duplicate
+session entries are rejected, and conflicting observed assignments are held out.
+Same-assignment repair tokens remain combined unless further evidence distinguishes
+their boundaries. Declared mapping evidence is labeled separately from observed
+spawn/metadata evidence. No prompts, source contents or raw tool output belong here.
+
+### Coordination and tool observations
+
+The nested report includes each caller's lifecycle counts and target-resolution
+coverage, including `followup_task` and `interrupt_agent`. An interrupt is not treated
+as a close or proof that capacity was released. With the compaction scan enabled,
+`tool_activity` reports structural call categories, duplicate removal, parse errors
+and unclassified/opaque counts. `--no-compaction-audit` leaves that view null.
+
+Custom tool calls are recognized. JavaScript `functions.exec` wrappers are explicitly
+opaque: this scanner does not infer execution from code strings, comments or branches.
+No tool category receives a fabricated share of response tokens. Tool counts cannot
+establish unnecessary polling, duplicate investigation, successful tests or savings.
+Resource-read detection remains limited by schema/classification coverage.
+
+Validate the helpers with:
+
+```bash
+python3 find_workflow_candidates.py --self-test
+python3 extract_workflow_lifecycle.py --self-test
+python3 profile_workflow_cost.py --self-test
+python3 -m unittest -v test_workflow_attribution
+```
+
+The synthetic CLI test checks nested accounting, duplicate snapshots, pre-activation
+history, cutoff handling and privacy. A small actual coordinated run is still needed
+to qualify the runtime's label/linkage emission; synthetic tests do not establish
+real-world attribution coverage or efficiency improvement.
+
+### Earlier profiler methodology
+
+v4 keeps v3's overlapping active-role model and adds two conservative evidence layers that are useful for before/after workflow experiments:
+
+1. **restart-aware analysis windows** using timezone-aware `--after` / `--before` boundaries
+2. **chunk / assignment correlation** only when a spawn exposes an explicit structured task label such as `<chunk-id>:<role>:<attempt>`
+
+v4.1 fixed an important cutoff-reconstruction edge case found on real Codex logs. A resumed or forked rollout can retain inherited timestamps from before the point where that session was actually activated, so its recorded earliest timestamp is not a reliable restart boundary. v4.2 keeps that logic: with a cutoff, it selects the analysis orchestrator from **observed inference/lifecycle activity inside the requested window**, not from `first_ts` alone. Trusted spawn time is used as the effective activation time for child workers.
+
+v4.2 adds an explicit **context-compaction audit**. It counts persisted compaction events directly, conservatively associates compaction-specific `token_count` samples when they are structurally close enough, measures observed context shrink/refill, and profiles the work performed while a session rebuilds context after compaction. It also tracks privacy-safe repeated resource reads/accesses during that recovery period and compares recovery requests with the same session's non-recovery requests as an exploratory baseline.
+
+Without a cutoff, v4.2 retains the v3 behavior: the selected graph family root is the orchestrator and the full family is profiled. With a cutoff, it scores sessions that actually have post-boundary activity, with particular weight on CLI/root-like sessions and trusted recognized-role spawns. A session whose recorded start predates the cutoff can still be selected as the resumed/restarted orchestrator, but only its in-window events are counted. If selection is ambiguous, the profiler stops rather than silently choosing a root. An explicit privacy-safe override is available with `--orchestrator S-...`.
+
+Example for a known workflow-update/restart boundary:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-ac4e5c3e8a \
+  --after 2026-09-14T19:54:47+02:00 \
+  --export-json workflow_cost_profile_v4_2.json
+```
+
+`--after` and `--before` require an explicit timezone offset. `--before` is exclusive.
+
+### Window/restart handling
+
+For a windowed run, sessions are audited as:
+
+```text
+pre-window
+carry-in
+in-window
+post-window
+carry-out
+```
+
+A **carry-in** session was activated before the boundary but still has observed activity afterward. For child workers, a trusted spawn timestamp overrides inherited rollout history when deciding whether the worker is carry-in or genuinely post-boundary. Other carry-in workers are reported separately and are **excluded from the primary post-restart totals by default**.
+
+The selected orchestrator is the one allowed carry-in exception: if the same privacy-safe session identity spans the restart boundary, v4.2 can select it from strong post-cutoff activity and count only its in-window events. The report prints whether the selected orchestrator's recorded start predates the cutoff plus the post-window usage/action/spawn evidence used for selection.
+
+The selected analysis segment is built from that orchestrator plus graph/trusted-spawn descendants that were activated or actually active inside the window. If no descendant set can be established, the profiler falls back to window-activity membership and says so explicitly.
+
+### Active-state and concurrency analysis
+
+The base cost model still combines:
+
+1. trusted spawn matches
+2. strong child-session role metadata
+3. observed child-session lifetime
+
+For recognized children, the active window begins at the **trusted spawn timestamp**, not the rollout's earliest timestamp. This avoids treating inherited/forked history as pre-spawn activity.
+
+That produces overlapping **active-role windows**. If an implementer and validator are alive at the same time, both remain active. Each orchestrator inference request is assigned to one mutually exclusive state such as:
+
+```text
+implementer only
+validator only
+implementer+validator
+multiple implementers
+multiple implementers+validator
+no-recognized-child-active
+```
+
+The profiler reports:
+
+- total observed work and public API-list-price-equivalent work by role
+- orchestrator/root cost by active child state
+- orchestrator/root cost by 0 / 1 / 2 / 3+ concurrent recognized children
+- trusted recognized-role activity windows and pairwise overlap
+- recognized child agent-minutes, active wall time, overlap wall time, extra concurrency-hours, and peak simultaneous children
+- exact role-level `SEND` targets when a routing field literally equals a configured role
+- inference bursts and activity after the first burst
+- per-session context growth, peak context, and apparent context resets
+- large-context / small-output workload by role and orchestrator active state
+- observed implementer -> validator cycles, with supervision ratios only for genuinely isolated sequential cycles
+- a privacy-safe action-schema audit
+
+### Context compaction audit
+
+v4.2 scans the selected rollout files for explicit persisted compaction markers, including paired `compacted` / `context_compacted` representations. Nearby representations are deduplicated into one observed compaction event.
+
+This is intentionally separate from the older `resets` field in the context-growth table. That older field is only a **context-drop heuristic**: it counts a large request followed by a request below 55% of the prior input size. v4.2 reports explicit compactions directly and also shows how many heuristic drops matched an explicit compaction, plus explicit-only and heuristic-only events.
+
+For each explicit compaction, v4.2 can report:
+
+```text
+context/request input immediately before compaction
+input on the first ordinary inference request after compaction
+observed shrink percentage
+direct compaction token/API$eq usage when a raw usage sample can be safely matched
+requests, tokens and API$eq during post-compaction recovery
+time and requests until the context refills to the configured fraction
+peak context reached during recovery
+tool activity during recovery
+resources accessed both shortly before and after compaction
+repeated file-read events across the compaction boundary
+```
+
+Direct compaction token cost is **not forced**. Some rollouts emit a compaction-specific `last_token_usage` sample between the persisted compaction markers even when the cumulative token total does not advance; v4.2 reads raw token telemetry so it can recover that sample. If no sufficiently close usage record exists, the direct cost is reported as unobserved rather than assigning the next normal model request to compaction.
+
+Because the normal workflow request tables deduplicate unchanged cumulative token totals, a matched compaction-specific usage sample can exist **outside** those primary request totals. v4.2 therefore reports how many matched direct-usage records were already present in the primary totals and separately reports matched direct API$eq that was outside them. Do not blindly add direct compaction API$eq to workflow totals without checking that field.
+
+By default, a recovery window begins after the compaction markers and ends at the earliest of:
+
+1. the next compaction in that session
+2. the end of the session / requested analysis window
+3. the first ordinary request whose input reaches 80% of the pre-compaction input
+
+Tune the refill threshold with:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-... \
+  --compaction-refill-fraction 0.8
+```
+
+To look for implementation-state reacquisition, the profiler also scans structural tool calls during recovery. It categorizes activity such as file reads, searches, Git/state inspection, tests/builds, writes/edits and other shell/tool work. Path-like resources are one-way hashed **locally**; raw paths, commands, prompts, source text and tool output are never printed or exported. The default pre-compaction resource lookback is 20 minutes:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-... \
+  --compaction-resource-lookback-minutes 20
+```
+
+The report includes a **post-compaction recovery vs same-session non-recovery baseline**. It compares API$eq/request, input/request, uncached input/request and tool events/request. The aggregate delta is exploratory only. It means that recovery windows were more or less expensive than other requests in the same sessions; it does **not** prove that compaction caused the difference or that the delta is achievable savings.
+
+Useful controls:
+
+```bash
+python3 profile_workflow_cost.py --family W-... --compaction-limit 50
+python3 profile_workflow_cost.py --family W-... --compaction-direct-usage-seconds 1
+python3 profile_workflow_cost.py --family W-... --compaction-dedupe-seconds 2
+python3 profile_workflow_cost.py --family W-... --no-compaction-audit
+```
+
+The `--stage-roles` option keeps its name for compatibility but means **roles included in active-state analysis**.
+
+By default an active window ends at the observed end of the child session. An optional grace period can be added with:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-... \
+  --active-tail-seconds 30
+```
+
+`--stage-tail-seconds` remains an alias.
+
+### Chunk / assignment correlation
+
+v4.2 can correlate implementer/validator/planner workers only from an explicit compact assignment label in a trusted spawn, for example:
+
+```text
+chunk-04:implementer:1
+chunk-04:validator:1
+chunk-04:implementer:2
+chunk-05:implementer:1
+```
+
+The raw task label is never printed or exported. It is converted into report-local privacy-safe chunk labels such as `C01`, `C02`, etc.
+
+Correlation is intentionally strict. Prose, timing proximity, or a role name by itself is **not** enough to invent a chunk identity. If the logs predate structured assignment labels, coverage may be zero and the report says so.
+
+This lets v4.2 distinguish lifecycle overlap into:
+
+```text
+same-chunk-repair-overlap
+same-chunk-replacement-overlap
+cross-chunk-overlap
+unclassified-overlap
+```
+
+Same-chunk implementer/validator overlap is therefore no longer treated as suspicious merely because validation began. **Cross-chunk active work** is the stronger lifecycle optimization signal. If chunk identity is unavailable, the overlap remains `unclassified-overlap` rather than being guessed from timing.
+
+### Supervision ratios
+
+For an isolated sequential `implementer -> validator` cycle, v4.2 can report:
+
+```text
+root work while implementer active / implementer work
+root work while validator active / validator work
+combined root stage work / combined direct child work
+```
+
+Ratios are suppressed for overlapping cycles, for sequential cycles with another recognized child active, and for explicit chunk mismatches. They are observational concurrency ratios, not guaranteed avoidable overhead.
+
+### Stable before/after comparison fields
+
+The report and JSON export include a **Comparison snapshot** with stable descriptive fields intended for comparing workflow versions, including:
+
+```text
+orchestrator_api_eq_share
+orchestrator_requests
+orchestrator_median_input_tokens
+orchestrator_p90_input_tokens
+large_context_small_output_api_eq_share
+root_with_2plus_children_api_eq_share
+recognized_child_agent_hours
+extra_concurrency_hours
+peak_concurrent_children
+chunk_correlation_coverage
+correlated_chunks
+direct_child_requests_per_correlated_chunk
+direct_child_api_eq_per_correlated_chunk
+cross_chunk_overlap_api_eq
+same_chunk_repair_overlap_api_eq
+same_chunk_replacement_overlap_api_eq
+unclassified_overlap_api_eq
+explicit_compactions
+direct_compaction_usage_coverage
+direct_compaction_api_eq
+direct_compaction_api_eq_outside_primary_totals
+post_compaction_recovery_api_eq
+post_compaction_recovery_api_eq_share
+post_compaction_recovery_input_tokens
+post_compaction_recovery_requests
+orchestrator_compactions
+orchestrator_compactions_per_hour
+repeated_post_compaction_read_events
+recovery_api_eq_delta_vs_same_session_baseline
+```
+
+These are descriptive measurements, not causal estimates of savings. The overlap classes can overlap conceptually and must not be summed into a savings number.
+
+### Exact role-targeted sends
+
+When a safe routing field exactly equals a configured role, such as:
+
+```text
+send.args.target = validator
+```
+
+v4.2 trusts the **role-level target**. It still does not claim to know the specific child session unless an actual session-ID bridge exists. Any nearby root inference pairing remains a timing heuristic and is labeled observational.
+
+### Custom workflows
+
+The default active roles are:
+
+```text
+implementer
+validator
+planner
+```
+
+Override them with:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-... \
+  --roles manager coder reviewer \
+  --stage-roles coder reviewer
+```
+
+The default successor relations used for lifecycle-overlap classification include:
+
+```text
+planner -> implementer
+implementer -> validator
+validator -> implementer
+```
+
+Customize them with repeatable options:
+
+```bash
+python3 profile_workflow_cost.py \
+  --family W-... \
+  --successor coder=reviewer \
+  --successor reviewer=coder
+```
+
+#### Privacy and interpretation
+
+The workflow helpers remain read-only and local. They do not print prompts, responses, source code, tool output, or raw session/thread/agent IDs.
+
+Useful options:
+
+```bash
+python3 profile_workflow_cost.py --help
+python3 profile_workflow_cost.py --self-test
+python3 profile_workflow_cost.py --family W-... --no-action-schema-audit
+python3 profile_workflow_cost.py --family W-... --prices prices.json
+python3 profile_workflow_cost.py --family W-... --after 2026-09-14T19:54:47+02:00
+python3 profile_workflow_cost.py --family W-... --after 2026-09-14T19:54:47+02:00 --orchestrator S-...
+```
+
+`API$eq` uses the same public list-price table as the main audit. It is a normalization ruler only, not a Codex subscription charge or OpenAI internal compute cost. Guardian long-context normalization uses the same mapping and multipliers as `codex_quota_audit.py`.
+
+The action-schema audit never prints argument/result values. It only prints structural paths, data types, counts, and whether hashed compact values overlap known family IDs or trusted spawn-result value namespaces. Any proposed handle bridge remains diagnostic until validated on real workflows.
+
+---
+
 ## Data source
 
 By default the script reads all available JSONL files under:
@@ -635,6 +1266,9 @@ rather than expanding your home-directory username.
 
 The generated Markdown report and summary JSON are designed around aggregate, privacy-safe results.
 
+The workflow helper outputs use hashed/stable labels and avoid printing prompts, responses, source code, tool stdout, or raw linkage IDs.
+
+
 CSV exports can contain timestamps and detailed usage patterns, so review them before sharing.
 
 ---
@@ -654,6 +1288,12 @@ CSV exports can contain timestamps and detailed usage patterns, so review them b
 - Automatic policy-regime detection is statistical.
 - Guardian quota attribution is estimated from account-global telemetry and should be interpreted with its uncertainty interval.
 - Replay detection is deliberately conservative. Dense activity without positive replay-sequence evidence remains included.
+- Workflow lifecycle attribution is conservative: only trusted exact-ID or very-tight spawn/start matches create follow-up phases or role-targeted supervision totals.
+- Diagnostic `single-active-agent` lifecycle hints are never used for cost attribution.
+- Workflow profiler active-state attribution can show multiple recognized children at once; per-window root totals can therefore overlap and should not be summed.
+- Exact role-targeted `SEND` labels are trusted only when a routing field exactly equals a configured role name. Nearby inference pairing remains observational.
+- Supervision ratios are emitted only for isolated sequential cycles. Ratios are suppressed for overlapping or non-isolated cycles and remain observational concurrency measures, not guaranteed avoidable overhead.
+- Lingering-agent candidates mean only that an older recognized child remains alive after a later same-role or configured successor-role spawn. Parallelism may be intentional; post-trigger inference is reported as observed exposure, not savings.
 
 ---
 
@@ -695,6 +1335,14 @@ Check locally with:
 
 ```bash
 python3 codex_quota_audit.py --version
+```
+
+Experimental workflow helper versions in this package:
+
+```text
+find_workflow_candidates.py      2.2
+extract_workflow_lifecycle.py   2.2.1
+profile_workflow_cost.py        5.1.1
 ```
 
 ---

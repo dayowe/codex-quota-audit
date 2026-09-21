@@ -6,9 +6,13 @@ __pycache__/
 
 # --- Generated data & artifacts ---
 *.jsonl
+*.json
+*.md
+*.txt
 *.csv
 *.png
 *.svg
+*.zip
 
 # --- OS / editor metadata ---
 .DS_Store
@@ -16,3 +20,4 @@ Thumbs.db
 desktop.ini
 ._*
 *:Zone.Identifier
+
