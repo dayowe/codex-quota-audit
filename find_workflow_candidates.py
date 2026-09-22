@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "2.2"
+__version__ = "2.3"
 
 DEFAULT_ROLES = ("coordinator", "orchestrator", "planner", "implementer", "validator")
 
@@ -659,16 +659,13 @@ def build_edges(sessions: Dict[str, Session], allow_shared: bool = True) -> List
 
 def connected_components(sessions: Dict[str, Session], edges: Sequence[Edge]) -> List[set[str]]:
     adj: Dict[str, set[str]] = defaultdict(set)
-    linked_nodes = set()
     for e in edges:
         adj[e.parent].add(e.child)
         adj[e.child].add(e.parent)
-        linked_nodes.add(e.parent)
-        linked_nodes.add(e.child)
 
     comps = []
     seen = set()
-    for start in linked_nodes:
+    for start in sorted(sessions):
         if start in seen:
             continue
         stack = [start]
@@ -690,13 +687,11 @@ def choose_root(comp: set[str], sessions: Dict[str, Session], edges: Sequence[Ed
     if not candidates:
         candidates = list(comp)
 
-    def rank(key: str) -> Tuple[int, int, float, str]:
+    def rank(key: str) -> Tuple[int, float, str]:
         s = sessions[key]
         source_rank = 0 if s.source_kind not in {"subagent", "guardian"} else 1
-        # A root that routes to known roles is more likely to be the orchestrator.
-        routing = sum(s.roles.routing_role.values())
         ts = s.first_ts.timestamp() if s.first_ts else float("inf")
-        return (source_rank, -routing, ts, key)
+        return (source_rank, ts, key)
 
     return sorted(candidates, key=rank)[0]
 
@@ -714,29 +709,24 @@ def family_role_summary(family: Family, sessions: Dict[str, Session]) -> Counter
     return out
 
 
-def score_family(family: Family, sessions: Dict[str, Session], roles: Sequence[str]) -> Tuple[float, str]:
-    role_counts = family_role_summary(family, sessions)
+def score_family(family: Family, sessions: Dict[str, Session]) -> Tuple[float, str]:
+    """Rank inspectable samples by telemetry/link coverage, never job titles."""
     edges = family.edges
     high = sum(e.confidence == "high" for e in edges)
     medium = sum(e.confidence == "medium" for e in edges)
     children = [k for k in family.members if k != family.root]
     non_guardian_children = [k for k in children if sessions[k].dominant_model != "codex-auto-review"]
 
-    has_impl = role_counts.get("implementer", 0) > 0
-    has_val = role_counts.get("validator", 0) > 0
-    has_orch = role_counts.get("orchestrator", 0) > 0 or role_counts.get("coordinator", 0) > 0
-
     first = family.first_ts(sessions)
     last = family.last_ts(sessions)
     hours = (last - first).total_seconds() / 3600 if first and last else float("inf")
 
     score = 0.0
-    score += high * 25 + medium * 8
+    score += 50 * high / len(edges) if edges else 0
+    score += 15 * medium / len(edges) if edges else 0
     score += min(len(non_guardian_children), 20) * 4
-    score += 50 if has_impl else 0
-    score += 50 if has_val else 0
-    score += 20 if has_orch else 0
-    score += 40 if has_impl and has_val else 0
+    measured = sum(sessions[k].tokens > 0 for k in family.members)
+    score += 40 * measured / len(family.members)
     if 2 <= len(non_guardian_children) <= 30:
         score += 20
     if hours <= 48:
@@ -746,14 +736,14 @@ def score_family(family: Family, sessions: Dict[str, Session], roles: Sequence[s
     if high == len(edges) and edges:
         score += 20
 
-    if has_impl and has_val and high >= 2 and len(non_guardian_children) <= 30 and hours <= 72:
-        quality = "excellent sample"
-    elif has_impl and has_val and (high + medium) >= 2:
-        quality = "good sample"
-    elif has_impl or has_val:
-        quality = "partial workflow"
+    if not measured:
+        quality = "no usage telemetry"
+    elif len(family.members) == 1:
+        quality = "standalone session"
+    elif high == len(edges) and measured == len(family.members):
+        quality = "linked, complete usage coverage"
     else:
-        quality = "linked family, roles unclear"
+        quality = "linked, limited evidence"
 
     return score, quality
 
@@ -771,7 +761,7 @@ def build_families(sessions: Dict[str, Session], edges: Sequence[Edge]) -> List[
             edges=comp_edges,
             family_key=short_key("W", seed),
         )
-        family.score, family.sample_quality = score_family(family, sessions, DEFAULT_ROLES)
+        family.score, family.sample_quality = score_family(family, sessions)
         families.append(family)
     return families
 
@@ -1027,12 +1017,12 @@ def main() -> int:
     ]
     pool = recent if recent else families
 
-    # Complete samples first, then recency, then quality score.
+    # Favor inspectable linked samples, retaining standalone sessions as well.
     quality_rank = {
-        "excellent sample": 0,
-        "good sample": 1,
-        "partial workflow": 2,
-        "linked family, roles unclear": 3,
+        "linked, complete usage coverage": 0,
+        "linked, limited evidence": 1,
+        "standalone session": 2,
+        "no usage telemetry": 3,
     }
     pool.sort(key=lambda f: (
         quality_rank.get(f.sample_quality, 9),
@@ -1043,13 +1033,13 @@ def main() -> int:
     print("\nBest recent workflow families")
     print("-----------------------------")
     print(
-        "These are graph-linked families, not time-gap clusters. "
-        "Planner is optional; implementer + validator is preferred."
+        "These are graph-linked families or standalone sessions, not time-gap clusters. "
+        "Ranking uses linkage and usage coverage, not workflow role names."
     )
 
     shown = pool[: max(0, args.top)]
     if not shown:
-        print("No linked workflow families found.")
+        print("No workflow families or standalone sessions found.")
         print("Rerun with --show-link-schema and share the linkage audit.")
     else:
         for i, f in enumerate(shown, 1):

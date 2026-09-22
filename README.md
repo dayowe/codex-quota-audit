@@ -26,13 +26,51 @@ The script reads local Codex JSONL telemetry under `~/.codex`, reconstructs effe
 
 ## Quick start
 
-For most users, the recommended command is:
+For quota analysis:
 
 ```bash
 python3 codex_quota_audit.py --charts
 ```
 
 This prints the highest-value findings and creates publication-ready PNG/SVG charts.
+
+### Profile a session or agent workflow
+
+For workflow costs, start with any session ID from the run you want to inspect:
+
+```bash
+python3 profile_workflow_cost.py \
+  --session YOUR_SESSION_ID \
+  --export-json workflow_cost_profile.json
+```
+
+This works with solo sessions, unnamed workers, flat teams and nested agent trees.
+No staged-implementation skills, special agent names or project configuration are
+required. The default **generic** profile reports observed usage, context growth,
+compactions and linked parent/worker activity without assuming a plan → implement
+→ validate sequence. Missing linkage or roles are reported as limitations.
+
+If you do not know the session ID, run `python3 find_workflow_candidates.py` and
+choose a reported `W-...` family or `S-...` session key. A session selector resolves
+the containing family; use `--analysis-root YOUR_SESSION_ID` as well to select only
+that session's observed subtree.
+
+Workflow analysis uses the Python standard library. Clone this repository, or keep
+these five modules together: `profile_workflow_cost.py`, `find_workflow_candidates.py`,
+`extract_workflow_lifecycle.py`, `workflow_attribution.py` and `codex_quota_audit.py`.
+They read local logs under `~/.codex`; `--home /path/to/codex-home` selects another
+log location. They make no network requests. The JSON export is optional.
+
+**API$eq is a comparison measure, not your subscription bill or quota consumption.**
+Raw tokens, cached input and price coverage remain visible. Reports cannot establish
+that observed overlap, context growth or validation effort was unnecessary.
+
+For a known implementation/validation workflow, add `--workflow-profile staged`.
+For other role names, see [Custom workflows](#custom-workflows). Neither option
+changes which roles count toward core token totals or concurrency.
+
+For practical setup and interpretation, see
+[Getting useful results and identifiable roles](#getting-useful-results-and-identifiable-roles).
 
 ### Install chart support
 
@@ -402,7 +440,7 @@ python3 find_workflow_candidates.py --self-test
 
 ## Experimental workflow profiling helpers
 
-The repository also includes three read-only helper scripts for investigating expensive multi-agent Codex workflows. These remain separate from the main quota audit while the workflow event schema is being validated against real rollout logs.
+The repository also includes three read-only helper commands for investigating Codex sessions and agent workflows. These remain separate from the main quota audit while the workflow event schema is being validated against real rollout logs.
 
 ### 1. Find graph-linked workflow families
 
@@ -422,6 +460,10 @@ For each recent family it reports:
 - link method and confidence
 
 The generated `W-...` family IDs are useful for selecting a representative workflow. A root/member `S-...` session key is more stable if a family later grows as new linked logs are added.
+
+Discovery includes standalone sessions and ranks families by observed linkage and
+usage coverage, not particular job titles. “Standalone” means no linked descendants
+were found in the available logs; it does not prove that no agents were used.
 
 Optional privacy-safe JSON manifest:
 
@@ -497,7 +539,7 @@ python3 extract_workflow_lifecycle.py \
 
 Parent/action inference association is still a timing heuristic and is explicitly reported as non-causal. Lifecycle schemas can change between Codex versions, so unresolved events are retained instead of being silently assigned to whichever agent happens to be active.
 
-### 3. Profile workflow cost by active-role state
+### 3. Profile session and workflow costs
 
 Once a representative family has been validated, use `profile_workflow_cost.py` to answer the workflow-optimization question directly:
 
@@ -513,11 +555,11 @@ A stable member/root session key works too:
 python3 profile_workflow_cost.py --family S-644a110a4f
 ```
 
-Or pass the coordinator's exact Codex session/thread ID directly; no finder step is needed:
+Or pass any member's exact Codex session/thread ID directly; no finder step is needed:
 
 ```bash
 python3 profile_workflow_cost.py \
-  --session YOUR_COORDINATOR_SESSION_ID \
+  --session YOUR_SESSION_ID \
   --export-json workflow_cost_profile_new.json
 ```
 
@@ -528,9 +570,140 @@ Reports retain hashed IDs. A session selector does not change the analysis root
 or isolate a subtree; existing root-selection and date-window rules still apply.
 The matching logs must be available under `--home` (default `~/.codex`).
 
-The workflow cost profiler is currently **v5.1.1**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
+The workflow cost profiler is currently **v6.0**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
 
-### Coordinated workflows: v5
+### Getting useful results and identifiable roles
+
+**Start with the logs you already have.** Run the session-ID command above, even
+if the main agent chose its own workers and you never defined any roles. You can
+still compare the root's own usage, individual workers and linked subtrees, plus
+context growth and compactions where recorded. Missing role evidence produces
+`unknown`, not missing tokens. Missing parent/spawn evidence limits tree and
+lifetime analysis; the report exposes that separately.
+
+Read **direct session usage** first to locate expensive agents, then inspect their
+subtrees and context/compaction measures. Direct totals are additive; inclusive
+subtree totals overlap and must not be summed together. These observations locate
+work, but do not establish what it accomplished or whether it was unnecessary.
+
+#### Role recognition is optional, and requires evidence
+
+The default vocabulary (`coordinator`, `orchestrator`, `planner`, `implementer`,
+`validator`) comes from the workflows this tool initially analyzed. It is not a
+required team structure or a universal Codex role standard. The parser recognizes:
+
+| Evidence in the available logs or mapping | What it establishes |
+| --- | --- |
+| An exact recognized role in supported fields of the session's own `session_meta` | Declared role; supported field names include `role`, `agent_role`, `agent_type`, `role_name` |
+| A recognized role in the final component of the worker's own recorded `agent_path` | Weaker naming evidence for a role, not a chunk/assignment identity |
+| A supported structured task label in a spawn matched to that worker | Declared role and assignment identity |
+| A supplied, validated assignment map | Explicitly declared role and, optionally, parent/assignment identity |
+
+For example, `researcher_1` can provide weaker role evidence **if** the runtime
+records it as the worker's own `agent_path` leaf and `researcher` is in `--roles`.
+That name alone does not establish an assignment. Metadata availability varies;
+do not assume that every runtime records these fields.
+
+Writing “you are a researcher” in a worker's prompt or final response is not enough:
+the profiler does not classify jobs from conversation prose. Similarly,
+`--roles researcher writer editor` tells the parser which existing names to
+recognize; it does not create log metadata or assign roles to sessions. Guardian
+classification is handled separately from recorded auto-review model metadata.
+
+#### Optional preparation for future runs
+
+Simple role metadata/names are sufficient for a role breakdown when recorded.
+If you also want reliable **per-task assignment attribution**, use the optional
+[structured label helper](#tool-compatible-assignment-identity). No staged skills
+or implementation/review sequence are required. Give the parent agent this guidance:
+
+> When spawning workers, use the audit tool's `workflow_attribution.encode_label`
+> helper to generate task labels with a consistent role, a run ID and a task ID.
+> Put the generated string in the spawn tool's `task_name` argument where supported,
+> not merely in the task prompt. Follow the documented attempt/reuse convention.
+> Do not ask workers to write telemetry or edit Codex logs. If the tool cannot carry
+> the label, preserve an existing explicit worker mapping instead of inventing one.
+
+For a research task, generate a label from this repository directory:
+
+```bash
+python3 -c 'from workflow_attribution import encode_label; print(encode_label("research-01", "researcher", 1, run_id="run-a"))'
+```
+
+The **parent** supplies that output as `task_name` when launching the worker. Label
+generation alone does not put anything into the logs. A trusted match between the
+recorded spawn and child session is also required. The main/root session has no
+parent spawn label; leave its role unknown unless its own metadata or an explicit
+mapping establishes it. Its position as root remains identifiable regardless.
+
+Analyze with the vocabulary used by the workflow:
+
+```bash
+python3 profile_workflow_cost.py \
+  --session YOUR_SESSION_ID \
+  --roles researcher writer editor \
+  --export-json research_workflow_profile.json
+```
+
+`--roles` replaces the default list, so include every role you want recognized.
+This command stays in generic mode; role recognition does not require stage/cycle
+interpretation.
+
+#### Existing unlabeled runs and verification
+
+For an existing run, use an [assignment map](#optional-mapping-import) only when
+you have trustworthy identity information, such as an explicit saved handoff.
+Role-only entries are supported; task IDs are not mandatory. Pass the map with
+`--assignment-map mapping.json` and include its custom role names in `--roles`.
+Otherwise, keep `unknown` rather than guessing from timing or token volume.
+
+Before drawing role/task conclusions, inspect `nested_attribution.sessions` in the
+JSON: `role`, `role_confidence`, `parent_source`, `assignment_source`,
+`role_diagnostics` and `issues` explain the evidence and conflicts. Check
+`nested_attribution.coverage` and the unattributed remainder, plus
+`workflow_analysis.lifetime_windows_status` and `sessions_without_lifetime_windows`.
+An unknown role and a missing parent link are different limitations. Test optional
+labeling on a small run before relying on it for a long workflow; do not reorganize
+your workflow merely to populate every report field.
+
+### Generic workflows: v6
+
+Core accounting and lifetime windows are independent of role names. An unknown-role
+worker with trusted spawn/lifetime evidence contributes just like a named worker.
+When usage is present but a trusted spawn is missing, usage remains counted; a
+lifetime window is not invented. `workflow_analysis` reports window coverage and
+the sessions missing that evidence. Zero observed concurrency is not proof that no
+other worker ran.
+
+Generic mode assumes no stage order. Role-pair cycles require `--cycle-roles FIRST
+SECOND` or the opt-in `staged` profile. An unavailable cycle summary is `null`, with
+a reason in `workflow_analysis`, rather than a misleading zero-cost measurement.
+Custom role filters produce a separate view; they never hide unknown-role work
+from the core report. Structured assignment labels and optional assignment maps
+still enrich per-unit attribution, but are not required for session/subtree totals.
+
+The output schema is **`codex-workflow-cost-profile-v6.0`**. Compared with v5.1:
+
+- `workflow_analysis` records the selected interpretation, lifetime coverage, cycle
+  availability and optional role-filtered activity.
+- Cycle fields and supervision summaries use `first`/`second` roles instead of
+  hard-coded implementer/validator names. Partial, overlapping or non-isolated
+  cycles do not qualify for isolated supervision ratios.
+- Existing `recognized_child_*`, `peak_concurrent_children` and
+  `no-recognized-child-active` keys are retained for compatibility. They now refer
+  to **all descendants with trusted lifetime evidence**, regardless of role, not
+  only immediate children. The nested attribution view reports immediate children.
+- With a date cutoff, root selection uses structural ancestry and in-window
+  activity, not Coordinator/Orchestrator role preference. Ambiguous structural
+  roots require `--analysis-root S-...` (or an exact raw session ID). An explicit
+  leaf root does not acquire sibling activity as a fallback.
+
+For before/after comparisons, fix the root and time window and verify the same
+session membership. Role-independent windows can change concurrency compared with
+older reports without changing token accounting; that is not workflow savings.
+Keep historical exports and write reruns to new filenames.
+
+### Nested attribution (introduced in v5)
 
 v5 adds `workflow_attribution.py` for explicit assignment identity and nested
 Coordinator → Orchestrator → Implementer/Validator accounting. It also supports
@@ -560,13 +733,9 @@ unless supported by explicit assignment evidence; it is never allocated by time
 alone. Cached input remains a subset of input; reasoning remains a subset of output.
 Missing model prices do not erase tokens and are exposed through price coverage.
 
-The output schema is `codex-workflow-cost-profile-v5.1`. Old root-only
-`orchestrator_*` comparison keys are now `root_*`; `analysis_root` replaces
-`analysis_orchestrator`. Family-wide concurrency describes recognized descendants,
-while the nested view distinguishes each immediate-parent relationship. Root role
-is reported separately. Use `--analysis-root S-...` when selection is ambiguous;
-`--orchestrator` remains a command-line alias. A unique explicitly identified active
-Coordinator takes precedence over its bounded Orchestrators in cutoff selection.
+Old root-only `orchestrator_*` comparison keys are now `root_*`; `analysis_root`
+replaces `analysis_orchestrator`. Root role is reported separately.
+`--orchestrator` remains a command-line alias for `--analysis-root`.
 
 Full-family reports now include the final observed event. An inferred upper bound
 is advanced by one microsecond; an explicit `--before` remains exclusive. Usage and
@@ -605,8 +774,9 @@ si1_<UTF-8 hex run ID>_<c or g>_<UTF-8 hex unit ID>_<role>_<attempt>
 ```
 
 `c` identifies a chunk and `g` an explicitly named group. Hex uses lowercase digits
-and preserves original case/punctuation without slug collisions. Roles use configured
-lowercase names; attempts are positive decimal integers without leading zeroes.
+and preserves original case/punctuation without slug collisions. Structured-label
+roles use configured lowercase ASCII letters (`a`–`z`) only; attempts are positive
+decimal integers without leading zeroes.
 Run/unit IDs are nonempty, at most 96 UTF-8 bytes each, without control characters;
 the complete label is at most 512 characters. Respect any stricter tool limits and
 use an explicit mapping if it cannot fit. Same-worker repair/revalidation retains
@@ -623,7 +793,8 @@ The corresponding logical identity is run `run-a`, assignment `O-03:implementer:
 Legacy colon labels remain readable but lack explicit run identity (reported as
 null); they are scoped to the selected family and cannot prove separation of
 multiple runs within that family. Arbitrary slugged names such as
-`o_03_implementer_1` are **not guessed**. Labels and unit IDs are not exported;
+`o_03_implementer_1` are **not decoded into assignments** (their role may still be
+recognized through the separate metadata naming rule). Labels and unit IDs are not exported;
 the report uses local `R01`/`U01` labels. Parent/session keys are one-way hashes.
 
 Use labels actually recorded by the workflow, or supply its existing
@@ -690,15 +861,19 @@ Validate the helpers with:
 python3 find_workflow_candidates.py --self-test
 python3 extract_workflow_lifecycle.py --self-test
 python3 profile_workflow_cost.py --self-test
-python3 -m unittest -v test_workflow_attribution
+python3 -m unittest -v test_workflow_attribution test_generic_workflow
 ```
 
-The synthetic CLI test checks nested accounting, duplicate snapshots, pre-activation
-history, cutoff handling and privacy. A small actual coordinated run is still needed
-to qualify the runtime's label/linkage emission; synthetic tests do not establish
-real-world attribution coverage or efficiency improvement.
+Synthetic tests cover solo/flat/nested workflows, unknown/custom roles, unchanged
+generic/staged accounting, incomplete linkage, independent cycle isolation,
+duplicate snapshots, pre-activation history, cutoff handling and privacy. Runtime
+label/linkage emission still needs inspection on the logs being analyzed; these
+tests do not establish compatibility with every Codex version or workflow savings.
 
 ### Earlier profiler methodology
+
+This section records the earlier v4 methods. v6's structural root selection and
+role-independent activity rules above supersede the historical role-based defaults.
 
 v4 keeps v3's overlapping active-role model and adds two conservative evidence layers that are useful for before/after workflow experiments:
 
@@ -736,19 +911,23 @@ carry-out
 
 A **carry-in** session was activated before the boundary but still has observed activity afterward. For child workers, a trusted spawn timestamp overrides inherited rollout history when deciding whether the worker is carry-in or genuinely post-boundary. Other carry-in workers are reported separately and are **excluded from the primary post-restart totals by default**.
 
-The selected orchestrator is the one allowed carry-in exception: if the same privacy-safe session identity spans the restart boundary, v4.2 can select it from strong post-cutoff activity and count only its in-window events. The report prints whether the selected orchestrator's recorded start predates the cutoff plus the post-window usage/action/spawn evidence used for selection.
+The selected root is the one allowed carry-in exception: if the same privacy-safe
+session identity spans the restart boundary, only its in-window events are counted.
+The report records structural root selection and activity evidence.
 
-The selected analysis segment is built from that orchestrator plus graph/trusted-spawn descendants that were activated or actually active inside the window. If no descendant set can be established, the profiler falls back to window-activity membership and says so explicitly.
+The selected segment is built from that root plus graph/trusted-spawn descendants
+that meet the window rules. There is no fallback that adopts unrelated active
+sessions when a descendant set cannot be established.
 
 ### Active-state and concurrency analysis
 
 The base cost model still combines:
 
 1. trusted spawn matches
-2. strong child-session role metadata
-3. observed child-session lifetime
+2. observed child-session lifetime
+3. optional role metadata for labeling, not admission
 
-For recognized children, the active window begins at the **trusted spawn timestamp**, not the rollout's earliest timestamp. This avoids treating inherited/forked history as pre-spawn activity.
+For descendants with trusted evidence, the active window begins at the **trusted spawn timestamp**, not the rollout's earliest timestamp. This avoids treating inherited/forked history as pre-spawn activity.
 
 That produces overlapping **active-role windows**. If an implementer and validator are alive at the same time, both remain active. Each orchestrator inference request is assigned to one mutually exclusive state such as:
 
@@ -765,14 +944,14 @@ The profiler reports:
 
 - total observed work and public API-list-price-equivalent work by role
 - orchestrator/root cost by active child state
-- orchestrator/root cost by 0 / 1 / 2 / 3+ concurrent recognized children
-- trusted recognized-role activity windows and pairwise overlap
-- recognized child agent-minutes, active wall time, overlap wall time, extra concurrency-hours, and peak simultaneous children
+- root cost by 0 / 1 / 2 / 3+ observed concurrent descendants
+- trusted lifetime windows and pairwise overlap, including unknown roles
+- descendant agent-minutes, active wall time, overlap wall time, extra concurrency-hours, and peak simultaneous descendants
 - exact role-level `SEND` targets when a routing field literally equals a configured role
 - inference bursts and activity after the first burst
 - per-session context growth, peak context, and apparent context resets
 - large-context / small-output workload by role and orchestrator active state
-- observed implementer -> validator cycles, with supervision ratios only for genuinely isolated sequential cycles
+- optionally configured role-pair cycles, with supervision ratios only for complete, isolated sequential cycles
 - a privacy-safe action-schema audit
 
 ### Context compaction audit
@@ -833,7 +1012,9 @@ python3 profile_workflow_cost.py --family W-... --compaction-dedupe-seconds 2
 python3 profile_workflow_cost.py --family W-... --no-compaction-audit
 ```
 
-The `--stage-roles` option keeps its name for compatibility but means **roles included in active-state analysis**.
+The `--stage-roles` option keeps its name but now requests a **separate filtered
+activity view** in `workflow_analysis.role_filtered_activity`. It does not filter
+the main active windows, concurrency, cycle-isolation checks or token totals.
 
 By default an active window ends at the observed end of the child session. An optional grace period can be added with:
 
@@ -881,17 +1062,20 @@ root work while validator active / validator work
 combined root stage work / combined direct child work
 ```
 
-Ratios are suppressed for overlapping cycles, for sequential cycles with another recognized child active, and for explicit chunk mismatches. They are observational concurrency ratios, not guaranteed avoidable overhead.
+Ratios are suppressed for overlapping or truncated cycles, for sequential cycles
+with another observed descendant active (including unknown roles), and for explicit
+chunk mismatches. They are observational concurrency ratios, not guaranteed
+avoidable overhead. v6 only computes these when a role pair is configured.
 
 ### Stable before/after comparison fields
 
 The report and JSON export include a **Comparison snapshot** with stable descriptive fields intended for comparing workflow versions, including:
 
 ```text
-orchestrator_api_eq_share
-orchestrator_requests
-orchestrator_median_input_tokens
-orchestrator_p90_input_tokens
+root_api_eq_share
+root_requests
+root_median_input_tokens
+root_p90_input_tokens
 large_context_small_output_api_eq_share
 root_with_2plus_children_api_eq_share
 recognized_child_agent_hours
@@ -913,8 +1097,8 @@ post_compaction_recovery_api_eq
 post_compaction_recovery_api_eq_share
 post_compaction_recovery_input_tokens
 post_compaction_recovery_requests
-orchestrator_compactions
-orchestrator_compactions_per_hour
+root_compactions
+root_compactions_per_hour
 repeated_post_compaction_read_events
 recovery_api_eq_delta_vs_same_session_baseline
 ```
@@ -933,24 +1117,26 @@ v4.2 trusts the **role-level target**. It still does not claim to know the speci
 
 ### Custom workflows
 
-The default active roles are:
-
-```text
-implementer
-validator
-planner
-```
-
-Override them with:
+All roles, including unknown roles, contribute to core accounting and trusted
+lifetime windows. The default recognition vocabulary is `coordinator`,
+`orchestrator`, `planner`, `implementer`, `validator`; this is only a labeling aid.
+To recognize other explicit role names and optionally study a role pair:
 
 ```bash
 python3 profile_workflow_cost.py \
   --family W-... \
   --roles manager coder reviewer \
-  --stage-roles coder reviewer
+  --stage-roles coder reviewer \
+  --cycle-roles coder reviewer \
+  --successor coder=reviewer
 ```
 
-The default successor relations used for lifecycle-overlap classification include:
+`--roles` replaces the vocabulary. Role names must match explicit metadata/labels;
+the profiler does not infer “coder” from arbitrary prompt text. Omit `--stage-roles`,
+`--cycle-roles` and `--successor` if you only want neutral session/tree accounting.
+
+Only `--workflow-profile staged` defaults to implementer → validator cycle analysis
+and these successor relations:
 
 ```text
 planner -> implementer
@@ -958,14 +1144,11 @@ implementer -> validator
 validator -> implementer
 ```
 
-Customize them with repeatable options:
-
-```bash
-python3 profile_workflow_cost.py \
-  --family W-... \
-  --successor coder=reviewer \
-  --successor reviewer=coder
-```
+Generic mode has no default successor map. Repeatable `--successor` options add or
+override relationships using configured role names. With a custom `--roles` list,
+either stay in generic mode or supply a compatible `--cycle-roles` pair to override
+the staged default. Observed role succession is not proof of repair, acceptance or
+unnecessary work. Per-unit attribution still requires explicit assignment evidence.
 
 #### Privacy and interpretation
 
@@ -1340,9 +1523,9 @@ python3 codex_quota_audit.py --version
 Experimental workflow helper versions in this package:
 
 ```text
-find_workflow_candidates.py      2.2
-extract_workflow_lifecycle.py   2.2.1
-profile_workflow_cost.py        5.1.1
+find_workflow_candidates.py      2.3
+extract_workflow_lifecycle.py    2.3
+profile_workflow_cost.py         6.0
 ```
 
 ---

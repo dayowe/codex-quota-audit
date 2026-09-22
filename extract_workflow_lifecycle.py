@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex workflow lifecycle extractor v2.2.1
+Codex workflow lifecycle extractor v2.3
 
 Companion to find_workflow_candidates.py.
 
@@ -50,7 +50,7 @@ except ImportError as exc:  # pragma: no cover - user-facing path
         "find_workflow_candidates.py"
     ) from exc
 
-__version__ = "2.2.1"
+__version__ = "2.3"
 
 ACTION_NAMES = {
     "spawn": ("spawn_agent", "spawn_subagent", "create_agent", "create_subagent"),
@@ -927,6 +927,21 @@ def duration_text(a: Optional[datetime], b: Optional[datetime]) -> str:
     return f"{seconds/86400:.1f}d"
 
 
+def resolve_session(selector: str, sessions: Dict[str, finder.Session]) -> Optional[str]:
+    """Resolve a hashed key or exact raw ID without exposing it in diagnostics."""
+    selector = selector.strip()
+    if selector in sessions:
+        return selector
+    ident = finder.fp(selector)
+    if ident is None:
+        return None
+    key = finder.short_key("S", ident)
+    if key in sessions:
+        return key
+    matches = [k for k, session in sessions.items() if ident in session.links.own_ids]
+    return matches[0] if len(matches) == 1 else None
+
+
 def resolve_family(selector: str, families: Sequence[finder.Family],
                    sessions: Dict[str, finder.Session]) -> Optional[finder.Family]:
     """Resolve a family key, hashed member key or exact raw session/thread ID.
@@ -1232,7 +1247,7 @@ def export_report_json(path: str, family: finder.Family, sessions: Dict[str, fin
 
     # Local import avoids a module cycle; both tools use the same parent rules.
     import workflow_attribution as attribution
-    identities = attribution.resolve(family, sessions, parsed, finder.DEFAULT_ROLES)
+    identities = attribution.resolve(family, sessions, parsed, args.roles)
     for key in sorted(family.members, key=lambda k: labels[k]):
         s = sessions[key]
         role = role_for_key(key, family, sessions)
@@ -1427,6 +1442,7 @@ new linked rollout files are added to ~/.codex.
         ap.error("--export-json currently requires exactly one --family selector")
 
     roles = tuple(dict.fromkeys(r.strip().lower() for r in args.roles if r.strip()))
+    args.roles = roles
     home = os.path.abspath(os.path.expanduser(args.home))
     paths = finder.file_paths(home)
 

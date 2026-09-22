@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Codex workflow cost profiler v5.1.1
+Codex workflow cost profiler v6.0
 
 Companion to find_workflow_candidates.py and extract_workflow_lifecycle.py.
 
 This profiler deliberately does NOT require exact SEND/WAIT session-recipient recovery.
-Instead it uses trusted spawn events plus strong session roles to build
-overlapping active-role windows, then measures where inference work accumulates.
+Instead it uses trusted spawn events to build observed descendant-lifetime
+windows, including unknown roles, then measures where inference accumulates.
+Generic mode assumes no workflow sequence. The staged profile or explicit role
+pairs enable optional sequence interpretation; neither changes core accounting.
 When SEND arguments contain an exact configured role label, that role-level target
 is treated as trusted even though the specific child session remains unknown.
 v4 adds restart-aware time windows and conservative chunk/assignment correlation.
@@ -71,13 +73,12 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "profile_workflow_cost.py must be in the same directory as "
-        "find_workflow_candidates.py, extract_workflow_lifecycle.py, and "
-        "codex_quota_audit.py"
+        "find_workflow_candidates.py, extract_workflow_lifecycle.py, "
+        "codex_quota_audit.py, and workflow_attribution.py"
     ) from exc
 
-__version__ = "5.1.1"
+__version__ = "6.0"
 
-DEFAULT_STAGE_ROLES = ("orchestrator", "implementer", "validator", "planner")
 DEFAULT_SUCCESSOR_MAP = {
     "planner": "implementer",
     "implementer": "validator",
@@ -1187,120 +1188,44 @@ def classify_sessions_for_window(family: finder.Family,
     return meta
 
 
-def _trusted_recognized_spawn_count(key: str,
-                                    family: finder.Family,
-                                    sessions: Dict[str, finder.Session],
-                                    parsed: Dict[str, lifecycle.ParsedSession],
-                                    stage_roles: set[str],
-                                    start: Optional[datetime],
-                                    end: Optional[datetime]) -> int:
-    n = 0
-    for action in parsed[key].actions:
-        if action.kind != "spawn" or not lifecycle.is_trusted_action(action) or not action.matched_session:
-            continue
-        if not in_time_window(action.ts, start, end):
-            continue
-        if action.matched_session not in sessions:
-            continue
-        role = lifecycle.role_for_session(sessions[action.matched_session])
-        if role in stage_roles:
-            n += 1
-    return n
-
-
-def select_analysis_orchestrator(family: finder.Family,
-                                 sessions: Dict[str, finder.Session],
-                                 parsed: Dict[str, lifecycle.ParsedSession],
-                                 stage_roles: set[str],
-                                 start: Optional[datetime],
-                                 end: Optional[datetime],
-                                 override: Optional[str]) -> Tuple[Optional[str], str, str, List[dict]]:
+def select_analysis_root(family: finder.Family,
+                         sessions: Dict[str, finder.Session],
+                         parsed: Dict[str, lifecycle.ParsedSession],
+                         start: Optional[datetime],
+                         end: Optional[datetime],
+                         override: Optional[str]) -> Tuple[Optional[str], str, str, List[dict]]:
     if override:
-        key = override.strip()
-        if key == "ROOT":
-            key = family.root
+        key = family.root if override == "ROOT" else lifecycle.resolve_session(override, sessions)
         if key not in family.members:
-            raise ValueError(f"--orchestrator {override!r} is not a member of {family.family_key}")
+            raise ValueError("--analysis-root must uniquely identify a member of the selected family")
         return key, "explicit-override", "high", []
     if start is None and end is None:
         return family.root, "family-root", "high", []
 
-    candidates = []
+    # Root selection is structural, not a role-name or busiest-agent contest.
+    # An idle parent can still own active descendants; recorded session age does
+    # not disqualify a resumed parent. Multiple active roots require an override.
+    members = set(family.members)
+    incoming = {e.child for e in family.edges if e.parent in members and e.child in members}
     for key in family.members:
-        sess = sessions[key]
-        window_times = parsed_activity_times(parsed[key], start, end)
-        strong_role = lifecycle.role_for_session(sess)
-        stage_spawns = _trusted_recognized_spawn_count(
-            key, family, sessions, parsed, stage_roles, start, end
-        )
-        trusted_spawns = sum(
-            1 for a in parsed[key].actions
-            if a.kind == "spawn" and lifecycle.is_trusted_action(a) and a.matched_session
-            and in_time_window(a.ts, start, end)
-        )
-        lifecycle_actions = sum(
-            1 for a in parsed[key].actions
-            if a.kind in {"spawn", "send", "wait", "resume", "close"}
-            and in_time_window(a.ts, start, end)
-        )
-        usage_requests = sum(1 for r in parsed[key].usage if in_time_window(r.ts, start, end))
-
-        # Crucial v4.1 change: do not require recorded session first_ts to be
-        # inside the window. Resumed/forked sessions can retain older history.
-        if not window_times and not stage_spawns and not trusted_spawns and not lifecycle_actions:
-            continue
-
-        score = 0.0
-        if strong_role in {"coordinator", "orchestrator"}:
-            score += 100.0
-        if sess.source_kind == "cli":
-            score += 20.0
-        if key == family.root:
-            score += 8.0
-        score += stage_spawns * 30.0
-        score += max(0, trusted_spawns - stage_spawns) * 8.0
-        score += min(lifecycle_actions, 120) * 0.15
-        score += min(usage_requests, 200) * 0.02
-        candidates.append({
-            "session_key": key,
-            "score": score,
-            "source_kind": sess.source_kind,
-            "strong_role": strong_role,
-            "trusted_stage_spawns": stage_spawns,
-            "trusted_spawns": trusted_spawns,
-            "lifecycle_actions": lifecycle_actions,
-            "usage_requests": usage_requests,
-            "recorded_start": sess.first_ts,
-            "first_window_activity": window_times[0] if window_times else None,
-            "last_window_activity": window_times[-1] if window_times else None,
-            "recorded_start_predates_window": bool(start is not None and sess.first_ts is not None and sess.first_ts < start),
-        })
-    coordinators = [r for r in candidates if r["strong_role"] == "coordinator"]
-    if len(coordinators) == 1:
-        return coordinators[0]["session_key"], "explicit-active-coordinator", "high", candidates
-    if len(coordinators) > 1:
-        return None, "ambiguous-active-coordinators", "low", candidates
-    candidates.sort(
-        key=lambda r: (r["score"], r["trusted_stage_spawns"], r["lifecycle_actions"], r["usage_requests"]),
-        reverse=True,
-    )
+        incoming.update(a.matched_session for a in parsed[key].actions
+                        if a.kind == "spawn" and lifecycle.is_trusted_action(a)
+                        and a.matched_session in members)
+    candidates = []
+    for key in sorted(members - incoming):
+        descendants = graph_descendants(family, key) | trusted_spawn_descendants(family, parsed, key)
+        activity = sorted(t for member in ({key} | descendants)
+                          for t in parsed_activity_times(parsed[member], start, end))
+        if activity:
+            candidates.append({"session_key": key, "first_window_activity": activity[0],
+                               "last_window_activity": activity[-1],
+                               "activity_events": len(activity)})
     if not candidates:
-        return None, "no-post-cutoff-activity-candidate", "none", candidates
-
-    top = candidates[0]
-    second_score = candidates[1]["score"] if len(candidates) > 1 else -1.0
-    gap = top["score"] - second_score
-    if top["strong_role"] in {"coordinator", "orchestrator"} and gap >= 2:
-        confidence = "high"
-    elif top["trusted_stage_spawns"] >= 2 and gap >= 8:
-        confidence = "high"
-    elif top["trusted_stage_spawns"] >= 1 and gap >= 4:
-        confidence = "medium"
-    elif top["session_key"] == family.root and top["source_kind"] == "cli" and top["lifecycle_actions"] >= 10 and gap >= 6:
-        confidence = "medium"
-    else:
-        return None, "ambiguous-post-cutoff-orchestrator", "low", candidates
-    return top["session_key"], "post-cutoff-observed-activity-score", confidence, candidates
+        return None, "no-structural-root-with-window-activity", "none", candidates
+    if len(candidates) != 1:
+        return None, "ambiguous-active-structural-roots", "low", candidates
+    confidence = "medium" if any(e.confidence != "high" for e in family.edges) else "high"
+    return candidates[0]["session_key"], "structural-root-with-window-activity", confidence, candidates
 
 def graph_descendants(family: finder.Family, root: str) -> set[str]:
     children: Dict[str, set[str]] = defaultdict(set)
@@ -1371,13 +1296,7 @@ def build_analysis_family(full_family: finder.Family,
         return spawned_in_window or has_window_activity(key)
 
     members = [analysis_root] + sorted(k for k in ancestry if k != analysis_root and eligible(k))
-    if len(members) <= 1:
-        members = [analysis_root] + sorted(
-            k for k in full_family.members if k != analysis_root and k in meta.in_window and eligible(k)
-        )
-        meta.membership_method = "window-activity-members-fallback"
-    else:
-        meta.membership_method = "selected-root-descendants-by-activity"
+    meta.membership_method = "selected-root-descendants-by-activity"
     members = list(dict.fromkeys(members))
     meta.analysis_root = analysis_root
     meta.excluded_in_window = [k for k in meta.in_window if k not in members]
@@ -1616,7 +1535,10 @@ def aggregate_requests(reqs: Iterable[lifecycle.UsageRequest],
 
 
 def token_summary(reqs, prices) -> dict:
-    t = aggregate_requests(reqs, prices)
+    return totals_dict(aggregate_requests(reqs, prices))
+
+
+def totals_dict(t: TokenTotals) -> dict:
     return {
         "requests": t.requests, "input_tokens": t.input_tokens,
         "cached_input_tokens": t.cached_input_tokens, "uncached_input_tokens": t.uncached_input_tokens,
@@ -1683,11 +1605,11 @@ def build_active_windows(family: finder.Family,
                          sessions: Dict[str, finder.Session],
                          parsed: Dict[str, lifecycle.ParsedSession],
                          labels: Dict[str, str],
-                         stage_roles: set[str],
+                         stage_roles: Optional[set[str]],
                          tail_seconds: float,
                          analysis_start: Optional[datetime] = None,
                          analysis_end: Optional[datetime] = None) -> Tuple[List[ActiveWindow], List[str]]:
-    """Build independent recognized-role activity windows from trusted spawns.
+    """Build observed descendant lifetime windows from trusted spawns.
 
     Unlike v1's spawn-defined stages, one spawn never truncates another active
     child. This preserves overlaps such as implementer + validator or multiple
@@ -1701,7 +1623,7 @@ def build_active_windows(family: finder.Family,
         key = action.matched_session
         assert key is not None
         role = lifecycle.role_for_key(key, family, sessions)
-        if role not in stage_roles:
+        if stage_roles is not None and role not in stage_roles:
             continue
         child = sessions[key]
         # Trusted spawn time is the effective activation boundary. A forked
@@ -1734,7 +1656,7 @@ def build_active_windows(family: finder.Family,
 
     role_children = [
         k for k in family.members
-        if k != family.root and lifecycle.role_for_key(k, family, sessions) in stage_roles
+        if k != family.root and (stage_roles is None or lifecycle.role_for_key(k, family, sessions) in stage_roles)
     ]
     excluded = [k for k in role_children if k not in recognized_targets]
     return windows, excluded
@@ -1911,10 +1833,10 @@ def pairwise_overlap_rows(windows: Sequence[ActiveWindow]) -> List[dict]:
     return rows
 
 
-def parse_successor_map(specs: Sequence[str], stage_roles: set[str]) -> Dict[str, str]:
+def parse_successor_map(specs: Sequence[str], stage_roles: set[str], profile: str = "generic") -> Dict[str, str]:
     mapping = {
         src: dst for src, dst in DEFAULT_SUCCESSOR_MAP.items()
-        if src in stage_roles and dst in stage_roles
+        if profile == "staged" and src in stage_roles and dst in stage_roles
     }
     for spec in specs:
         if "=" not in spec:
@@ -1928,7 +1850,7 @@ def parse_successor_map(specs: Sequence[str], stage_roles: set[str]) -> Dict[str
 
 def overlap_classification(old: ActiveWindow, new: ActiveWindow,
                            successor_map: Dict[str, str]) -> Optional[Tuple[str, str]]:
-    same_role = new.role == old.role
+    same_role = new.role == old.role and old.role != "unknown"
     successor = successor_map.get(old.role)
     successor_role = bool(successor and new.role == successor)
     if not same_role and not successor_role:
@@ -2061,13 +1983,16 @@ def build_cycles(family: finder.Family,
                  parsed: Dict[str, lifecycle.ParsedSession],
                  windows: Sequence[ActiveWindow],
                  prices: Dict[str, Tuple[float, float, float]],
-                 handoff_seconds: float) -> List[Cycle]:
-    """Build implementer -> validator cycles from trusted spawn order.
+                 handoff_seconds: float,
+                 cycle_roles: Optional[Tuple[str, str]] = None) -> List[Cycle]:
+    """Build explicitly configured role-pair cycles from trusted spawn order.
 
     Root supervision windows follow the observed lifetime of each child session,
     not the next spawn. Overlapping cycles remain visible but are excluded from
     clean supervision-ratio summaries.
     """
+    if cycle_roles is None:
+        return []
     cycles: List[Cycle] = []
     guardians = [k for k in family.members if lifecycle.role_for_key(k, family, sessions) == "guardian/auto-review"]
     all_keys = list(family.members)
@@ -2077,13 +2002,18 @@ def build_cycles(family: finder.Family,
     for i in range(len(ordered) - 1):
         imp = ordered[i]
         val = ordered[i + 1]
-        if imp.role != "implementer" or val.role != "validator":
+        if (imp.role, val.role) != cycle_roles:
             continue
         idx += 1
-        imp_end = sessions[imp.target_key].last_ts or imp.end
-        val_end = sessions[val.target_key].last_ts or val.end
+        imp_end, val_end = imp.end, val.end
         handoff = (val.start - imp_end).total_seconds()
-        if imp.chunk_key and val.chunk_key and imp.chunk_key != val.chunk_key:
+        truncated = any(w.start > w.spawn_ts or
+                        (sessions[w.target_key].last_ts is not None and
+                         w.end < sessions[w.target_key].last_ts)
+                        for w in (imp, val))
+        if truncated:
+            quality = "window-truncated"
+        elif imp.chunk_key and val.chunk_key and imp.chunk_key != val.chunk_key:
             quality = "chunk-mismatch"
         elif -2 <= handoff <= 2:
             quality = "tight-sequential"
@@ -2642,14 +2572,14 @@ def _cycle_supervision_summary(cycles: Sequence[Cycle]) -> dict:
             return a / b if b else None
         return {
             "cycles": len(rows),
-            "root_implementation_api_eq": root_impl,
-            "implementer_api_eq": child_impl,
-            "root_validation_api_eq": root_val,
-            "validator_api_eq": child_val,
+            "root_first_role_api_eq": root_impl,
+            "first_agent_api_eq": child_impl,
+            "root_second_role_api_eq": root_val,
+            "second_agent_api_eq": child_val,
             "combined_root_api_eq": root_impl + root_val,
             "combined_child_api_eq": child_impl + child_val,
-            "implementation_ratio_api_eq": ratio(root_impl, child_impl),
-            "validation_ratio_api_eq": ratio(root_val, child_val),
+            "first_role_ratio_api_eq": ratio(root_impl, child_impl),
+            "second_role_ratio_api_eq": ratio(root_val, child_val),
             "combined_supervision_ratio_api_eq": ratio(root_impl + root_val, child_impl + child_val),
             "combined_supervision_ratio_raw": ratio(root_raw, child_raw),
         }
@@ -2817,7 +2747,8 @@ def export_json(path: str, family: finder.Family,
                 chunks: Sequence[dict],
                 comparison: dict,
                 compaction: Optional[CompactionAudit],
-                nested: Optional[dict] = None) -> None:
+                nested: Optional[dict] = None,
+                workflow_analysis: Optional[dict] = None) -> None:
     def tt(t: TokenTotals) -> dict:
         return {
             "requests": t.requests,
@@ -2832,12 +2763,13 @@ def export_json(path: str, family: finder.Family,
 
     supervision = _cycle_supervision_summary(cycles)
     obj = {
-        "schema": "codex-workflow-cost-profile-v5.1",
+        "schema": "codex-workflow-cost-profile-v6.0",
         "version": __version__,
         "family": family.family_key,
         "privacy": "No prompts/responses/source code/tool output/raw IDs are included.",
         "api_eq_note": "Public API-list-price equivalent only; not subscription billing or OpenAI internal cost.",
         "root_role": lifecycle.role_for_session(sessions[family.root]),
+        "workflow_analysis": workflow_analysis,
         "nested_attribution": nested,
         "tool_activity": compaction.tool_activity if compaction is not None else None,
         "tool_activity_note": "Structural observed calls only. Opaque wrappers are not decoded by reading code strings. Counts are not waste or token-cost attribution; null means scanning was disabled.",
@@ -2931,7 +2863,7 @@ def export_json(path: str, family: finder.Family,
             "correlated_windows": sum(1 for w in windows if w.chunk_label),
             "correlated_chunks": len(chunks),
             "coverage": (sum(1 for w in windows if w.chunk_label) / len(windows)) if windows else None,
-            "method": "explicit structured spawn task labels only; weak timing is never used",
+            "method": "explicit structured spawn task labels or validated assignment map; weak timing is never used",
             "chunks": [
                 {
                     "chunk": r["chunk"],
@@ -2951,7 +2883,7 @@ def export_json(path: str, family: finder.Family,
             "unmatched_inference_pairings": role_target_unmatched,
             "note": "Role target is exact/trusted; nearby inference pairing is observational, not causal.",
         },
-        "cycle_supervision_summary": supervision,
+        "cycle_supervision_summary": supervision if cycles else None,
         "bursts": [
             {
                 "agent": b.agent_label,
@@ -2971,20 +2903,22 @@ def export_json(path: str, family: finder.Family,
             {
                 "index": c.index,
                 "quality": c.quality,
-                "implementer_agent": c.implementer_window.target_label,
-                "validator_agent": c.validator_window.target_label,
+                "first_agent": c.implementer_window.target_label,
+                "second_agent": c.validator_window.target_label,
+                "first_role": c.implementer_window.role,
+                "second_role": c.validator_window.role,
                 "start": c.implementer_window.start.isoformat(),
                 "end": c.validator_window.end.isoformat(),
                 "handoff_gap_seconds": c.handoff_gap_seconds,
-                "root_during_implementation": tt(c.root_implementer),
-                "root_during_validation": tt(c.root_validator),
-                "implementer_inference": tt(c.implementer_agent),
-                "validator_inference": tt(c.validator_agent),
+                "root_during_first_role": tt(c.root_implementer),
+                "root_during_second_role": tt(c.root_validator),
+                "first_agent_inference": tt(c.implementer_agent),
+                "second_agent_inference": tt(c.validator_agent),
                 "ratio_eligible": c.ratio_eligible,
                 "supervision_ratio_api_eq": c.supervision_ratio_api_eq if c.ratio_eligible and math.isfinite(c.supervision_ratio_api_eq) else None,
-                "implementation_supervision_ratio_api_eq": c.implementation_supervision_ratio_api_eq if c.ratio_eligible and math.isfinite(c.implementation_supervision_ratio_api_eq) else None,
-                "validation_supervision_ratio_api_eq": c.validation_supervision_ratio_api_eq if c.ratio_eligible and math.isfinite(c.validation_supervision_ratio_api_eq) else None,
-                "isolated_from_other_recognized_children": c.isolated,
+                "first_role_supervision_ratio_api_eq": c.implementation_supervision_ratio_api_eq if c.ratio_eligible and math.isfinite(c.implementation_supervision_ratio_api_eq) else None,
+                "second_role_supervision_ratio_api_eq": c.validation_supervision_ratio_api_eq if c.ratio_eligible and math.isfinite(c.validation_supervision_ratio_api_eq) else None,
+                "isolated_from_other_observed_descendants": c.isolated,
                 "other_active_roles": list(c.other_active_roles),
                 "other_active_agents": list(c.other_active_agents),
                 "guardian": tt(c.guardian),
@@ -3148,7 +3082,8 @@ def print_report(family: finder.Family,
                  chunks: Sequence[dict],
                  comparison: dict,
                  compaction: Optional[CompactionAudit],
-                 args: argparse.Namespace) -> None:
+                 args: argparse.Namespace,
+                 workflow_analysis: dict) -> None:
     all_total = TokenTotals()
     for t in role_totals.values():
         all_total.add_totals(t)
@@ -3156,7 +3091,7 @@ def print_report(family: finder.Family,
 
     trusted_spawns = trusted_spawn_actions(family, parsed)
     recognized_targets = {w.target_key for w in windows}
-    role_children = [k for k in family.members if k != family.root and lifecycle.role_for_key(k, family, sessions) in set(args.stage_roles)]
+    role_children = [k for k in family.members if k != family.root]
     excluded = [k for k in role_children if k not in recognized_targets]
 
     print(f"\nWorkflow cost profile {family.family_key}")
@@ -3175,11 +3110,7 @@ def print_report(family: finder.Family,
         print(f"analysis root: {family.root}  role={lifecycle.role_for_session(sessions[family.root])}  selection={analysis_meta.root_selection_method}/{analysis_meta.root_selection_confidence}")
         selected_evidence = next((r for r in analysis_meta.orchestrator_candidates if r.get("session_key") == family.root), None)
         if selected_evidence:
-            print("orchestrator selection evidence: "
-                  f"post-window usage={selected_evidence['usage_requests']}, "
-                  f"lifecycle actions={selected_evidence['lifecycle_actions']}, "
-                  f"trusted stage spawns={selected_evidence['trusted_stage_spawns']}, "
-                  f"recorded start predates cutoff={'yes' if selected_evidence['recorded_start_predates_window'] else 'no'}")
+            print(f"structural root/subtree activity events: {selected_evidence['activity_events']}")
         print(f"segment membership: {analysis_meta.membership_method}; primary sessions={len(family.members)}")
         print(f"window session audit: pre={len(analysis_meta.pre_window)}, carry-in={len(analysis_meta.carry_in)}, "
               f"in-window={len(analysis_meta.in_window)}, post={len(analysis_meta.post_window)}, carry-out={len(analysis_meta.carry_out)}")
@@ -3199,9 +3130,12 @@ def print_report(family: finder.Family,
         print(f"analysis span: {local_time(effective_first)} -> {local_time(effective_last)} "
               f"({fmt_duration((effective_last-effective_first).total_seconds())})")
     print(f"sessions: {len(family.members)}")
-    print(f"trusted spawns: {len(trusted_spawns)}; recognized active windows: {len(windows)}")
-    print(f"recognized role sessions excluded from active-state attribution: {len(excluded)}")
-    print("Active-state attribution uses trusted spawn + child lifetime; overlapping children remain overlapping.")
+    print(f"trusted spawns: {len(trusted_spawns)}; observed lifetime windows: {len(windows)}")
+    print(f"sessions without a trusted lifetime window: {len(excluded)} (usage remains included)")
+    print("Core activity covers all roles, including unknown roles, with a trusted spawn + observed lifetime.")
+    print("Windows represent observed descendant lifetimes, not continuous execution or just immediate children.")
+    print(f"Workflow interpretation: {args.workflow_profile}; optional role filter: {args.stage_roles or 'none'}")
+    print(f"Lifetime-window coverage: {workflow_analysis['lifetime_windows_status']}")
     print("Exact role-targeted SENDs use configured role strings, not guessed session recipients.")
     print("API$eq is a public API-list-price normalization ruler, not billing.\n")
 
@@ -3213,14 +3147,14 @@ def print_report(family: finder.Family,
     print_token_row("TOTAL", all_total, all_total.total_tokens, all_total.api_eq)
     print(f"price coverage by observed tokens: {fmt_pct(all_total.price_coverage)}")
 
-    print("\nOrchestrator cost by active child state")
+    print("\nRoot cost by observed descendant state")
     print("---------------------------------------")
     print("active state                      req      input   cached   uncached    output     API$eq   root raw%  root $eq%")
     for name, t in sorted(root_states.items(), key=lambda kv: (kv[1].api_eq, kv[1].total_tokens), reverse=True):
         print_token_row(name, t, root_total.total_tokens, root_total.api_eq, width=32)
     print("These states are mutually exclusive for each root inference request, so this table is additive.")
 
-    print("\nOrchestrator cost by concurrent child count")
+    print("\nRoot cost by overlapping descendant lifetimes")
     print("-------------------------------------------")
     print("children                         req      input   cached   uncached    output     API$eq   root $eq%")
     root_total_eq = sum(t.api_eq for t in root_child_counts.values())
@@ -3236,19 +3170,25 @@ def print_report(family: finder.Family,
     for bucket in ("2", "3+"):
         if bucket in root_child_counts:
             concurrent_root.add_totals(root_child_counts[bucket])
-    print(f"root work with 2+ recognized children active: {fmt_eq(concurrent_root.api_eq)} "
+    print(f"root work with 2+ observed descendants active: {fmt_eq(concurrent_root.api_eq)} "
           f"({fmt_pct(concurrent_root.api_eq / root_total_eq if root_total_eq else float('nan'))} of root API$eq)")
 
     print("\nConcurrency exposure")
     print("--------------------")
-    print(f"recognized child agent-minutes: {concurrency['agent_seconds']/60.0:.1f} "
+    print(f"observed descendant agent-minutes: {concurrency['agent_seconds']/60.0:.1f} "
           f"({concurrency['agent_seconds']/3600.0:.2f} agent-hours)")
-    print(f"wall time with >=1 recognized child: {concurrency['active_wall_seconds']/60.0:.1f}m")
-    print(f"wall time with >=2 recognized children: {concurrency['overlap_wall_seconds']/60.0:.1f}m")
+    print(f"wall time with >=1 observed descendant: {concurrency['active_wall_seconds']/60.0:.1f}m")
+    print(f"wall time with >=2 observed descendants: {concurrency['overlap_wall_seconds']/60.0:.1f}m")
     print(f"extra concurrency-hours beyond one child: {concurrency['extra_concurrency_seconds']/3600.0:.2f}h")
-    print(f"peak simultaneous recognized children: {concurrency['peak_concurrent_children']}")
+    print(f"peak simultaneous observed descendants: {concurrency['peak_concurrent_children']}")
+    filtered = workflow_analysis["role_filtered_activity"]
+    if filtered is not None:
+        print(f"Optional role-filtered view ({', '.join(filtered['roles'])}): "
+              f"{len(filtered['agents'])} observed agents; "
+              f"peak lifetime overlap={filtered['concurrency']['peak_concurrent_children']}. "
+              "Core totals and concurrency above are unfiltered.")
     if overlap_agents:
-        print("Agents with the most time overlapping another recognized child:")
+        print("Agents with the most time overlapping another observed descendant:")
         for r in overlap_agents[:min(args.agent_limit, 10)]:
             if r['overlap_seconds'] <= 0:
                 continue
@@ -3266,7 +3206,7 @@ def print_report(family: finder.Family,
     print("\nRecognized active windows")
     print("-------------------------")
     if not windows:
-        print("No trusted recognized-role active windows found.")
+        print("Unavailable: no trusted descendant lifetime windows; this does not prove no worker activity.")
     else:
         print("#   start                end                  role          agent chunk duration  overlaps  root API$eq  child API$eq")
         for w in windows[:args.stage_limit]:
@@ -3335,12 +3275,15 @@ def print_report(family: finder.Family,
         print(f"exact role-targeted SEND calls: {total_role_sends}; inference pairings missing: {role_target_unmatched}")
         print("Role target is trusted. Nearby inference pairing is heuristic and is not a causal cost claim.")
 
-    print("\nObserved implement -> validate cycles")
+    print("\nConfigured role-pair cycles")
     print("------------------------------------")
-    if not cycles:
-        print("No consecutive trusted implementer -> validator spawn transitions found.")
+    if not args.cycle_roles:
+        print("Unavailable: no role-pair interpretation configured; use --cycle-roles or --workflow-profile staged.")
+    elif not cycles:
+        print(f"Unavailable: no supported consecutive {args.cycle_roles[0]} -> {args.cycle_roles[1]} transitions found.")
     else:
-        print("#  impl  val   quality             handoff   other active agents        impl agent  root/impl  val agent  root/val  supervise x")
+        print(f"Roles: {args.cycle_roles[0]} -> {args.cycle_roles[1]}")
+        print("#  first second quality            handoff   other active agents        first agent root/first second agent root/second ratio")
         for c in cycles[:args.cycle_limit]:
             ratio = c.supervision_ratio_api_eq if c.ratio_eligible else float("nan")
             ratio_text = f"{ratio:.2f}x" if math.isfinite(ratio) else "-"
@@ -3361,17 +3304,17 @@ def print_report(family: finder.Family,
     print(f"sequential cycles observed: {supervision['sequential_cycles_observed']}; "
           f"isolated ratio-eligible cycles: {iso['cycles']}")
     if iso["cycles"]:
-        ir = iso["implementation_ratio_api_eq"]
-        vr = iso["validation_ratio_api_eq"]
+        ir = iso["first_role_ratio_api_eq"]
+        vr = iso["second_role_ratio_api_eq"]
         cr = iso["combined_supervision_ratio_api_eq"]
         rr = iso["combined_supervision_ratio_raw"]
-        print(f"isolated root/implementer API$eq:           {ir:.2f}x" if ir is not None else "isolated implementation ratio: -")
-        print(f"isolated root/validator API$eq:             {vr:.2f}x" if vr is not None else "isolated validation ratio: -")
+        print(f"isolated root/first-role API$eq:            {ir:.2f}x" if ir is not None else "isolated first-role ratio: -")
+        print(f"isolated root/second-role API$eq:           {vr:.2f}x" if vr is not None else "isolated second-role ratio: -")
         print(f"isolated combined root/direct-child API$eq: {cr:.2f}x" if cr is not None else "isolated combined ratio: -")
         print(f"isolated combined root/direct-child raw:    {rr:.2f}x" if rr is not None else "isolated combined raw ratio: -")
         print("These are observational concurrency measures, not guaranteed avoidable overhead.")
     else:
-        print("No overall supervision ratio is reported because no sequential cycle is isolated from other recognized children.")
+        print("No overall supervision ratio: no configured, complete sequential cycle is isolated from other observed descendants.")
     suppressed_overlap = sum(c.quality == "overlap" for c in cycles)
     suppressed_noniso = supervision['ratios_suppressed_for_nonisolated_cycles']
     if suppressed_overlap or suppressed_noniso:
@@ -3418,7 +3361,7 @@ def print_report(family: finder.Family,
     for role, t in sorted(large_by_role.items(), key=lambda kv: kv[1].api_eq, reverse=True):
         print(f"  {role:<26} req={t.requests:<4} input={fmt_tokens(t.input_tokens):>8} API$eq={fmt_eq(t.api_eq):>9}")
     if large_root_state:
-        print("  orchestrator subset by active child state:")
+        print("  root subset by observed descendant state:")
         for state, t in sorted(large_root_state.items(), key=lambda kv: kv[1].api_eq, reverse=True):
             print(f"    {state:<32} req={t.requests:<4} input={fmt_tokens(t.input_tokens):>8} API$eq={fmt_eq(t.api_eq):>9}")
 
@@ -3573,8 +3516,8 @@ def print_report(family: finder.Family,
         if bucket in root_child_counts:
             concurrent_root.add_totals(root_child_counts[bucket])
     if concurrent_root.requests:
-        signals.append((concurrent_root.api_eq, "root with 2+ recognized descendants active", concurrent_root))
-    for role in ("implementer", "validator"):
+        signals.append((concurrent_root.api_eq, "root with 2+ observed descendants active", concurrent_root))
+    for role in sorted({lifecycle.role_for_key(k, family, sessions) for k in family.members if k != family.root}):
         re = TokenTotals()
         for key in family.members:
             if lifecycle.role_for_key(key, family, sessions) != role:
@@ -3714,8 +3657,8 @@ def self_test() -> None:
                               "spawn_agent", "c4", matched_session="S-val",
                               match_method="tight-start-time", match_confidence="medium"),
     ]
-    selected, method, conf, candidates = select_analysis_orchestrator(
-        fam2, sessions2, parsed2, {"implementer", "validator"}, cutoff, None, None
+    selected, method, conf, candidates = select_analysis_root(
+        fam2, sessions2, parsed2, cutoff, None, None
     )
     assert selected == "S-newroot" and conf in {"high", "medium"}, (selected, method, conf, candidates)
 
@@ -3743,8 +3686,8 @@ def self_test() -> None:
     meta3 = classify_sessions_for_window(fam3, sessions3, parsed3, cutoff, None)
     assert "S-resumed" in meta3.carry_in
     assert "S-forked" in meta3.in_window and "S-forked" not in meta3.carry_in
-    selected3, method3, conf3, candidates3 = select_analysis_orchestrator(
-        fam3, sessions3, parsed3, {"implementer", "validator"}, cutoff, None, None
+    selected3, method3, conf3, candidates3 = select_analysis_root(
+        fam3, sessions3, parsed3, cutoff, None, None
     )
     assert selected3 == "S-resumed" and conf3 in {"high", "medium"}, (selected3, method3, conf3, candidates3)
     view3 = build_analysis_family(fam3, sessions3, parsed3, meta3, selected3)
@@ -3843,7 +3786,7 @@ def self_test() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Profile where token/API-equivalent work accumulates inside one Codex multi-agent workflow.",
+        description="Profile token/API-equivalent work in a Codex session or linked session family.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python3 profile_workflow_cost.py --family W-e7af89b98f
@@ -3855,10 +3798,10 @@ def main() -> int:
   python3 profile_workflow_cost.py --family W-e7af89b98f --successor implementer=validator
   python3 profile_workflow_cost.py --self-test
 
-Active-state attribution is based on trusted spawns, strong role labels, and the
-observed lifetime of each child session. Overlapping children remain overlapping.
-With --after/--before, the profiler selects a post-boundary analysis orchestrator
-and excludes carry-in sessions from primary totals unless explicitly selected.
+Core activity covers every role with trusted spawn/lifetime evidence, including
+unnamed workers. Role and assignment interpretation is optional. With date windows,
+the profiler selects a structural root with subtree activity, requiring an explicit
+--analysis-root if ambiguous. Non-root carry-ins remain separately reported.
 Exact configured role names in SEND routing fields are trusted at the role level,
 but unresolved SEND/WAIT calls are never assigned to a specific child session.
 """,
@@ -3868,10 +3811,14 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--home", default=os.path.expanduser("~/.codex"), help="Codex data directory")
     ap.add_argument("--after", metavar="ISO8601", help="analyze only the post-boundary segment; timezone offset is required")
     ap.add_argument("--before", metavar="ISO8601", help="optional exclusive end of analysis window; timezone offset is required")
-    ap.add_argument("--analysis-root", "--orchestrator", dest="orchestrator", metavar="S_ID", help="override the analysis root (coordinator or direct orchestrator) for a windowed family")
+    ap.add_argument("--analysis-root", "--orchestrator", dest="orchestrator", metavar="ID", help="override the analysis root with a hashed key or exact raw session ID")
+    ap.add_argument("--workflow-profile", choices=("generic", "staged"), default="generic",
+                    help="optional workflow interpretation; generic assumes no stage sequence (default)")
     ap.add_argument("--assignment-map", metavar="JSON", help="optional explicit workflow-assignment-map-v1 identities; no transcript parsing")
     ap.add_argument("--roles", nargs="+", default=list(finder.DEFAULT_ROLES), help="role labels to recognize")
-    ap.add_argument("--stage-roles", nargs="+", default=list(DEFAULT_STAGE_ROLES), help="roles included in active-state analysis")
+    ap.add_argument("--stage-roles", nargs="+", help="optional role-filtered activity view; never filters core usage or concurrency")
+    ap.add_argument("--cycle-roles", nargs=2, metavar=("FIRST", "SECOND"),
+                    help="explicit role pair for sequential-cycle interpretation; staged defaults to implementer validator")
     ap.add_argument("--tight-spawn-seconds", type=float, default=2.0, help="trusted unique spawn/start temporal window")
     ap.add_argument("--spawn-window-minutes", type=float, default=30.0, help="broad diagnostic spawn window")
     ap.add_argument("--active-tail-seconds", "--stage-tail-seconds", dest="active_tail_seconds", type=float, default=0.0,
@@ -3879,7 +3826,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--burst-gap-seconds", type=float, default=120.0, help="idle gap that starts a new inference burst")
     ap.add_argument("--cycle-handoff-seconds", type=float, default=300.0, help="max handoff gap labeled sequential")
     ap.add_argument("--successor", action="append", default=[], metavar="ROLE=ROLE",
-                    help="configured next-stage relation for lifecycle-overlap classification; repeatable (defaults include implementer=validator and validator=implementer)")
+                    help="next-stage relation for overlap interpretation; repeatable; staged supplies default relations")
     ap.add_argument("--action-inference-window-seconds", type=float, default=90.0,
                     help="window for observational pairing of role-targeted SENDs to nearby root inference")
     ap.add_argument("--large-context-input-tokens", type=int, default=200_000, help="large-context threshold")
@@ -3912,8 +3859,12 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
         ap.error("--family ID or --session SESSION_ID is required")
 
     roles = tuple(dict.fromkeys(r.strip().lower() for r in args.roles if r.strip()))
-    stage_roles = set(r.strip().lower() for r in args.stage_roles if r.strip())
-    args.stage_roles = sorted(stage_roles)
+    stage_roles = set(r.strip().lower() for r in args.stage_roles if r.strip()) if args.stage_roles else None
+    args.stage_roles = sorted(stage_roles) if stage_roles is not None else None
+    if args.cycle_roles:
+        args.cycle_roles = tuple(r.strip().lower() for r in args.cycle_roles)
+    elif args.workflow_profile == "staged":
+        args.cycle_roles = ("implementer", "validator")
     try:
         analysis_after = parse_aware_iso8601(args.after, "--after")
         analysis_before = parse_aware_iso8601(args.before, "--before")
@@ -3925,7 +3876,13 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             raise ValueError("--compaction-resource-lookback-minutes must be >= 0")
         if args.compaction_dedupe_seconds < 0 or args.compaction_direct_usage_seconds < 0:
             raise ValueError("compaction timing windows must be >= 0")
-        successor_map = parse_successor_map(args.successor, stage_roles)
+        successor_map = parse_successor_map(args.successor, set(roles), args.workflow_profile)
+        if stage_roles is not None and not stage_roles <= set(roles) | {"unknown", "guardian/auto-review"}:
+            raise ValueError("--stage-roles must be configured with --roles (or use unknown/guardian/auto-review)")
+        if args.cycle_roles and (len(set(args.cycle_roles)) != 2 or not set(args.cycle_roles) <= set(roles)):
+            raise ValueError("--cycle-roles requires two distinct configured roles; use --roles to recognize custom names")
+        if any(role not in roles for pair in successor_map.items() for role in pair):
+            raise ValueError("--successor roles must be configured with --roles")
     except ValueError as exc:
         ap.error(str(exc))
     home = os.path.abspath(os.path.expanduser(args.home))
@@ -3938,7 +3895,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     print("Source: ~/.codex" if home == os.path.abspath(os.path.expanduser("~/.codex")) else f"Source: {home}")
     print(f"Files: {len(paths):,}")
     print(f"Roles: {', '.join(roles)}")
-    print(f"Active roles: {', '.join(sorted(stage_roles))}")
+    print(f"Core activity: all roles; workflow interpretation: {args.workflow_profile}")
     print("Rebuilding privacy-safe family graph...\n")
 
     sessions: Dict[str, finder.Session] = {}
@@ -3985,8 +3942,8 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     parsed_full = parsed
     analysis_meta = classify_sessions_for_window(source_family, sessions, parsed_full, analysis_after, analysis_before)
     try:
-        analysis_root, selection_method, selection_confidence, candidates = select_analysis_orchestrator(
-            source_family, sessions, parsed_full, stage_roles,
+        analysis_root, selection_method, selection_confidence, candidates = select_analysis_root(
+            source_family, sessions, parsed_full,
             analysis_after, analysis_before, args.orchestrator,
         )
     except ValueError as exc:
@@ -3995,19 +3952,16 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     analysis_meta.root_selection_confidence = selection_confidence
     analysis_meta.orchestrator_candidates = candidates
     if analysis_root is None:
-        print("\nCould not identify a sufficiently unambiguous analysis orchestrator for this time window.", file=sys.stderr)
+        print("\nCould not identify an unambiguous structural analysis root with activity in this window.", file=sys.stderr)
         if candidates:
             print("Top post-boundary candidates (privacy-safe session IDs):", file=sys.stderr)
             for row in candidates[:5]:
                 print(
-                    f"  {row['session_key']} score={row['score']:.1f} "
-                    f"stage_spawns={row['trusted_stage_spawns']} actions={row['lifecycle_actions']} "
-                    f"usage={row['usage_requests']} "
-                    f"first_window={row['first_window_activity'].isoformat() if row['first_window_activity'] else '-'} "
-                    f"recorded_start_predates={row['recorded_start_predates_window']}",
+                    f"  {row['session_key']} activity_events={row['activity_events']} "
+                    f"first_window={row['first_window_activity'].isoformat()}",
                     file=sys.stderr,
                 )
-        print("Use --orchestrator S-... only after reviewing the candidate evidence.", file=sys.stderr)
+        print("Use --analysis-root ID only after reviewing the candidate evidence.", file=sys.stderr)
         return 3
 
     family = build_analysis_family(source_family, sessions, parsed_full, analysis_meta, analysis_root)
@@ -4035,8 +3989,8 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     nested = attribution.report(family, parsed, identities, labels, lambda rs: token_summary(rs, prices))
     nested["pre_activation_records_excluded"] = dict(excluded_replay)
 
-    windows, _ = build_active_windows(
-        family, sessions, parsed, labels, stage_roles, args.active_tail_seconds,
+    windows, excluded_windows = build_active_windows(
+        family, sessions, parsed, labels, None, args.active_tail_seconds,
         analysis_meta.analysis_start, analysis_meta.analysis_end,
     )
     apply_assignment_windows(windows, identities, source_family.family_key)
@@ -4056,7 +4010,29 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
         family, parsed, role_target_map, prices, args.action_inference_window_seconds
     )
     bursts = build_all_bursts(family, sessions, parsed, labels, args.burst_gap_seconds, prices)
-    cycles = build_cycles(family, sessions, parsed, windows, prices, args.cycle_handoff_seconds)
+    cycles = build_cycles(family, sessions, parsed, windows, prices, args.cycle_handoff_seconds, args.cycle_roles)
+    workflow_analysis = {
+        "profile": args.workflow_profile,
+        "activity_scope": "all descendants with trusted spawn/lifetime evidence, regardless of role",
+        "lifetime_note": "Observed lifetime overlap is not continuous execution, cost causation or duplicate work.",
+        "sessions_without_lifetime_windows": [labels[k] for k in excluded_windows],
+        "lifetime_windows_status": ("partial" if windows and excluded_windows else "available" if windows
+                                    else "unavailable" if excluded_windows else "no_observed_descendants"),
+        "cycle_roles": args.cycle_roles,
+        "cycles_status": "not_configured" if not args.cycle_roles else "available" if cycles else "unavailable",
+        "cycles_reason": ("No stage sequence assumed; configure --cycle-roles or the staged profile."
+                          if not args.cycle_roles else "Observed transitions, not proof of task completion or review."
+                          if cycles else "No supported consecutive transition for the configured role pair."),
+        "role_filtered_activity": None,
+    }
+    if stage_roles is not None:
+        selected_windows = [w for w in windows if w.role in stage_roles]
+        workflow_analysis["role_filtered_activity"] = {
+            "roles": sorted(stage_roles), "agents": sorted({w.target_label for w in selected_windows}),
+            "concurrency": concurrency_metrics(selected_windows, analysis_meta.analysis_start, analysis_meta.analysis_end),
+            "root_cost_by_concurrent_descendant_count": {
+                k: totals_dict(v) for k, v in root_child_count_costs(family, parsed, selected_windows, prices).items()},
+        }
     large_by_role, large_root_state = large_small_breakdown(
         family, sessions, parsed, windows, prices,
         args.large_context_input_tokens, args.small_output_tokens,
@@ -4094,7 +4070,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
         bursts, cycles, context_rows, large_by_role, large_root_state,
         root_child_counts, concurrency, overlap_agents, overlap_pairs, lingering, successor_map,
         role_target_counts, role_target_costs, role_target_unmatched, schema,
-        analysis_meta, chunks, comparison, compaction, args,
+        analysis_meta, chunks, comparison, compaction, args, workflow_analysis,
     )
     print_nested_report(nested)
     if compaction is not None:
@@ -4108,7 +4084,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             root_states, bursts, cycles, context_rows, large_by_role,
             large_root_state, root_child_counts, concurrency, overlap_agents,
             overlap_pairs, lingering, successor_map, role_target_counts, role_target_costs,
-            role_target_unmatched, schema, analysis_meta, chunks, comparison, compaction, nested,
+            role_target_unmatched, schema, analysis_meta, chunks, comparison, compaction, nested, workflow_analysis,
         )
         print(f"\nWrote privacy-safe workflow cost profile: {args.export_json}")
 
