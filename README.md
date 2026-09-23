@@ -56,10 +56,14 @@ the containing family; use `--analysis-root YOUR_SESSION_ID` as well to select o
 that session's observed subtree.
 
 Workflow analysis uses the Python standard library. Clone this repository, or keep
-these five modules together: `profile_workflow_cost.py`, `find_workflow_candidates.py`,
-`extract_workflow_lifecycle.py`, `workflow_attribution.py` and `codex_quota_audit.py`.
+these six modules together: `profile_workflow_cost.py`, `find_workflow_candidates.py`,
+`extract_workflow_lifecycle.py`, `workflow_attribution.py`, `workflow_pauses.py` and `codex_quota_audit.py`.
 They read local logs under `~/.codex`; `--home /path/to/codex-home` selects another
 log location. They make no network requests. The JSON export is optional.
+
+Long breaks can lower tokens/hour without improving the workflow. The profiler
+flags quiet intervals; [pause review](#quiet-intervals-and-confirmed-pauses) lets you
+confirm them once and reuse the decisions without rescanning logs during review.
 
 **API$eq is a comparison measure, not your subscription bill or quota consumption.**
 Raw tokens, cached input and price coverage remain visible. Reports cannot establish
@@ -440,7 +444,7 @@ python3 find_workflow_candidates.py --self-test
 
 ## Experimental workflow profiling helpers
 
-The repository also includes three read-only helper commands for investigating Codex sessions and agent workflows. These remain separate from the main quota audit while the workflow event schema is being validated against real rollout logs.
+The repository also includes three helper commands for investigating Codex sessions and agent workflows. Analysis never edits source logs; optional pause review saves local annotations. These helpers remain separate from the main quota audit while the workflow event schema is being validated against real rollout logs.
 
 ### 1. Find graph-linked workflow families
 
@@ -570,7 +574,89 @@ Reports retain hashed IDs. A session selector does not change the analysis root
 or isolate a subtree; existing root-selection and date-window rules still apply.
 The matching logs must be available under `--home` (default `~/.codex`).
 
-The workflow cost profiler is currently **v6.0**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
+The workflow cost profiler is currently **v6.1**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
+
+### Quiet intervals and confirmed pauses
+
+Normal profiling automatically flags intervals of at least **one hour without
+recorded model calls across the analyzed family/subtree**. It never prompts or
+automatically classifies silence as a pause. A quiet coordinator with busy workers
+does not qualify. Long tests, external waits and missing telemetry can also cause
+silence. Only gaps bounded by recorded calls are suggested, not leading/trailing
+silence at the report edges. Change the threshold with `--quiet-gap-minutes` if needed.
+
+The output keeps the full elapsed-time rate and shows a separate hypothetical rate
+excluding unclassified gaps. This is a sensitivity check, not an efficiency claim.
+To confirm whether a suggested interval was a deliberate pause, use the saved report:
+
+```bash
+python3 profile_workflow_cost.py --review-pauses workflow_cost_profile.json
+```
+
+This explicitly interactive command **does not rescan Codex logs or launch agents**.
+It requires a terminal; normal profiling remains suitable for unattended scripts.
+For each interval, choose:
+
+1. Confirm the displayed boundaries (approximate if inferred from calls).
+2. Confirm with edited, timezone-aware timestamps.
+3. Mark as ordinary elapsed time; do not suggest excluding it again.
+4. Remove the decision / leave unclassified.
+
+Enter keeps the current decision. At the end you can add a pause that was not
+suggested, such as a shorter break or a pause during which workers kept running.
+Edited timestamps must lie inside the saved report's window. Displayed times use
+your local timezone and show its UTC offset. Finish review to save; Ctrl-C/EOF
+cancels unsaved changes. Existing decisions can be edited or removed with the same
+command. Decisions outside the selected report window are retained.
+
+Decisions are stored locally under
+`$XDG_STATE_HOME/codex-quota-audit/pauses/`, defaulting to
+`~/.local/state/codex-quota-audit/pauses/`. Files contain a hashed analysis-root key,
+timestamps, classification and boundary provenance, with private file permissions.
+They are outside the repository, contain no conversation text, and are not uploaded.
+Use `--pause-store DIRECTORY` on both profiling and review to choose another store.
+Normal profiling only reads this store; missing stores are not created.
+
+Annotations follow the **stable selected session root**, even as its family grows;
+they do not follow temporary `G1` labels or a changing `W-...` family key. Profiling
+a different explicit subtree root uses separate decisions. Changed gap evidence
+can produce a new unclassified candidate; saved confirmed intervals still apply,
+and any newly observed usage within them is reported.
+
+Future profiles automatically show both measurements, for example:
+
+```text
+Elapsed: 46.20h; confirmed pauses: 8.59h; excluding pauses: 37.61h
+Raw tokens/elapsed hour:          17.27M
+Raw tokens/hour excluding pauses: 21.21M
+```
+
+All original token/request totals remain intact. If calls were recorded during a
+confirmed pause, their usage is shown separately and removed **along with the time**
+from the adjusted rate. Intervals are start-inclusive/end-exclusive; overlapping
+pauses count once and are clipped to the analysis window. Inferred gaps start just
+after the preceding call and end at the following call, preserving both bounding
+requests. If pauses cover the entire window, the adjusted rate is unavailable.
+
+“Excluding pauses” is **not active CPU time or productive time**. Calls are assigned
+by recorded timestamp, not execution duration; a long-running response may cross a
+pause boundary. Other report fields, including concurrency, compaction and existing
+comparison metrics, keep their original semantics and are not silently adjusted.
+Compare similarly defined time periods and keep workload differences visible.
+
+Review uses a v6.1+ export's compact timestamp/request/token timeline. Earlier exports
+lack the precision required for arbitrary boundary edits: regenerate them once with
+v6.1+ rather than guessing from burst totals. The source report stays unchanged.
+To also save a revised copy after review, choose a new output path:
+
+```bash
+python3 profile_workflow_cost.py --review-pauses workflow_cost_profile.json \
+  --export-json workflow_cost_profile_reviewed.json
+```
+
+The copy refreshes `pause_analysis` only, using the saved snapshot and current local
+decisions. Existing output files are not overwritten. Conflicting concurrent reviews
+fail explicitly rather than silently replacing another review's decisions.
 
 ### Getting useful results and identifiable roles
 
@@ -682,8 +768,11 @@ Custom role filters produce a separate view; they never hide unknown-role work
 from the core report. Structured assignment labels and optional assignment maps
 still enrich per-unit attribution, but are not required for session/subtree totals.
 
-The output schema is **`codex-workflow-cost-profile-v6.0`**. Compared with v5.1:
+The output schema is **`codex-workflow-cost-profile-v6.1`**. Compared with v5.1:
 
+- `pause_analysis` (v6.1) adds quiet-interval candidates, confirmed/rejected decisions,
+  a compact usage timeline for offline review, and separate elapsed/pause-adjusted
+  rates. It does not change the primary accounting or existing comparison fields.
 - `workflow_analysis` records the selected interpretation, lifetime coverage, cycle
   availability and optional role-filtered activity.
 - Cycle fields and supervision summaries use `first`/`second` roles instead of
@@ -861,12 +950,13 @@ Validate the helpers with:
 python3 find_workflow_candidates.py --self-test
 python3 extract_workflow_lifecycle.py --self-test
 python3 profile_workflow_cost.py --self-test
-python3 -m unittest -v test_workflow_attribution test_generic_workflow
+python3 -m unittest -v test_workflow_attribution test_generic_workflow test_workflow_pauses
 ```
 
 Synthetic tests cover solo/flat/nested workflows, unknown/custom roles, unchanged
 generic/staged accounting, incomplete linkage, independent cycle isolation,
-duplicate snapshots, pre-activation history, cutoff handling and privacy. Runtime
+duplicate snapshots, pre-activation history, cutoff handling, privacy, pause boundary
+accounting, overlapping pauses, offline review and persistent decisions. Runtime
 label/linkage emission still needs inspection on the logs being analyzed; these
 tests do not establish compatibility with every Codex version or workflow savings.
 
@@ -1525,7 +1615,7 @@ Experimental workflow helper versions in this package:
 ```text
 find_workflow_candidates.py      2.3
 extract_workflow_lifecycle.py    2.3
-profile_workflow_cost.py         6.0
+profile_workflow_cost.py         6.1
 ```
 
 ---

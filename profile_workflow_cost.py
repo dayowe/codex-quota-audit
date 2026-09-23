@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex workflow cost profiler v6.0
+Codex workflow cost profiler v6.1
 
 Companion to find_workflow_candidates.py and extract_workflow_lifecycle.py.
 
@@ -36,11 +36,12 @@ It is intended to answer optimization questions such as:
   SEND/WAIT targets in a future extractor version?
 
 Privacy properties:
-- read-only; no network requests
+- profiling is read-only; no network requests
 - never prints prompts, model responses, source code, tool stdout, or raw IDs
 - uses the same one-way-hashed W-/S-/Axx identifiers as the workflow helpers
 - action-schema audit prints only field paths, types, counts, and match counts
 - JSON export contains structural metadata and aggregate token counts only
+- optional pause review saves local annotations; it never edits source logs
 
 API-dollar values are public API-list-price equivalents used only as a
 normalization ruler. They are not subscription billing or OpenAI internal cost.
@@ -70,14 +71,15 @@ try:
     import extract_workflow_lifecycle as lifecycle
     import codex_quota_audit as audit
     import workflow_attribution as attribution
+    import workflow_pauses as pauses
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "profile_workflow_cost.py must be in the same directory as "
         "find_workflow_candidates.py, extract_workflow_lifecycle.py, "
-        "codex_quota_audit.py, and workflow_attribution.py"
+        "codex_quota_audit.py, workflow_attribution.py, and workflow_pauses.py"
     ) from exc
 
-__version__ = "6.0"
+__version__ = "6.1"
 
 DEFAULT_SUCCESSOR_MAP = {
     "planner": "implementer",
@@ -2748,7 +2750,8 @@ def export_json(path: str, family: finder.Family,
                 comparison: dict,
                 compaction: Optional[CompactionAudit],
                 nested: Optional[dict] = None,
-                workflow_analysis: Optional[dict] = None) -> None:
+                workflow_analysis: Optional[dict] = None,
+                pause_analysis: Optional[dict] = None) -> None:
     def tt(t: TokenTotals) -> dict:
         return {
             "requests": t.requests,
@@ -2763,13 +2766,14 @@ def export_json(path: str, family: finder.Family,
 
     supervision = _cycle_supervision_summary(cycles)
     obj = {
-        "schema": "codex-workflow-cost-profile-v6.0",
+        "schema": "codex-workflow-cost-profile-v6.1",
         "version": __version__,
         "family": family.family_key,
         "privacy": "No prompts/responses/source code/tool output/raw IDs are included.",
         "api_eq_note": "Public API-list-price equivalent only; not subscription billing or OpenAI internal cost.",
         "root_role": lifecycle.role_for_session(sessions[family.root]),
         "workflow_analysis": workflow_analysis,
+        "pause_analysis": pause_analysis,
         "nested_attribution": nested,
         "tool_activity": compaction.tool_activity if compaction is not None else None,
         "tool_activity_note": "Structural observed calls only. Opaque wrappers are not decoded by reading code strings. Counts are not waste or token-cost attribution; null means scanning was disabled.",
@@ -3848,6 +3852,12 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--no-compaction-audit", action="store_true", help="skip explicit compaction/recovery analysis")
     ap.add_argument("--no-action-schema-audit", action="store_true", help="skip the structural action schema audit")
     ap.add_argument("--export-json", metavar="PATH", help="write privacy-safe machine-readable profile")
+    ap.add_argument("--review-pauses", metavar="REPORT.json",
+                    help="interactively review pauses using a saved v6.1+ report; no log rescan")
+    ap.add_argument("--pause-store", metavar="DIRECTORY",
+                    help="local pause annotation directory (default: XDG state directory/codex-quota-audit/pauses)")
+    ap.add_argument("--quiet-gap-minutes", type=float, default=60,
+                    help="suggest call-free intervals at least this long, without classifying them as pauses (default: 60)")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
@@ -3855,6 +3865,16 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     if args.self_test:
         self_test()
         return 0
+    if args.review_pauses:
+        if args.family or args.after or args.before or args.orchestrator:
+            ap.error("--review-pauses uses the saved report's scope; do not combine it with session/window selection")
+        try:
+            return pauses.review_report(args.review_pauses, args.pause_store or pauses.default_store(), args.export_json)
+        except (OSError, ValueError) as exc:
+            ap.error(str(exc))
+        except (EOFError, KeyboardInterrupt):
+            print("\nPause review cancelled; unsaved decisions were not written.", file=sys.stderr)
+            return 130
     if not args.family:
         ap.error("--family ID or --session SESSION_ID is required")
 
@@ -3866,6 +3886,8 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     elif args.workflow_profile == "staged":
         args.cycle_roles = ("implementer", "validator")
     try:
+        if not math.isfinite(args.quiet_gap_minutes) or args.quiet_gap_minutes <= 0:
+            raise ValueError("--quiet-gap-minutes must be a positive finite number")
         analysis_after = parse_aware_iso8601(args.after, "--after")
         analysis_before = parse_aware_iso8601(args.before, "--before")
         if analysis_after is not None and analysis_before is not None and analysis_before <= analysis_after:
@@ -4065,6 +4087,16 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             analysis_meta.analysis_start, analysis_meta.analysis_end,
         )
 
+    try:
+        pause_entries, _ = pauses.load_annotations(args.pause_store or pauses.default_store(), family.root)
+        pause_evidence = pauses.make_evidence(
+            family.root, analysis_meta.analysis_start, analysis_meta.analysis_end,
+            (r for key in family.members for r in parsed[key].usage),
+        )
+        pause_analysis = pauses.analyze(pause_evidence, pause_entries, args.quiet_gap_minutes)
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
+
     print_report(
         family, sessions, parsed, labels, windows, role_totals, root_states,
         bursts, cycles, context_rows, large_by_role, large_root_state,
@@ -4084,9 +4116,10 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             root_states, bursts, cycles, context_rows, large_by_role,
             large_root_state, root_child_counts, concurrency, overlap_agents,
             overlap_pairs, lingering, successor_map, role_target_counts, role_target_costs,
-            role_target_unmatched, schema, analysis_meta, chunks, comparison, compaction, nested, workflow_analysis,
+            role_target_unmatched, schema, analysis_meta, chunks, comparison, compaction, nested, workflow_analysis, pause_analysis,
         )
         print(f"\nWrote privacy-safe workflow cost profile: {args.export_json}")
+    pauses.print_summary(pause_analysis, args.export_json, args.pause_store)
 
     print("\nInterpretation")
     print("--------------")
