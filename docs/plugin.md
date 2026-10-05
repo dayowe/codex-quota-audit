@@ -5,6 +5,8 @@ addition to the standalone Python package.
 
 ## Install
 
+Requires Python 3.10 or newer on the launcher path (`python3` on Linux/macOS, `python` on Windows), local Codex logs, and a Codex CLI with plugin support. See the [README](../README.md#get-started) for user setup and the [usage guide](usage.md) for standalone commands.
+
 ```bash
 codex plugin marketplace add dayowe/codex-quota-audit --ref main
 codex plugin add codex-quota-audit@dayowe
