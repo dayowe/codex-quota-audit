@@ -1,0 +1,38 @@
+{
+  "name": "codex-quota-audit",
+  "version": "0.8.0",
+  "description": "Analyze local Codex quota efficiency, Guardian overhead, banked resets, and multi-agent workflow usage in a privacy-safe local dashboard.",
+  "author": {
+    "name": "dayowe"
+  },
+  "keywords": [
+    "codex",
+    "quota",
+    "usage",
+    "tokens",
+    "guardian",
+    "banked reset",
+    "workflow",
+    "multi-agent",
+    "dashboard"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Quota Audit",
+    "shortDescription": "Understand what your Codex quota bought",
+    "longDescription": "Reads local Codex rollout telemetry and builds a self-contained dashboard for empirical quota efficiency, policy regimes, Guardian / Approve-for-me overhead, user-confirmed banked resets, and optional multi-agent workflow profiling. Analysis and report generation stay local; the plugin has no remote service, analytics, or telemetry.",
+    "developerName": "dayowe",
+    "category": "Engineering",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Build my Codex quota dashboard",
+      "Analyze Guardian and my banked resets",
+      "Profile my latest multi-agent workflow"
+    ],
+    "brandColor": "#7DA2C8",
+    "screenshots": []
+  }
+}

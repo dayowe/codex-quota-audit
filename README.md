@@ -2,7 +2,7 @@
 
 **How much Codex work does your quota actually buy?**
 
-`codex_quota_audit.py` analyzes your local Codex session logs to measure quota efficiency across models, reasoning-effort levels, and time.
+`Codex Quota Audit` analyzes your local Codex session logs to measure quota efficiency across models, reasoning-effort levels, and time. The preferred interfaces are the Codex plugin and the `cqa` CLI. Historical direct-script wrappers are kept under `compat/` for maintainers, but application code lives in `src/cqa`.
 
 It can help answer questions such as:
 
@@ -15,31 +15,200 @@ It can help answer questions such as:
 - Are replayed rollout histories or stale quota readings distorting a simple tokens-per-percent calculation?
 - Where inside a multi-agent workflow are orchestration, implementation, validation, context rereads, and re-entry consuming the most work?
 
-The script reads local Codex JSONL telemetry under `~/.codex`, reconstructs effective quota accounting periods, filters replayed history, and relates observed token usage to the Codex rate-limit meter.
+The analyzers read local Codex JSONL telemetry under `~/.codex`, reconstruct effective quota accounting periods, filter replayed history, and relate observed token usage to the Codex rate-limit meter.
 
 **Nothing leaves your machine.**
 
 > [!IMPORTANT]
 > This is an empirical analysis of local telemetry. It is not documentation of OpenAI's internal quota formula, billing system, or compute costs.
 
+## Demo
+
+Explore a real workflow report covering **September 29–October 3, 2026**: model performance, response timing, work by role, agent timelines, and context compactions.
+
+[![Model-performance comparisons beside the workflow timeline showing agents, compactions, concurrency, and pauses](docs/assets/workflow-report.png)](https://dayowe.github.io/codex-quota-audit/)
+
+[**Open the interactive demo →**](https://dayowe.github.io/codex-quota-audit/)
+
+---
+
+## Codex plugin
+
+The repository now includes a self-contained Codex plugin with two skills: `quota-audit` and `workflow-profile`. Install the repository marketplace and then the plugin:
+
+```bash
+codex plugin marketplace add dayowe/codex-quota-audit --ref main
+codex plugin add codex-quota-audit@dayowe
+```
+
+Start a new Codex thread after installation. You can then ask naturally for things such as **“Build my Codex quota dashboard”**, **“Analyze Guardian and these banked reset timestamps”**, or **“Profile my latest multi-agent workflow.”** The plugin delegates to the same local analyzers documented below; it has no remote service and keeps the standard dashboard/report local. See [`docs/plugin.md`](docs/plugin.md) for packaging, privacy, and development details.
+
 ---
 
 ## Quick start
 
-For quota analysis:
+### Recommended: Codex plugin
+
+For Codex users, the plugin is the primary installation experience and is deliberately **one step after marketplace registration**: no separate Python package installation is required.
 
 ```bash
-python3 codex_quota_audit.py --charts
+codex plugin marketplace add dayowe/codex-quota-audit --ref main
+codex plugin add codex-quota-audit@dayowe
+```
+
+Start a new Codex thread and ask **“Build my Codex quota dashboard”** or **“Profile my latest multi-agent workflow.”** For the latter, the plugin uses a strict selector: it requires delegated non-Guardian worker usage, excludes the currently running Codex session when Codex exposes its thread/session ID, and archives the workflow report in the local CQA report library under `~/.codex/codex-quota-audit/`, while maintaining `latest/workflow.html`. It does not silently fall back to the dashboard session, Guardian-only activity, or a standalone session.
+
+### Standalone CLI from a checkout
+
+For terminal use, the repository is also a normal Python package:
+
+```bash
+python3 -m pip install .
+cqa dashboard
+```
+
+PyPI publication is intentionally deferred; installing from a checkout is the supported standalone-package path for now.
+
+`cqa dashboard` archives a self-contained dark-theme dashboard in `~/.codex/codex-quota-audit/reports/`, updates `latest/quota.html`, and opens the archived report in your default browser. Use `--no-open` for headless/agent runs:
+
+```bash
+cqa dashboard --no-open
+```
+
+To include the most recent inspectable workflow automatically:
+
+```bash
+cqa dashboard --workflow latest
+```
+
+The standalone `cqa dashboard --workflow latest` selector remains broad: it prefers linked multi-session workflows with observed usage and can fall back to a standalone session when no linked workflow is available. Use `--workflow-multi-agent-only` when you want the same strict semantics as the plugin. To keep the machine-readable contract too:
+
+```bash
+cqa dashboard --workflow latest --report-json
+```
+
+Useful commands are:
+
+```bash
+cqa audit --history
+cqa workflow candidates
+cqa workflow profile latest
+cqa workflow profile latest --multi-agent-only
+cqa reports
+cqa reports list
+cqa report validate ~/.codex/codex-quota-audit/latest/quota.json
+cqa research throughput-compare latest
+```
+
+From a source checkout, install with `python3 -m pip install .` and use `cqa`. Historical direct-script wrappers are isolated under `compat/` and are not part of the primary interface.
+
+### Development / release gate
+
+The project intentionally does not require a hosted CI pipeline at this stage. Before a release candidate, run the deterministic local gate:
+
+```bash
+python3 tools/release_check.py
+```
+
+It covers the complete test suite, analyzer self-tests, plugin launchers, privacy canaries, compile checks, and an offline wheel build/import smoke. Each subprocess stage is time-bounded and reports elapsed time; failures include captured diagnostics instead of silently hanging. See [`docs/development/releasing.md`](docs/development/releasing.md) and [`docs/privacy.md`](docs/privacy.md).
+
+Long workflow profiles also show concise progress by default (scan/parse counts plus analysis/render stages). Use `--quiet` for script-friendly final-path-only output, or `--show-analysis-output` when the underlying profiler's detailed diagnostics are useful. Progress never invents percentages or ETAs.
+
+### Direct analyzer CLI
+
+The underlying quota analyzer is available through the unified CLI:
+
+```bash
+cqa audit --dashboard
+```
+
+This writes the same self-contained report format to:
+
+```text
+~/.codex/codex-quota-audit/report.html
+```
+
+The dashboard has no CDN, analytics, remote fonts, or network dependencies. Its embedded data is the privacy-safe `cqa-report-v1` contract; the browser only renders already-computed results.
+
+To keep the machine-readable contract as well:
+
+```bash
+cqa audit \
+  --report-json cqa-report.json \
+  --dashboard
+```
+
+For the traditional quota analysis and publication charts:
+
+```bash
+cqa audit --charts
 ```
 
 This prints the highest-value findings and creates publication-ready PNG/SVG charts.
+
+### Include workflow-profiler evidence
+
+The workflow profiler can now render the same dashboard contract directly:
+
+```bash
+python3 -m cqa.workflow.profile \
+  --family W-YOUR_WORKFLOW \
+  --dashboard \
+  --report-json workflow-report.json
+```
+
+`python3 -m cqa.workflow.profile --export-json` remains the detailed, privacy-safe profiler format for advanced/debug use. `--report-json` is the normalized `cqa-report-v1` presentation contract.
+
+To combine quota and workflow analysis in one dashboard, first produce the detailed workflow profile, then attach it to the quota report:
+
+```bash
+python3 -m cqa.workflow.profile \
+  --family W-YOUR_WORKFLOW \
+  --export-json workflow_cost_profile.json
+
+cqa audit \
+  --dashboard \
+  --workflow-profile-json workflow_cost_profile.json
+```
+
+`--workflow-profile-json` is repeatable. Combined reports expose a workflow selector in the dashboard. Workflow identifiers are remapped to report-local IDs (`workflow-...`, `agent-...`, `agent-window-...`, `compaction-...`, `handoff-...`) before they enter the shared dashboard contract.
+
+### Dashboard history and workflow timeline
+
+The dashboard includes a first-class **History & regimes** view. Detected model-specific policy-regime windows share one time axis; selecting a regime filters the quota-efficiency cohort view without changing the report or recomputing analysis.
+
+Workflow profiles include a layered timeline built entirely from `cqa-report-v1`. Layers can independently show trusted agent lifetimes, Guardian activity bursts, compactions, 2+ child concurrency, reviewed quiet/pause intervals, and profiler handoffs. Compactions and handoffs are point events: their horizontal position is meaningful, but marker width is not duration. Guardian activity, trusted agent lifetimes, concurrency, and pause bands are elapsed-time intervals; very short intervals receive a minimum visible width. Guardian burst width represents first-to-last-request elapsed time, not continuous model inference. Timeline elements support keyboard activation and open evidence drawers. The drawer traps keyboard focus while open, and the dashboard honors reduced-motion preferences.
+
+### Workflow model performance and pace
+
+Workflow reports separate **Model performance**, **Response timing**, **Work by role / Workflow pace**, and **Agent activity**. The dashboard keeps established performance terminology visible and explains it in place: **Tool-excluded output rate** is the primary response-efficiency measure, **Visible generation rate** is the complementary exact-attribution decoder-speed measure, **TTFT** means Time to First Token, **P50** is the median, and **P90** is the 90th percentile. Table headers and timing cards pair the canonical terms with short descriptions such as “median first-token delay,” while one-click metric guides provide the exact denominators and evidence rules. The model drawer keeps percentage denominators explicit and shows response time in two stages: total task time → external tool/wait vs retained response time, then retained response time → timed reasoning, visible generation, and other retained time.
+
+The underlying primary metric is unchanged: response-level non-reasoning model output divided by observed task time after exactly paired external tool/wait spans are removed. Reasoning, TTFT/request latency, model-resume latency, visible generation, and model-generated tool-call output remain charged to the model. Evidence remains Exact / Partial / Unavailable and model/effort rows remain observational rather than controlled benchmark rankings.
+
+Visible generation remains response-scoped and unchanged: CQA pairs timed visible `AgentMessage` item(s) with response-level token usage, sums multiple visible-message durations, excludes mixed visible+tool-call responses, and never lets `function_call_output` / `custom_tool_call_output` contaminate the following response. Low-coverage cohorts are flagged; defensible small-sample rates stay numeric with evidence labels, while truly unavailable evidence remains unavailable rather than becoming zero. Review/Guardian rows stay visually separated because their workload shape is not a controlled like-for-like benchmark.
+
+TTFT remains a distinct responsiveness diagnostic even though it contributes to tool-excluded task time. Current rollout telemetry records one TTFT per Codex task/turn (turn start → first model token); it does not provide TTFT for every later model response inside a tool-heavy turn. End-to-end task duration remains lifecycle context rather than server-internal inference time.
+
+The separate **Workflow pace** view retains observed turn cadence by **role**, **model**, and privacy-safe **agent**, together with tokens/turn, active-interval token-work rate, and **Model output per minute**. The elapsed-output rate is response-level model output attributed to the group divided by the full workflow analysis-window wall time; its denominator intentionally includes tools, orchestration, waits, subagents and scheduling, so it is not generation speed. Root/child position is shown separately from semantic role in report/dashboard presentation. One turn is one deduplicated Codex usage sample. Cadence uses adjacent turns inside the configured `--burst-gap-seconds` threshold and can include tool execution, orchestration and waiting, so it must not be interpreted as model inference latency or decoding speed.
+
+Model-performance aggregates are weighted from total qualified output tokens and total qualified generation time; latency uses distributions rather than arithmetic means. Every timing metric carries sample/coverage information. See [`docs/workflow-profiler.md`](docs/workflow-profiler.md) for the exact definitions and caveats.
+
+### Research: compare generation throughput semantics
+
+For methodology work, `cqa research throughput-compare ID` compares three deliberately different timing semantics over the same local Codex logs: production CQA **visible-generation tok/s**, a separately labelled **Tokscale-style** accounting-interval reconstruction, and research-only **tool-excluded response throughput**. The last metric keeps reasoning/TTFT/model-side elapsed time in the denominator while subtracting exactly paired model tool-call → tool-result spans, so external tool execution/waiting does not dilute the model-side rate. The research artifact emits only report-local session references and does **not** alter the dashboard or `cqa-report-v1.0`. By default it writes privacy-safe JSON and CSV under `~/.codex/codex-quota-audit/research/`.
+
+To validate the Tokscale reconstruction against upstream Tokscale on the **exact same selected rollout population**, add `--stage-tokscale-home PATH`. CQA creates a local-only Codex home containing only those raw rollout files, then prints the upstream command using `CODEX_HOME=PATH`. The staging directory is deliberately **not** privacy-safe: it contains raw Codex rollout content/filenames and must not be uploaded or shared. See [`docs/research/throughput.md`](docs/research/throughput.md) for formulas, staging behavior, privacy guarantees, upstream references, and interpretation limits.
+
+### Local report library
+
+Normal `cqa` runs no longer overwrite one fixed HTML file. Reports are archived locally under `~/.codex/codex-quota-audit/reports/`, while stable copies under `latest/` make automation predictable. Run `cqa reports` to open the local browser library or `cqa reports list` for a terminal list. Workflow filenames use the analyzed workflow start date plus a short privacy-safe workflow reference; `--name "Big frontend migration"` can add an optional recognition label at creation time. No rename subsystem or raw Codex session IDs are used in shareable filenames.
 
 ### Profile a session or agent workflow
 
 For workflow costs, start with any session ID from the run you want to inspect:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --session YOUR_SESSION_ID \
   --export-json workflow_cost_profile.json
 ```
@@ -50,16 +219,18 @@ required. The default **generic** profile reports observed usage, context growth
 compactions and linked parent/worker activity without assuming a plan → implement
 → validate sequence. Missing linkage or roles are reported as limitations.
 
-If you do not know the session ID, run `python3 find_workflow_candidates.py` and
+If you do not know the session ID, run `cqa workflow candidates` and
 choose a reported `W-...` family or `S-...` session key. A session selector resolves
 the containing family; use `--analysis-root YOUR_SESSION_ID` as well to select only
 that session's observed subtree.
 
-Workflow analysis uses the Python standard library. Clone this repository, or keep
-these six modules together: `profile_workflow_cost.py`, `find_workflow_candidates.py`,
-`extract_workflow_lifecycle.py`, `workflow_attribution.py`, `workflow_pauses.py` and `codex_quota_audit.py`.
-They read local logs under `~/.codex`; `--home /path/to/codex-home` selects another
-log location. They make no network requests. The JSON export is optional.
+Workflow analysis uses the Python standard library. The canonical implementation is the
+`cqa` package under `src/cqa/`. `pyproject.toml` installs that package for standalone use.
+The Codex plugin keeps a generated, release-checked runtime mirror under
+`plugins/codex-quota-audit/runtime/cqa/` so plugin installs remain self-contained without
+creating a second independently editable implementation.
+It reads local logs under `~/.codex`; `--home /path/to/codex-home` selects another log
+location. It makes no network requests. JSON/HTML output is optional.
 
 Long breaks can lower tokens/hour without improving the workflow. The profiler
 flags quiet intervals; [pause review](#quiet-intervals-and-confirmed-pauses) lets you
@@ -85,7 +256,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install matplotlib
 
-python3 codex_quota_audit.py --charts
+cqa audit --charts
 ```
 
 On Windows PowerShell:
@@ -95,14 +266,47 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install matplotlib
 
-python codex_quota_audit.py --charts
+cqa audit --charts
 ```
 
 If you do not want to install `matplotlib`, run:
 
 ```bash
-python3 codex_quota_audit.py
+cqa audit
 ```
+
+---
+
+## Report architecture
+
+The dashboard is intentionally a renderer, not another analytics implementation:
+
+```text
+                         cqa CLI
+                  thin user-facing orchestrator
+                         |
+local Codex telemetry    |
+        |                |
+        +-- cqa.quota.audit -----------+
+        |                              |
+        +-- cqa.workflow.profile ------+
+                                       |
+                                       v
+                                cqa-report-v1
+                                       |
+                         +-------------+-------------+
+                         |             |             |
+                        JSON          HTML       future clients
+
+Canonical source: src/cqa/
+Plugin runtime:   plugins/codex-quota-audit/runtime/cqa/ (generated mirror)
+```
+
+Statistical inference, quota reconstruction, Guardian estimation, banked-reset matching, workflow attribution, compaction analysis, and concurrency analysis remain in Python. The report layer normalizes their already-computed results, applies privacy-safe report-local identifiers, and feeds the renderer.
+
+The contract is documented in [`docs/cqa-report-v1.md`](docs/cqa-report-v1.md) and machine-validated by [`schema/cqa-report-v1.schema.json`](schema/cqa-report-v1.schema.json).
+
+Development status is tracked in [`ROADMAP.md`](ROADMAP.md). A fresh coding/agent session should read [`docs/development/handoff.md`](docs/development/handoff.md) before changing the project.
 
 ---
 
@@ -138,7 +342,7 @@ The script detects model-specific **policy regimes** so historical changes are n
 Use:
 
 ```bash
-python3 codex_quota_audit.py --history
+cqa audit --history
 ```
 
 to add:
@@ -163,7 +367,7 @@ It can report:
 - extra Guardian inference tokens
 - cached vs uncached input
 - Guardian share of local approval context
-- public GPT-5.4 rate-card-equivalent work
+- date-aware public ChatGPT Work/Codex rate-card-equivalent work
 - estimated quota overhead per 7-day reset period
 - median and high-end approval overhead
 
@@ -188,7 +392,7 @@ The script can test the claim that a **banked reset visually restores the meter 
 Provide timestamps for resets you personally triggered:
 
 ```bash
-python3 codex_quota_audit.py --charts \
+cqa audit --charts \
   --banked-reset 2026-09-05T23:11 \
   --banked-reset 2026-09-10T08:23 \
   --banked-reset 2026-09-13T15:03
@@ -224,7 +428,7 @@ The comparison periods are **not assumed to be normal/scheduled resets**. They a
 
 #### Equal-quota before/after boundary slices
 
-Version 2.15 also directly tests the immediate before/after behavior around each confirmed banked reset.
+Version 2.16 also directly tests the immediate before/after behavior around each confirmed banked reset.
 
 For each reset it compares:
 
@@ -263,7 +467,7 @@ A result that starts low and rises toward `1.00x` could instead suggest a tempor
 To reproduce only a 14-point test:
 
 ```bash
-python3 codex_quota_audit.py --charts \
+cqa audit --charts \
   --banked-reset 2026-09-10T08:23 \
   --banked-slice-points 14
 ```
@@ -280,7 +484,7 @@ python3 codex_quota_audit.py --charts \
 Running:
 
 ```bash
-python3 codex_quota_audit.py --charts
+cqa audit --charts
 ```
 
 can generate:
@@ -312,16 +516,16 @@ The default chart theme is a restrained light report style intended for GitHub/R
 Use dark mode with:
 
 ```bash
-python3 codex_quota_audit.py --charts --chart-theme dark
+cqa audit --charts --chart-theme dark
 ```
 
 If you commit generated images to the repo, you can embed them in this README:
 
 ```markdown
-![Quota value by model and effort](quota_value_by_model_effort.png)
-![Approve-for-me cost by reset period](guardian_quota_by_period.png)
-![Banked-reset effective-capacity audit](banked_reset_capacity.png)
-![Banked-reset boundary-slice audit](banked_reset_boundary_slices.png)
+![Quota value by model and effort](docs/assets/quota_value_by_model_effort.png)
+![Approve-for-me cost by reset period](docs/assets/guardian_quota_by_period.png)
+![Banked-reset effective-capacity audit](docs/assets/banked_reset_capacity.png)
+![Banked-reset boundary-slice audit](docs/assets/banked_reset_boundary_slices.png)
 ```
 
 ---
@@ -331,31 +535,31 @@ If you commit generated images to the repo, you can embed them in this README:
 ### Most users
 
 ```bash
-python3 codex_quota_audit.py --charts
+cqa audit --charts
 ```
 
 ### Text-only analysis
 
 ```bash
-python3 codex_quota_audit.py
+cqa audit
 ```
 
 ### Historical trends and policy regimes
 
 ```bash
-python3 codex_quota_audit.py --history
+cqa audit --history
 ```
 
 or with charts:
 
 ```bash
-python3 codex_quota_audit.py --charts --history
+cqa audit --charts --history
 ```
 
 ### Detailed forensic diagnostics
 
 ```bash
-python3 codex_quota_audit.py --diagnostics
+cqa audit --diagnostics
 ```
 
 This adds detailed reset/replay/telemetry and Guardian diagnostics.
@@ -365,51 +569,75 @@ This adds detailed reset/replay/telemetry and Guardian diagnostics.
 ### Experimental token-weight analysis
 
 ```bash
-python3 codex_quota_audit.py --weight-details
+cqa audit --weight-details
 ```
 
 This shows the identifiability-aware cached/uncached/output token-weight fits.
 
-### Publication-ready report and machine-readable summary
+### Local HTML dashboard and `cqa-report-v1`
+
+Generate the privacy-safe structured report contract without creating chart files:
 
 ```bash
-python3 codex_quota_audit.py --charts \
+cqa audit --report-json cqa-report.json
+```
+
+Generate a self-contained dark-theme HTML dashboard:
+
+```bash
+cqa audit --dashboard
+```
+
+With no path, `--dashboard` writes `~/.codex/codex-quota-audit/report.html`. You can choose another path:
+
+```bash
+cqa audit --dashboard ./codex-quota-dashboard.html
+```
+
+The dashboard is rendered from `cqa-report-v1`, not from CSV or SVG output. The report builder consumes the already-computed quota, Guardian, policy-regime, and banked-reset analysis objects; the browser only formats, filters, selects, and draws. The HTML is self-contained and has no CDN, remote font, analytics, or network dependency.
+
+`cqa-report-v1` uses the `dashboard-safe-v1` privacy profile: it excludes prompts, responses, tool output, file contents, auth/account identity, source paths, and raw session IDs. See `docs/cqa-report-v1.md` and `schema/cqa-report-v1.schema.json`.
+
+### Publication-ready report and legacy machine-readable summary
+
+```bash
+cqa audit --charts \
   --report codex_quota_report.md \
   --summary-json codex_quota_summary.json
 ```
 
-The generated report and summary contain aggregate results rather than prompts or model responses.
+The existing Markdown report and `codex-quota-audit-summary-v2` export remain unchanged for backwards compatibility.
 
 ### Show all options
 
 ```bash
-python3 codex_quota_audit.py --help
+cqa audit --help
 ```
 
 ### Run synthetic self-tests
 
 ```bash
-python3 codex_quota_audit.py --self-test
+cqa audit --self-test
 ```
 
 ### Show version
 
 ```bash
-python3 codex_quota_audit.py --version
+cqa audit --version
 ```
 
 ---
 
 ## Experimental workflow candidate finder
 
-The repository also includes `find_workflow_candidates.py`, a privacy-conscious helper for locating representative multi-agent workflows before building or tuning a workflow cost profile.
+The package also includes `cqa.workflow.candidates`, a privacy-conscious helper for locating representative multi-agent workflows before building or tuning a workflow cost profile.
 
 It reconstructs parent → subagent families from session/thread/rollout linkage metadata rather than grouping sessions only by time. It also recognizes configurable role labels such as `orchestrator`, `planner`, `implementer`, and `validator`, while avoiding prompt/response text in its output.
 
 Run:
 
 ```bash
-python3 find_workflow_candidates.py
+python3 -m cqa.workflow.candidates
 ```
 
 The default output shows the 10 best recent graph-linked workflow families, including:
@@ -424,19 +652,19 @@ The default output shows the 10 best recent graph-linked workflow families, incl
 For a shareable machine-readable manifest:
 
 ```bash
-python3 find_workflow_candidates.py \
+python3 -m cqa.workflow.candidates \
   --export-json workflow_candidates.json
 ```
 
-The helper one-way hashes linkage identifiers and does not print prompts, responses, source code, tool stdout, or raw session/thread IDs. It is a **sample-selection tool**; use `extract_workflow_lifecycle.py` for conservative per-workflow lifecycle and cost analysis.
+The helper one-way hashes linkage identifiers and does not print prompts, responses, source code, tool stdout, or raw session/thread IDs. It is a **sample-selection tool**; use `cqa.workflow.lifecycle` for conservative per-workflow lifecycle and cost analysis.
 
 Useful options:
 
 ```bash
-python3 find_workflow_candidates.py --top 15
-python3 find_workflow_candidates.py --recent-days 45
-python3 find_workflow_candidates.py --show-link-schema
-python3 find_workflow_candidates.py --self-test
+python3 -m cqa.workflow.candidates --top 15
+python3 -m cqa.workflow.candidates --recent-days 45
+python3 -m cqa.workflow.candidates --show-link-schema
+python3 -m cqa.workflow.candidates --self-test
 ```
 
 ---
@@ -449,10 +677,10 @@ The repository also includes three helper commands for investigating Codex sessi
 ### 1. Find graph-linked workflow families
 
 ```bash
-python3 find_workflow_candidates.py
+python3 -m cqa.workflow.candidates
 ```
 
-`find_workflow_candidates.py` scans local rollout metadata and reconstructs candidate parent/subagent families from session/thread/rollout linkage IDs. It does not print prompts, model responses, source code, tool stdout, or raw linkage IDs.
+`cqa.workflow.candidates` scans local rollout metadata and reconstructs candidate parent/subagent families from session/thread/rollout linkage IDs. It does not print prompts, model responses, source code, tool stdout, or raw linkage IDs.
 
 For each recent family it reports:
 
@@ -472,7 +700,7 @@ were found in the available logs; it does not prove that no agents were used.
 Optional privacy-safe JSON manifest:
 
 ```bash
-python3 find_workflow_candidates.py \
+python3 -m cqa.workflow.candidates \
   --export-json workflow_candidates.json
 ```
 
@@ -481,14 +709,14 @@ python3 find_workflow_candidates.py \
 After choosing a family, run:
 
 ```bash
-python3 extract_workflow_lifecycle.py \
+python3 -m cqa.workflow.lifecycle \
   --family W-e7af89b98f
 ```
 
 You can also select a family using any member/root session key:
 
 ```bash
-python3 extract_workflow_lifecycle.py \
+python3 -m cqa.workflow.lifecycle \
   --family S-644a110a4f
 ```
 
@@ -520,7 +748,7 @@ It reports:
 For a shareable machine-readable extract:
 
 ```bash
-python3 extract_workflow_lifecycle.py \
+python3 -m cqa.workflow.lifecycle \
   --family W-e7af89b98f \
   --export-json workflow_lifecycle.json
 ```
@@ -530,13 +758,13 @@ The JSON export contains structural metadata and token counts only. It does not 
 Useful options:
 
 ```bash
-python3 extract_workflow_lifecycle.py --help
+python3 -m cqa.workflow.lifecycle --help
 ```
 
 The default trusted temporal fallback for a spawn requires a unique child session to begin within 2 seconds of the spawn call. You can tune that diagnostic boundary with:
 
 ```bash
-python3 extract_workflow_lifecycle.py \
+python3 -m cqa.workflow.lifecycle \
   --family W-e7af89b98f \
   --tight-spawn-seconds 2
 ```
@@ -545,10 +773,10 @@ Parent/action inference association is still a timing heuristic and is explicitl
 
 ### 3. Profile session and workflow costs
 
-Once a representative family has been validated, use `profile_workflow_cost.py` to answer the workflow-optimization question directly:
+Once a representative family has been validated, use `cqa.workflow.profile` to answer the workflow-optimization question directly:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-e7af89b98f \
   --export-json workflow_cost_profile.json
 ```
@@ -556,13 +784,13 @@ python3 profile_workflow_cost.py \
 A stable member/root session key works too:
 
 ```bash
-python3 profile_workflow_cost.py --family S-644a110a4f
+python3 -m cqa.workflow.profile --family S-644a110a4f
 ```
 
 Or pass any member's exact Codex session/thread ID directly; no finder step is needed:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --session YOUR_SESSION_ID \
   --export-json workflow_cost_profile_new.json
 ```
@@ -574,7 +802,7 @@ Reports retain hashed IDs. A session selector does not change the analysis root
 or isolate a subtree; existing root-selection and date-window rules still apply.
 The matching logs must be available under `--home` (default `~/.codex`).
 
-The workflow cost profiler is currently **v6.1**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
+The workflow cost profiler is currently **v6.9**. It deliberately does **not** require exact `SEND` / `WAIT` session-recipient recovery.
 
 ### Quiet intervals and confirmed pauses
 
@@ -590,7 +818,7 @@ excluding unclassified gaps. This is a sensitivity check, not an efficiency clai
 To confirm whether a suggested interval was a deliberate pause, use the saved report:
 
 ```bash
-python3 profile_workflow_cost.py --review-pauses workflow_cost_profile.json
+python3 -m cqa.workflow.profile --review-pauses workflow_cost_profile.json
 ```
 
 This explicitly interactive command **does not rescan Codex logs or launch agents**.
@@ -650,7 +878,7 @@ v6.1+ rather than guessing from burst totals. The source report stays unchanged.
 To also save a revised copy after review, choose a new output path:
 
 ```bash
-python3 profile_workflow_cost.py --review-pauses workflow_cost_profile.json \
+python3 -m cqa.workflow.profile --review-pauses workflow_cost_profile.json \
   --export-json workflow_cost_profile_reviewed.json
 ```
 
@@ -720,12 +948,38 @@ The **parent** supplies that output as `task_name` when launching the worker. La
 generation alone does not put anything into the logs. A trusted match between the
 recorded spawn and child session is also required. The main/root session has no
 parent spawn label; leave its role unknown unless its own metadata or an explicit
-mapping establishes it. Its position as root remains identifiable regardless.
+declaration establishes it. Its position as root remains identifiable regardless.
+
+For a root role that you know from trusted workflow configuration or your own
+invocation, declare it explicitly without teaching CQA any topology convention:
+
+```bash
+cqa workflow profile YOUR_SESSION_ID --root-role coordinator
+```
+
+`--root-role` accepts any normalized role label; `coordinator` is only an example.
+CQA does **not** infer coordinator/planner/orchestrator from the shape of the agent
+tree. For several trusted overrides, use a local-only role map:
+
+```json
+{
+  "schema": "workflow-role-map-v1",
+  "root_role": "manager",
+  "sessions": [
+    {"session": "LOCAL_SESSION_SELECTOR", "role": "researcher"}
+  ]
+}
+```
+
+Pass it with `--role-map roles.json`. Raw selectors in this file are used only to
+resolve local sessions and never enter the portable report; the report keeps only
+the resolved privacy-safe agent and role evidence. Conflicting explicit declarations
+fail rather than silently choosing one.
 
 Analyze with the vocabulary used by the workflow:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --session YOUR_SESSION_ID \
   --roles researcher writer editor \
   --export-json research_workflow_profile.json
@@ -768,11 +1022,15 @@ Custom role filters produce a separate view; they never hide unknown-role work
 from the core report. Structured assignment labels and optional assignment maps
 still enrich per-unit attribution, but are not required for session/subtree totals.
 
-The output schema is **`codex-workflow-cost-profile-v6.1`**. Compared with v5.1:
+The output schema is **`codex-workflow-cost-profile-v6.9`**. Compared with v5.1:
 
 - `pause_analysis` (v6.1) adds quiet-interval candidates, confirmed/rejected decisions,
   a compact usage timeline for offline review, and separate elapsed/pause-adjusted
   rates. It does not change the primary accounting or existing comparison fields.
+- `turn_throughput` (v6.2; extended in v6.6) adds weighted observed turn cadence by role/model/agent, tokens/turn, observed raw-work rate, and workflow-normalized model-output rate.
+- `turn_performance` (v6.6) keeps response-scoped visible-generation timing, fixes tool-result boundary classification, reports exact-attribution coverage against visible responses, and separates Codex-turn responsiveness (TTFT/task duration) from model-generation comparison; role/model/agent summaries use the same qualification rules.
+- `response_efficiency` (v6.7) adds tool-excluded response timing by overall/model/model+effort/agent: task elapsed time, exactly paired external tool/wait subtraction, non-reasoning model-output rate, directly timed reasoning/visible spans, residual tool-excluded time, TTFT, and evidence coverage. The dashboard carries this through `cqa-report-v1.0` only inside existing `extensions`.
+- `pricing` (v6.8+) centralizes ChatGPT Work/Codex Standard token-rate normalization, adds GPT-6.1 Sol, applies supported >272K long-context multipliers with the GPT-6 Astra Codex exception, and records rate-card provenance plus date-aware Auto-review mapping. v6.9 additionally exports per-model/rate-row cost totals, priced/unpriced request counts, long-context priced-request counts, and exact long-context price uplift for the dashboard pricing drill-down.
 - `workflow_analysis` records the selected interpretation, lifetime coverage, cycle
   availability and optional role-filtered activity.
 - Cycle fields and supervision summaries use `first`/`second` roles instead of
@@ -794,13 +1052,13 @@ Keep historical exports and write reruns to new filenames.
 
 ### Nested attribution (introduced in v5)
 
-v5 adds `workflow_attribution.py` for explicit assignment identity and nested
+v5 introduced the historical `workflow_attribution.py` compatibility entry point for explicit assignment identity and nested
 Coordinator → Orchestrator → Implementer/Validator accounting. It also supports
 historical direct-orchestrator families. Run the usual profiler command with a
 **new output filename**; historical reports are not upgraded or overwritten automatically.
 
 ```bash
-python3 profile_workflow_cost.py --family W-... --export-json workflow_cost_profile_v5.json
+python3 -m cqa.workflow.profile --family W-... --export-json workflow_cost_profile_v5.json
 ```
 
 The new `nested_attribution` section reports:
@@ -947,10 +1205,10 @@ Resource-read detection remains limited by schema/classification coverage.
 Validate the helpers with:
 
 ```bash
-python3 find_workflow_candidates.py --self-test
-python3 extract_workflow_lifecycle.py --self-test
-python3 profile_workflow_cost.py --self-test
-python3 -m unittest -v test_workflow_attribution test_generic_workflow test_workflow_pauses
+python3 -m cqa.workflow.candidates --self-test
+python3 -m cqa.workflow.lifecycle --self-test
+python3 -m cqa.workflow.profile --self-test
+python3 -m unittest -v test_workflow_attribution test_generic_workflow test_workflow_pauses test_cqa_report
 ```
 
 Synthetic tests cover solo/flat/nested workflows, unknown/custom roles, unchanged
@@ -979,7 +1237,7 @@ Without a cutoff, v4.2 retains the v3 behavior: the selected graph family root i
 Example for a known workflow-update/restart boundary:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-ac4e5c3e8a \
   --after 2026-09-14T19:54:47+02:00 \
   --export-json workflow_cost_profile_v4_2.json
@@ -1058,7 +1316,7 @@ input on the first ordinary inference request after compaction
 observed shrink percentage
 direct compaction token/API$eq usage when a raw usage sample can be safely matched
 requests, tokens and API$eq during post-compaction recovery
-time and requests until the context refills to the configured fraction
+context refill time and requests until the configured fraction, next compaction, or session/analysis end
 peak context reached during recovery
 tool activity during recovery
 resources accessed both shortly before and after compaction
@@ -1075,10 +1333,12 @@ By default, a recovery window begins after the compaction markers and ends at th
 2. the end of the session / requested analysis window
 3. the first ordinary request whose input reaches 80% of the pre-compaction input
 
+The dashboard calls this elapsed window **context refill time**. It is not the duration of the compaction operation. If pre-compaction context is unavailable, CQA can still report an explicit compaction marker but does not claim a measured shrink episode. Requests/tokens observed in the window are observational and are not automatically caused by or avoidable through compaction.
+
 Tune the refill threshold with:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-... \
   --compaction-refill-fraction 0.8
 ```
@@ -1086,7 +1346,7 @@ python3 profile_workflow_cost.py \
 To look for implementation-state reacquisition, the profiler also scans structural tool calls during recovery. It categorizes activity such as file reads, searches, Git/state inspection, tests/builds, writes/edits and other shell/tool work. Path-like resources are one-way hashed **locally**; raw paths, commands, prompts, source text and tool output are never printed or exported. The default pre-compaction resource lookback is 20 minutes:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-... \
   --compaction-resource-lookback-minutes 20
 ```
@@ -1096,10 +1356,10 @@ The report includes a **post-compaction recovery vs same-session non-recovery ba
 Useful controls:
 
 ```bash
-python3 profile_workflow_cost.py --family W-... --compaction-limit 50
-python3 profile_workflow_cost.py --family W-... --compaction-direct-usage-seconds 1
-python3 profile_workflow_cost.py --family W-... --compaction-dedupe-seconds 2
-python3 profile_workflow_cost.py --family W-... --no-compaction-audit
+python3 -m cqa.workflow.profile --family W-... --compaction-limit 50
+python3 -m cqa.workflow.profile --family W-... --compaction-direct-usage-seconds 1
+python3 -m cqa.workflow.profile --family W-... --compaction-dedupe-seconds 2
+python3 -m cqa.workflow.profile --family W-... --no-compaction-audit
 ```
 
 The `--stage-roles` option keeps its name but now requests a **separate filtered
@@ -1109,7 +1369,7 @@ the main active windows, concurrency, cycle-isolation checks or token totals.
 By default an active window ends at the observed end of the child session. An optional grace period can be added with:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-... \
   --active-tail-seconds 30
 ```
@@ -1213,7 +1473,7 @@ lifetime windows. The default recognition vocabulary is `coordinator`,
 To recognize other explicit role names and optionally study a role pair:
 
 ```bash
-python3 profile_workflow_cost.py \
+python3 -m cqa.workflow.profile \
   --family W-... \
   --roles manager coder reviewer \
   --stage-roles coder reviewer \
@@ -1247,15 +1507,15 @@ The workflow helpers remain read-only and local. They do not print prompts, resp
 Useful options:
 
 ```bash
-python3 profile_workflow_cost.py --help
-python3 profile_workflow_cost.py --self-test
-python3 profile_workflow_cost.py --family W-... --no-action-schema-audit
-python3 profile_workflow_cost.py --family W-... --prices prices.json
-python3 profile_workflow_cost.py --family W-... --after 2026-09-14T19:54:47+02:00
-python3 profile_workflow_cost.py --family W-... --after 2026-09-14T19:54:47+02:00 --orchestrator S-...
+python3 -m cqa.workflow.profile --help
+python3 -m cqa.workflow.profile --self-test
+python3 -m cqa.workflow.profile --family W-... --no-action-schema-audit
+python3 -m cqa.workflow.profile --family W-... --prices prices.json
+python3 -m cqa.workflow.profile --family W-... --after 2026-09-14T19:54:47+02:00
+python3 -m cqa.workflow.profile --family W-... --after 2026-09-14T19:54:47+02:00 --orchestrator S-...
 ```
 
-`API$eq` uses the same public list-price table as the main audit. It is a normalization ruler only, not a Codex subscription charge or OpenAI internal compute cost. Guardian long-context normalization uses the same mapping and multipliers as `codex_quota_audit.py`.
+`API$eq` uses the same public ChatGPT Work/Codex Standard token-rate table as the main audit. It is a normalization ruler only, not a Codex subscription charge or OpenAI internal compute cost. Pricing is request-scoped: supported requests over 272K input tokens receive the documented 2x input / 2x cached-input / 1.5x output multiplier, while GPT-6 Astra keeps its Codex long-context exception. Auto-review pricing is date-aware and uses the same mapping as `cqa.quota.audit`.
 
 The action-schema audit never prints argument/result values. It only prints structural paths, data types, counts, and whether hashed compact values overlap known family IDs or trusted spawn-result value namespaces. Any proposed handle bridge remains diagnostic until validated on real workflows.
 
@@ -1277,7 +1537,7 @@ If six months of logs are present, six months are analyzed. If more history is p
 Use a different Codex directory with:
 
 ```bash
-python3 codex_quota_audit.py --home /path/to/.codex
+cqa audit --home /path/to/.codex
 ```
 
 The default analysis targets the 7-day (`10080` minute) Codex limit.
@@ -1361,7 +1621,12 @@ Where the data cannot support a clean inference, the script reports that limitat
 
 ### Public rate-card equivalent
 
-For comparison purposes, `codex-auto-review` is mapped to GPT-5.4 in the script's public rate-card-equivalent calculation.
+For comparison purposes, `codex-auto-review` uses a date-aware public ChatGPT Work/Codex rate-card mapping:
+
+- before **2026-07-30**: GPT-5.4
+- on or after **2026-07-30**: GPT-5.6 Luna
+
+The transition date follows OpenAI's July 30, 2026 Auto-review upgrade announcement. A custom `codex-auto-review` entry in `--prices` overrides this built-in historical mapping.
 
 `Guardian $eq` is:
 
@@ -1369,7 +1634,7 @@ For comparison purposes, `codex-auto-review` is mapped to GPT-5.4 in the script'
 - not a Pro subscription charge
 - not OpenAI's internal compute cost
 
-The script can apply documented long-context multipliers when the local telemetry provides enough information.
+Current built-in normalization records its rate-card source/as-of date. Supported requests over 272K input tokens receive the documented 2x input / 2x cached-input / 1.5x output multiplier; GPT-6 Astra retains the documented Codex long-context exception. Fast-mode and regional multipliers are not inferred when telemetry does not establish them.
 
 ---
 
@@ -1400,7 +1665,7 @@ Both tests also calculate metrics excluding `codex-auto-review` so Guardian over
 
 ## API price normalization
 
-Public API list prices are used as a common normalization ruler across differently priced models.
+Public ChatGPT Work/Codex Standard token rates are used as a common normalization ruler across differently priced models. The built-in table includes **GPT-6.1 Sol at $2.00 / $0.10 / $10.00 per 1M uncached-input / cached-input / output tokens** as of 2026-10-04. Source: OpenAI ChatGPT Rate Card (Enterprise token-based pricing), `https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing`.
 
 They are **not**:
 
@@ -1412,7 +1677,7 @@ They are **not**:
 You can override or extend the built-in price table:
 
 ```bash
-python3 codex_quota_audit.py --prices prices.json
+cqa audit --prices prices.json
 ```
 
 Accepted formats:
@@ -1446,42 +1711,42 @@ If a model has no configured price, raw-token analysis still works, but API-norm
 ### High-water quota buckets
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --export-buckets quota_buckets.csv
 ```
 
 ### Reset ledger
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --export-resets reset_ledger.csv
 ```
 
 ### Model/effort chart aggregates
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --export-chart-data quota_chart_data.csv
 ```
 
 ### Guardian approval episodes
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --export-approval-episodes approval_episodes.csv
 ```
 
 ### Guardian quota cost by reset period
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --export-guardian-periods guardian_periods.csv
 ```
 
 ### Banked-reset whole-period capacity
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --banked-reset 2026-09-10T08:23 \
   --export-banked-capacity banked_capacity.csv
 ```
@@ -1489,7 +1754,7 @@ python3 codex_quota_audit.py \
 ### Banked-reset equal-quota boundary slices
 
 ```bash
-python3 codex_quota_audit.py \
+cqa audit \
   --banked-reset 2026-09-10T08:23 \
   --export-banked-slices banked_boundary_slices.csv
 ```
@@ -1589,7 +1854,7 @@ The script exposes additional tuning controls for:
 Run:
 
 ```bash
-python3 codex_quota_audit.py --help
+cqa audit --help
 ```
 
 for the complete list and current defaults.
@@ -1601,21 +1866,21 @@ for the complete list and current defaults.
 Current version:
 
 ```text
-2.15
+2.16
 ```
 
 Check locally with:
 
 ```bash
-python3 codex_quota_audit.py --version
+cqa audit --version
 ```
 
 Experimental workflow helper versions in this package:
 
 ```text
-find_workflow_candidates.py      2.3
-extract_workflow_lifecycle.py    2.3
-profile_workflow_cost.py         6.1
+cqa.workflow.candidates         2.3
+cqa.workflow.lifecycle          2.3
+cqa.workflow.profile            6.9
 ```
 
 ---

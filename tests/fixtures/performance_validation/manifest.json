@@ -1,0 +1,17 @@
+{
+  "description": "Sanitized structural derivative of a five-session staged multi-agent validation workflow. Contains timing/token/tool-call shapes only; no prompts, response text, tool arguments/output, raw session IDs, or source paths.",
+  "expected": {
+    "responses": 93,
+    "visible_responses": 25,
+    "qualified_visible_responses": 9,
+    "weighted_visible_output_tokens_per_second": 54.7,
+    "visible_timed_responses": 24
+  },
+  "files": [
+    "01-root.jsonl",
+    "02-orchestrator.jsonl",
+    "03-implementer-a.jsonl",
+    "04-implementer-b.jsonl",
+    "05-validator.jsonl"
+  ]
+}

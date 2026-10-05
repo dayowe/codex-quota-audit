@@ -1,0 +1,2798 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:codex-quota-audit:schema:cqa-report-v1",
+  "title": "Codex Quota Audit report v1",
+  "description": "Privacy-safe, presentation-neutral report contract shared by Codex Quota Audit analyzers and renderers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "generator",
+    "report",
+    "privacy",
+    "analysis",
+    "quota",
+    "guardian",
+    "banked_resets",
+    "workflow",
+    "findings",
+    "data_quality"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cqa-report"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+\\.[0-9]+$"
+    },
+    "generator": {
+      "$ref": "#/$defs/generator"
+    },
+    "report": {
+      "$ref": "#/$defs/reportInfo"
+    },
+    "privacy": {
+      "$ref": "#/$defs/privacy"
+    },
+    "analysis": {
+      "$ref": "#/$defs/analysis"
+    },
+    "quota": {
+      "$ref": "#/$defs/quotaSection"
+    },
+    "guardian": {
+      "$ref": "#/$defs/guardianSection"
+    },
+    "banked_resets": {
+      "$ref": "#/$defs/bankedSection"
+    },
+    "workflow": {
+      "$ref": "#/$defs/workflowSection"
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "data_quality": {
+      "$ref": "#/$defs/dataQuality"
+    }
+  },
+  "$defs": {
+    "sectionStatus": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "partial",
+        "not_requested",
+        "not_available",
+        "insufficient_data",
+        "error"
+      ]
+    },
+    "dateTime": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "generatorComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "components"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "components": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/generatorComponent"
+          }
+        }
+      }
+    },
+    "timeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "end": {
+          "$ref": "#/$defs/dateTime"
+        }
+      }
+    },
+    "reportInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated_at",
+        "kind",
+        "observed_range",
+        "extensions"
+      ],
+      "properties": {
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "dashboard",
+            "sample_fixture",
+            "export"
+          ]
+        },
+        "observed_range": {
+          "$ref": "#/$defs/timeRange"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "contains_prompt_text",
+        "contains_response_text",
+        "contains_tool_output",
+        "contains_file_contents",
+        "contains_auth_data",
+        "contains_account_identity",
+        "contains_source_paths",
+        "contains_raw_session_ids"
+      ],
+      "properties": {
+        "profile": {
+          "const": "dashboard-safe-v1"
+        },
+        "contains_prompt_text": {
+          "const": false
+        },
+        "contains_response_text": {
+          "const": false
+        },
+        "contains_tool_output": {
+          "const": false
+        },
+        "contains_file_contents": {
+          "const": false
+        },
+        "contains_auth_data": {
+          "const": false
+        },
+        "contains_account_identity": {
+          "const": false
+        },
+        "contains_source_paths": {
+          "const": false
+        },
+        "contains_raw_session_ids": {
+          "const": false
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "methods",
+        "parameters",
+        "extensions"
+      ],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "methods": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "level",
+        "low",
+        "high"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "low": {
+          "type": "number"
+        },
+        "high": {
+          "type": "number"
+        },
+        "resamples": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "estimate",
+        "interval"
+      ],
+      "properties": {
+        "estimate": {
+          "type": "number"
+        },
+        "interval": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/interval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requests",
+        "input_tokens",
+        "cached_input_tokens",
+        "uncached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "api_list_equivalent_usd",
+        "price_coverage"
+      ],
+      "properties": {
+        "requests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cached_input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "uncached_input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning_output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "api_list_equivalent_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "price_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "quotaSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "models",
+        "cohorts",
+        "quota_points_observed",
+        "episodes"
+      ],
+      "properties": {
+        "models": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cohorts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quota_points_observed": {
+          "type": "number",
+          "minimum": 0
+        },
+        "episodes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "regime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "model",
+        "start",
+        "end",
+        "detection",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^regime-"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "detection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "basis"
+          ],
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "basis": {
+              "type": "string"
+            }
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "cohortEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "quota_points",
+        "episodes",
+        "buckets",
+        "model_token_share",
+        "effort_token_share"
+      ],
+      "properties": {
+        "quota_points": {
+          "type": "number",
+          "minimum": 0
+        },
+        "episodes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "buckets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "effort_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "tokenComposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cached_input",
+        "uncached_input",
+        "output"
+      ],
+      "properties": {
+        "cached_input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "uncached_input": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "cohort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "model",
+        "effort",
+        "regime_id",
+        "evidence",
+        "efficiency",
+        "token_composition_per_quota_point",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^cohort-"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "regime_id": {
+          "type": "string",
+          "pattern": "^regime-"
+        },
+        "evidence": {
+          "$ref": "#/$defs/cohortEvidence"
+        },
+        "efficiency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "raw_tokens_per_quota_point",
+            "api_equivalent_usd_per_quota_point"
+          ],
+          "properties": {
+            "raw_tokens_per_quota_point": {
+              "$ref": "#/$defs/estimate"
+            },
+            "api_equivalent_usd_per_quota_point": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/estimate"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "token_composition_per_quota_point": {
+          "$ref": "#/$defs/tokenComposition"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "quotaSection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "summary",
+        "regimes",
+        "cohorts",
+        "extensions"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/sectionStatus"
+        },
+        "summary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/quotaSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "regimes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/regime"
+          }
+        },
+        "cohorts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cohort"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "guardianSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_episodes",
+        "inference_events",
+        "guardian_tokens",
+        "estimated_quota_overhead"
+      ],
+      "properties": {
+        "approval_episodes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inference_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "guardian_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "estimated_quota_overhead": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/estimate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "guardianPeriod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "start",
+        "end",
+        "quota_points_used",
+        "approvals",
+        "paired_approvals",
+        "guardian_tokens",
+        "estimated_quota_overhead",
+        "estimated_share_of_used_quota",
+        "ratecard",
+        "approval_episode_ids",
+        "status",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^guardian-period-"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "quota_points_used": {
+          "type": "number",
+          "minimum": 0
+        },
+        "approvals": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "paired_approvals": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "guardian_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "estimated_quota_overhead": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/estimate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "estimated_share_of_used_quota": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/estimate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ratecard": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "model",
+            "api_list_equivalent_usd",
+            "priced_approvals",
+            "long_context_events"
+          ],
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "api_list_equivalent_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "priced_approvals": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "long_context_events": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "approval_episode_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^approval-"
+          }
+        },
+        "status": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "guardianEpisode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "period_id",
+        "start",
+        "end",
+        "duration_seconds",
+        "pairing",
+        "guardian_events",
+        "guardian_tokens",
+        "guardian_token_breakdown",
+        "parent",
+        "ratecard",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^approval-"
+        },
+        "period_id": {
+          "type": "string",
+          "pattern": "^guardian-period-"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "pairing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "confidence",
+            "method",
+            "ambiguous"
+          ],
+          "properties": {
+            "confidence": {
+              "type": "string"
+            },
+            "method": {
+              "type": "string"
+            },
+            "ambiguous": {
+              "type": "boolean"
+            }
+          }
+        },
+        "guardian_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "guardian_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "guardian_token_breakdown": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cached_input",
+            "uncached_input",
+            "output",
+            "reasoning_output"
+          ],
+          "properties": {
+            "cached_input": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "uncached_input": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reasoning_output": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "parent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "model",
+            "effort",
+            "policy_regime"
+          ],
+          "properties": {
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "policy_regime": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "ratecard": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "model",
+            "api_list_equivalent_usd",
+            "base_usd",
+            "long_context_events"
+          ],
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "api_list_equivalent_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "base_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "long_context_events": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "guardianSection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "summary",
+        "periods",
+        "approval_episodes",
+        "extensions"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/sectionStatus"
+        },
+        "summary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/guardianSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "periods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guardianPeriod"
+          }
+        },
+        "approval_episodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guardianEpisode"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "bankedComparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "metric",
+        "label",
+        "capacity_ratio",
+        "confirmed_banked_periods",
+        "comparison_periods",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^banked-comparison-"
+        },
+        "metric": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "capacity_ratio": {
+          "$ref": "#/$defs/estimate"
+        },
+        "confirmed_banked_periods": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comparison_periods": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "bankedSlice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "quota_points",
+        "pairs",
+        "preferred_metric",
+        "metrics",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^banked-slice-"
+        },
+        "quota_points": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "pairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "preferred_metric": {
+          "type": "string",
+          "enum": [
+            "all_raw",
+            "all_api",
+            "core_raw",
+            "core_api"
+          ]
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all_raw",
+            "all_api",
+            "core_raw",
+            "core_api"
+          ],
+          "properties": {
+            "all_raw": {
+              "$ref": "#/$defs/bankedSliceMetric"
+            },
+            "all_api": {
+              "$ref": "#/$defs/bankedSliceMetric"
+            },
+            "core_raw": {
+              "$ref": "#/$defs/bankedSliceMetric"
+            },
+            "core_api": {
+              "$ref": "#/$defs/bankedSliceMetric"
+            }
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "bankedSection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "summary",
+        "whole_period_comparisons",
+        "boundary_slices",
+        "capacity_periods",
+        "boundary_observations",
+        "extensions"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/sectionStatus"
+        },
+        "summary": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "confirmed_resets",
+                "matched_comparison_periods",
+                "preferred_boundary_points",
+                "strongest_metric"
+              ],
+              "properties": {
+                "confirmed_resets": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "matched_comparison_periods": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "preferred_boundary_points": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "strongest_metric": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "whole_period_comparisons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bankedComparison"
+          }
+        },
+        "boundary_slices": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bankedSlice"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        },
+        "capacity_periods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bankedCapacityPeriod"
+          }
+        },
+        "boundary_observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/bankedBoundaryObservation"
+          }
+        }
+      }
+    },
+    "workflowRole": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "usage",
+        "extensions"
+      ],
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        },
+        "throughput": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/throughputStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "performance": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/performanceStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "workflowAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "parent_id",
+        "role",
+        "role_confidence",
+        "active",
+        "usage",
+        "unit",
+        "chunk",
+        "issues",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^agent-"
+        },
+        "parent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "role_confidence": {
+          "type": "string"
+        },
+        "active": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timeRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chunk": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        },
+        "throughput": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/throughputStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "performance": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/performanceStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "compaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "role",
+        "timestamp",
+        "context_before_input_tokens",
+        "context_after_first_request_input_tokens",
+        "observed_shrink_fraction",
+        "recovery",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^compaction-"
+        },
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "context_before_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "context_after_first_request_input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "observed_shrink_fraction": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "end",
+            "end_reason",
+            "duration_seconds",
+            "usage"
+          ],
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/dateTime"
+            },
+            "end_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "duration_seconds": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "usage": {
+              "$ref": "#/$defs/usage"
+            }
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowSignal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "code",
+        "label",
+        "value",
+        "unit",
+        "classification",
+        "summary",
+        "evidence_refs",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^signal-"
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_]+$"
+        },
+        "label": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "classification": {
+          "const": "observational"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowPause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "start",
+        "end",
+        "seconds",
+        "status",
+        "boundary_source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^pause-"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string"
+        },
+        "boundary_source": {
+          "type": "string"
+        }
+      }
+    },
+    "workflowProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "analysis_window",
+        "summary",
+        "roles",
+        "agents",
+        "compactions",
+        "concurrency",
+        "timeline",
+        "signals",
+        "pauses",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^workflow-"
+        },
+        "analysis_window": {
+          "$ref": "#/$defs/timeRange"
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "raw_tokens",
+            "api_list_equivalent_usd",
+            "sessions",
+            "requests",
+            "compactions",
+            "peak_concurrent_children"
+          ],
+          "properties": {
+            "raw_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "api_list_equivalent_usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "sessions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "requests": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "compactions": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "peak_concurrent_children": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowRole"
+          }
+        },
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowAgent"
+          }
+        },
+        "compactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/compaction"
+          }
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "recognized_child_agent_hours",
+            "active_wall_hours",
+            "overlap_wall_hours",
+            "extra_concurrency_hours",
+            "peak_concurrent_children",
+            "wall_minutes_by_count"
+          ],
+          "properties": {
+            "recognized_child_agent_hours": {
+              "type": "number",
+              "minimum": 0
+            },
+            "active_wall_hours": {
+              "type": "number",
+              "minimum": 0
+            },
+            "overlap_wall_hours": {
+              "type": "number",
+              "minimum": 0
+            },
+            "extra_concurrency_hours": {
+              "type": "number",
+              "minimum": 0
+            },
+            "peak_concurrent_children": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "wall_minutes_by_count": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowSignal"
+          }
+        },
+        "pauses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowPause"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        },
+        "timeline": {
+          "$ref": "#/$defs/workflowTimeline"
+        },
+        "throughput_method": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/throughputMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "throughput": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/throughputStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "throughput_by_model": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowModelThroughput"
+          }
+        },
+        "performance_method": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/performanceMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "performance": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/performanceStats"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "performance_by_model": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowModelPerformance"
+          }
+        }
+      }
+    },
+    "workflowSection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "profiles",
+        "extensions"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/sectionStatus"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowProfile"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "code",
+        "category",
+        "level",
+        "title",
+        "summary",
+        "evidence_refs",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^finding-"
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_]+$"
+        },
+        "category": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "info",
+            "caution"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "qualityWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "level",
+        "message",
+        "refs"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_]+$"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "info",
+            "caution",
+            "limited"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "dataQuality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "overall",
+        "metrics",
+        "warnings",
+        "extensions"
+      ],
+      "properties": {
+        "overall": {
+          "type": "string",
+          "enum": [
+            "good",
+            "caution",
+            "limited",
+            "unknown"
+          ]
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "quota_cohorts_total",
+            "quota_cohorts_priced",
+            "guardian_pairing_coverage",
+            "workflow_role_attribution_sessions",
+            "workflow_sessions",
+            "workflow_lifetime_windows_status"
+          ],
+          "properties": {
+            "quota_cohorts_total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "quota_cohorts_priced": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "guardian_pairing_coverage": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 1
+            },
+            "workflow_role_attribution_sessions": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "workflow_sessions": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "workflow_lifetime_windows_status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/qualityWarning"
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "bankedSliceMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "after_before_ratio"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "after_before_ratio": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/estimate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "bankedWork": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tokens",
+        "tokens_per_quota_point",
+        "api_list_equivalent_usd",
+        "api_list_equivalent_usd_per_quota_point",
+        "price_coverage"
+      ],
+      "properties": {
+        "tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_per_quota_point": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "api_list_equivalent_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "api_list_equivalent_usd_per_quota_point": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "price_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "bankedMarker": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "supplied",
+        "precision",
+        "match_offset_minutes"
+      ],
+      "properties": {
+        "supplied": {
+          "type": "string",
+          "minLength": 1
+        },
+        "precision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "match_offset_minutes": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "bankedCapacityPeriod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "start",
+        "end",
+        "reset_kind",
+        "confirmed_banked",
+        "marker",
+        "quota_points",
+        "model",
+        "model_token_share",
+        "effort",
+        "effort_token_share",
+        "regime",
+        "complete_period",
+        "all_work",
+        "core_work",
+        "guardian_tokens",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^banked-period-"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "reset_kind": {
+          "type": "string"
+        },
+        "confirmed_banked": {
+          "type": "boolean"
+        },
+        "marker": {
+          "$ref": "#/$defs/bankedMarker"
+        },
+        "quota_points": {
+          "type": "number",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "regime": {
+          "type": "string",
+          "minLength": 1
+        },
+        "complete_period": {
+          "type": "boolean"
+        },
+        "all_work": {
+          "$ref": "#/$defs/bankedWork"
+        },
+        "core_work": {
+          "$ref": "#/$defs/bankedWork"
+        },
+        "guardian_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "bankedBoundarySide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "period_start",
+        "meter_start",
+        "meter_end",
+        "interpolated",
+        "quota_points",
+        "all_tokens",
+        "core_tokens",
+        "guardian_tokens",
+        "all_api_list_equivalent_usd",
+        "core_api_list_equivalent_usd",
+        "model_token_share",
+        "effort_token_share"
+      ],
+      "properties": {
+        "period_start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "meter_start": {
+          "type": "number"
+        },
+        "meter_end": {
+          "type": "number"
+        },
+        "interpolated": {
+          "type": "boolean"
+        },
+        "quota_points": {
+          "type": "number",
+          "minimum": 0
+        },
+        "all_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "core_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "guardian_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "all_api_list_equivalent_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "core_api_list_equivalent_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "model_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "effort_token_share": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "bankedBoundaryObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "reset_time",
+        "marker",
+        "slice_points",
+        "model",
+        "effort",
+        "regime",
+        "controls",
+        "before",
+        "after",
+        "ratios",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^banked-boundary-"
+        },
+        "reset_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "marker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "supplied",
+            "precision"
+          ],
+          "properties": {
+            "supplied": {
+              "type": "string",
+              "minLength": 1
+            },
+            "precision": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "slice_points": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "regime": {
+          "type": "string",
+          "minLength": 1
+        },
+        "controls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "same_model",
+            "same_effort",
+            "same_regime"
+          ],
+          "properties": {
+            "same_model": {
+              "type": "boolean"
+            },
+            "same_effort": {
+              "type": "boolean"
+            },
+            "same_regime": {
+              "type": "boolean"
+            }
+          }
+        },
+        "before": {
+          "$ref": "#/$defs/bankedBoundarySide"
+        },
+        "after": {
+          "$ref": "#/$defs/bankedBoundarySide"
+        },
+        "ratios": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all_raw",
+            "all_api",
+            "core_raw",
+            "core_api"
+          ],
+          "properties": {
+            "all_raw": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "all_api": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "core_raw": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "core_api": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowAgentWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "role",
+        "start",
+        "end",
+        "chunk",
+        "confidence",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^agent-window-"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agent-"
+        },
+        "role": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "chunk": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "confidence": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowGuardianActivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "start",
+        "end",
+        "usage",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^guardian-activity-"
+        },
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowConcurrencyWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "start",
+        "end",
+        "active_children",
+        "agent_ids",
+        "roles"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^concurrency-"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "active_children": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "agent_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^agent-"
+          },
+          "uniqueItems": true
+        },
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "workflowHandoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "from_agent_id",
+        "to_agent_id",
+        "from_role",
+        "to_role",
+        "timestamp",
+        "gap_seconds",
+        "quality",
+        "extensions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^handoff-"
+        },
+        "from_agent_id": {
+          "type": "string",
+          "pattern": "^agent-"
+        },
+        "to_agent_id": {
+          "type": "string",
+          "pattern": "^agent-"
+        },
+        "from_role": {
+          "type": "string"
+        },
+        "to_role": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "gap_seconds": {
+          "type": "number"
+        },
+        "quality": {
+          "type": "string"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "workflowTimeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_windows",
+        "guardian_activity",
+        "concurrency_windows",
+        "handoffs"
+      ],
+      "properties": {
+        "agent_windows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowAgentWindow"
+          }
+        },
+        "guardian_activity": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowGuardianActivity"
+          }
+        },
+        "concurrency_windows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowConcurrencyWindow"
+          }
+        },
+        "handoffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/workflowHandoff"
+          }
+        }
+      }
+    },
+    "throughputStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "contributors",
+        "observed_turn_transitions",
+        "observed_turn_interval_seconds",
+        "turns_per_observed_second",
+        "turns_per_workflow_second",
+        "raw_tokens",
+        "tokens_per_turn"
+      ],
+      "properties": {
+        "turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contributors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observed_turn_transitions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observed_turn_interval_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "turns_per_observed_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "turns_per_workflow_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "raw_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observed_raw_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_per_turn": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "raw_tokens_per_observed_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_tokens_per_workflow_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "throughputMethod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turn_definition",
+        "cadence_basis",
+        "idle_gap_seconds",
+        "caveat"
+      ],
+      "properties": {
+        "turn_definition": {
+          "type": "string"
+        },
+        "cadence_basis": {
+          "type": "string"
+        },
+        "observed_work_basis": {
+          "type": "string"
+        },
+        "idle_gap_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "caveat": {
+          "type": "string"
+        },
+        "workflow_output_basis": {
+          "type": "string"
+        }
+      }
+    },
+    "workflowModelThroughput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "throughput",
+        "extensions"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "throughput": {
+          "$ref": "#/$defs/throughputStats"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      }
+    },
+    "performanceStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turns",
+        "contributors",
+        "generation_timed_turns",
+        "generation_coverage",
+        "visible_output_tokens",
+        "visible_generation_seconds",
+        "visible_output_tokens_per_second",
+        "visible_output_tokens_per_turn",
+        "reasoning_tokens_per_turn",
+        "reasoning_timed_turns",
+        "reasoning_seconds",
+        "reasoning_tokens_per_second",
+        "ttft_samples",
+        "ttft_coverage",
+        "ttft_p50_seconds",
+        "ttft_p90_seconds",
+        "turn_duration_samples",
+        "turn_duration_coverage",
+        "turn_duration_p50_seconds",
+        "turn_duration_p90_seconds",
+        "qualification_reasons"
+      ],
+      "properties": {
+        "turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "task_turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contributors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generation_timed_turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generation_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "generation_quality": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "good",
+            "low",
+            "insufficient",
+            null
+          ]
+        },
+        "visible_output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "visible_generation_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "visible_output_tokens_per_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "visible_output_tokens_per_turn": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasoning_tokens_per_turn": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reasoning_timed_turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reasoning_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reasoning_tokens_per_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "ttft_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ttft_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "ttft_p50_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "ttft_p90_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "turn_duration_samples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "turn_duration_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "turn_duration_p50_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "turn_duration_p90_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "qualification_reasons": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "qualified_visible_responses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "visible_responses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "visible_timed_responses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "visible_generation_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "visible_timing_coverage": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "performanceMethod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "turn_definition",
+        "visible_output_definition",
+        "generation_qualification",
+        "aggregation",
+        "caveat"
+      ],
+      "properties": {
+        "turn_definition": {
+          "type": "string"
+        },
+        "visible_output_definition": {
+          "type": "string"
+        },
+        "generation_qualification": {
+          "type": "string"
+        },
+        "aggregation": {
+          "type": "string"
+        },
+        "caveat": {
+          "type": "string"
+        }
+      }
+    },
+    "workflowModelPerformance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "effort",
+        "performance",
+        "extensions"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "performance": {
+          "$ref": "#/$defs/performanceStats"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

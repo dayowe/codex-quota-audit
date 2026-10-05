@@ -1,0 +1,20 @@
+{
+  "name": "dayowe",
+  "interface": {
+    "displayName": "dayowe"
+  },
+  "plugins": [
+    {
+      "name": "codex-quota-audit",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-quota-audit"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Engineering"
+    }
+  ]
+}

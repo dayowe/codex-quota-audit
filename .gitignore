@@ -1,23 +1,40 @@
-# --- Python ---
-venv/
+# Python bytecode / environments
 __pycache__/
 *.py[cod]
-*$py.class
+.venv/
+venv/
+env/
+ENV/
 
-# --- Generated data & artifacts ---
-*.jsonl
-*.json
-*.md
-*.txt
-*.csv
-*.png
-*.svg
-*.zip
+# Local environment configuration
+.env
+.env.*
+!.env.example
 
-# --- OS / editor metadata ---
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
 .DS_Store
-Thumbs.db
-desktop.ini
 ._*
-*:Zone.Identifier
+Thumbs.db
+ehthumbs.db
+desktop.ini
 
+# Windows downloaded-file metadata
+*Zone.Identifier
+
+# Build and temporary files
+build/
+dist/
+*.egg-info/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.whl

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-quota-audit"
+version = "0.8.0"
+description = "Local privacy-safe analysis of Codex quota efficiency and multi-agent workflow usage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "dayowe" }
+]
+keywords = ["codex", "quota", "tokens", "workflow", "guardian", "dashboard"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.optional-dependencies]
+validate = ["jsonschema>=4.18"]
+dev = ["jsonschema>=4.18"]
+
+[project.scripts]
+cqa = "cqa.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/dayowe/codex-quota-audit"
+Repository = "https://github.com/dayowe/codex-quota-audit"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["cqa*"]
+
+[tool.setuptools.package-data]
+cqa = [
+  "assets/dashboard/*.html",
+  "assets/schema/*.json",
+]
