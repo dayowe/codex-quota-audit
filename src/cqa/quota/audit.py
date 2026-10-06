@@ -95,7 +95,7 @@ import statistics
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -105,6 +105,9 @@ from ..report.core import (
     load_workflow_profile_json, render_dashboard_html, write_cqa_report_json,
 )
 
+
+from ..workflow import records
+from ..workflow.cache import Index
 
 __version__ = "2.16"
 
@@ -916,10 +919,12 @@ def extract_rate_windows(rate_limits: object) -> Dict[int, RateWindow]:
     return out
 
 
-def parse_file(path: str,
-               prices: Dict[str, Tuple[float, float, float]],
-               target_window_minutes: int,
-               stats: ParseStats) -> List[Event]:
+def parse_file(path: str, prices: Dict[str, Tuple[float, float, float]],
+               target_window_minutes: int, stats: ParseStats) -> List[Event]:
+    return records.read_consumer(path, quota_consumer(path, prices, target_window_minutes, stats), [])
+
+
+def quota_consumer(path, prices, target_window_minutes, stats):
     """Parse one rollout file once, retaining every Codex rate-limit window.
 
     `used`/`reset_at` continue to refer to the requested main-analysis window so
@@ -938,164 +943,161 @@ def parse_file(path: str,
     source_index = 0
     file_line_index = 0
 
-    try:
-        fh = open(path, "rb")
-    except OSError:
-        return out
+    while True:
+        raw = yield
+        if raw is None:
+            break
+        file_line_index += 1
+        stats.lines += 1
+        # Session source usually appears at the beginning. Later state changes
+        # are selected by narrow field-name checks to avoid JSON-decoding every
+        # prompt/response/tool-content record in very large rollout files.
+        is_usage_hint = b'"token_count"' in raw or b'"token_usage_record"' in raw
+        metadata_hint = (
+            file_line_index <= 50
+            or b'"turn_context"' in raw
+            or b'"effort"' in raw
+            or b'"reasoning_effort"' in raw
+            or b'"approval_policy"' in raw
+            or b'"approvals_reviewer"' in raw
+            or b'"thread_settings_applied"' in raw
+            or b'"codex-auto-review"' in raw
+            or b'"parent' in raw
+            or b'"session_id"' in raw
+            or b'"thread_id"' in raw
+            or b'"conversation_id"' in raw
+            or b'"rollout_id"' in raw
+            or b'"subagent"' in raw
+            or b'"approval' in raw
+        )
+        if not is_usage_hint and not metadata_hint:
+            continue
+        try:
+            obj = records.loads(raw)
+        except ValueError:
+            stats.json_errors += 1
+            continue
 
-    with fh:
-        for raw in fh:
-            file_line_index += 1
-            stats.lines += 1
-            # Session source usually appears at the beginning. Later state changes
-            # are selected by narrow field-name checks to avoid JSON-decoding every
-            # prompt/response/tool-content record in very large rollout files.
-            is_usage_hint = b'"token_count"' in raw or b'"token_usage_record"' in raw
-            metadata_hint = (
-                file_line_index <= 50
-                or b'"turn_context"' in raw
-                or b'"effort"' in raw
-                or b'"reasoning_effort"' in raw
-                or b'"approval_policy"' in raw
-                or b'"approvals_reviewer"' in raw
-                or b'"thread_settings_applied"' in raw
-                or b'"codex-auto-review"' in raw
-                or b'"parent' in raw
-                or b'"session_id"' in raw
-                or b'"thread_id"' in raw
-                or b'"conversation_id"' in raw
-                or b'"rollout_id"' in raw
-                or b'"subagent"' in raw
-                or b'"approval' in raw
-            )
-            if not is_usage_hint and not metadata_hint:
-                continue
+        payload = obj.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+
+        _collect_link_ids(payload, link_info, stats)
+        marker_kind = _approval_marker_kind(payload, obj.get("type"))
+        if marker_kind is not None:
             try:
-                obj = json.loads(raw)
-            except ValueError:
-                stats.json_errors += 1
-                continue
-
-            payload = obj.get("payload") or {}
-            if not isinstance(payload, dict):
-                continue
-
-            _collect_link_ids(payload, link_info, stats)
-            marker_kind = _approval_marker_kind(payload, obj.get("type"))
-            if marker_kind is not None:
-                try:
-                    marker_ts = parse_timestamp(obj["timestamp"])
-                    approval_markers.append((marker_ts, marker_kind))
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-            new_model = model_from_payload(payload)
-            if new_model is not None:
-                model = new_model
-
-            new_effort = effort_from_payload(payload, stats)
-            if new_effort is not None and new_effort != effort:
-                effort = new_effort
-                stats.effort_state_updates += 1
-
-            new_policy, new_reviewer = approval_state_from_payload(payload)
-            if new_policy is not None and new_policy != approval_policy:
-                approval_policy = new_policy
-                stats.approval_policy_updates += 1
-            if new_reviewer is not None and new_reviewer != approvals_reviewer:
-                approvals_reviewer = new_reviewer
-                stats.reviewer_state_updates += 1
-
-            new_source = source_kind_from_payload(payload)
-            if new_source is not None and new_source != source_kind:
-                source_kind = new_source
-                stats.source_kind_updates += 1
-
-            ptype = payload.get("type") or obj.get("type")
-            if ptype not in ("token_count", "token_usage_record"):
-                continue
-            stats.token_count_records += 1
-
-            info = payload.get("info") or {}
-            if not isinstance(info, dict):
-                info = {}
-            last = info.get("last_token_usage") or payload.get("last_token_usage")
-            total = info.get("total_token_usage") or payload.get("total_token_usage")
-            if not isinstance(last, dict):
-                stats.missing_usage += 1
-                continue
-
-            total_input = total_cached = total_output = None
-            if isinstance(total, dict):
-                cur_total = tuple(int(total.get(k, 0) or 0) for k in
-                                  ("input_tokens", "cached_input_tokens", "output_tokens"))
-                if cur_total == prev_total:
-                    stats.immediate_duplicate_totals += 1
-                    continue
-                prev_total = cur_total
-                total_input, total_cached, total_output = cur_total
-
-            windows = extract_rate_windows(payload.get("rate_limits"))
-            if not windows:
-                stats.missing_target_limit += 1
-                continue
-            for minutes in windows:
-                stats.window_records[minutes] = stats.window_records.get(minutes, 0) + 1
-
-            target = windows.get(target_window_minutes)
-            if target is None:
-                stats.missing_target_limit += 1
-                used = float("nan")
-                reset_at = float("nan")
-            else:
-                stats.target_candidate_events += 1
-                used = target.used
-                reset_at = target.reset_at
-
-            try:
-                ts_raw = obj["timestamp"]
-                ts = parse_timestamp(ts_raw)
+                marker_ts = parse_timestamp(obj["timestamp"])
+                approval_markers.append((marker_ts, marker_kind))
             except (KeyError, TypeError, ValueError):
-                stats.json_errors += 1
+                pass
+
+        new_model = model_from_payload(payload)
+        if new_model is not None:
+            model = new_model
+
+        new_effort = effort_from_payload(payload, stats)
+        if new_effort is not None and new_effort != effort:
+            effort = new_effort
+            stats.effort_state_updates += 1
+
+        new_policy, new_reviewer = approval_state_from_payload(payload)
+        if new_policy is not None and new_policy != approval_policy:
+            approval_policy = new_policy
+            stats.approval_policy_updates += 1
+        if new_reviewer is not None and new_reviewer != approvals_reviewer:
+            approvals_reviewer = new_reviewer
+            stats.reviewer_state_updates += 1
+
+        new_source = source_kind_from_payload(payload)
+        if new_source is not None and new_source != source_kind:
+            source_kind = new_source
+            stats.source_kind_updates += 1
+
+        ptype = payload.get("type") or obj.get("type")
+        if ptype not in ("token_count", "token_usage_record"):
+            continue
+        stats.token_count_records += 1
+
+        info = payload.get("info") or {}
+        if not isinstance(info, dict):
+            info = {}
+        last = info.get("last_token_usage") or payload.get("last_token_usage")
+        total = info.get("total_token_usage") or payload.get("total_token_usage")
+        if not isinstance(last, dict):
+            stats.missing_usage += 1
+            continue
+
+        total_input = total_cached = total_output = None
+        if isinstance(total, dict):
+            cur_total = tuple(int(total.get(k, 0) or 0) for k in
+                              ("input_tokens", "cached_input_tokens", "output_tokens"))
+            if cur_total == prev_total:
+                stats.immediate_duplicate_totals += 1
                 continue
+            prev_total = cur_total
+            total_input, total_cached, total_output = cur_total
 
-            inp = int(last.get("input_tokens", 0) or 0)
-            cached = int(last.get("cached_input_tokens", 0) or 0)
-            output = int(last.get("output_tokens", 0) or 0)
-            reasoning_output = int(last.get("reasoning_output_tokens", 0) or 0)
-            uncached = max(inp - cached, 0)
-            current_model = model or "unknown"
-            current_effort = effort or "unknown"
-            if current_effort == "unknown":
-                stats.unknown_effort_events += 1
-            api_usd = price_event(current_model, uncached, cached, output, prices, ts=ts)
+        windows = extract_rate_windows(payload.get("rate_limits"))
+        if not windows:
+            stats.missing_target_limit += 1
+            continue
+        for minutes in windows:
+            stats.window_records[minutes] = stats.window_records.get(minutes, 0) + 1
 
-            out.append(Event(
-                ts_raw=ts_raw,
-                ts=ts,
-                source=path,
-                model=current_model,
-                uncached=uncached,
-                cached=cached,
-                output=output,
-                used=used,
-                reset_at=reset_at,
-                window_minutes=target_window_minutes,
-                priced=api_usd is not None,
-                api_usd=api_usd,
-                effort=current_effort,
-                reasoning_output=reasoning_output,
-                approval_policy=approval_policy or "unknown",
-                approvals_reviewer=approvals_reviewer or "unknown",
-                source_kind=source_kind or "unknown",
-                rate_windows=windows,
-                total_input=total_input,
-                total_cached=total_cached,
-                total_output=total_output,
-                source_index=source_index,
-            ))
-            source_index += 1
-            stats.candidate_events += 1
+        target = windows.get(target_window_minutes)
+        if target is None:
+            stats.missing_target_limit += 1
+            used = float("nan")
+            reset_at = float("nan")
+        else:
+            stats.target_candidate_events += 1
+            used = target.used
+            reset_at = target.reset_at
+
+        try:
+            ts_raw = obj["timestamp"]
+            ts = parse_timestamp(ts_raw)
+        except (KeyError, TypeError, ValueError):
+            stats.json_errors += 1
+            continue
+
+        inp = int(last.get("input_tokens", 0) or 0)
+        cached = int(last.get("cached_input_tokens", 0) or 0)
+        output = int(last.get("output_tokens", 0) or 0)
+        reasoning_output = int(last.get("reasoning_output_tokens", 0) or 0)
+        uncached = max(inp - cached, 0)
+        current_model = model or "unknown"
+        current_effort = effort or "unknown"
+        if current_effort == "unknown":
+            stats.unknown_effort_events += 1
+        api_usd = price_event(current_model, uncached, cached, output, prices, ts=ts)
+
+        out.append(Event(
+            ts_raw=ts_raw,
+            ts=ts,
+            source=path,
+            model=current_model,
+            uncached=uncached,
+            cached=cached,
+            output=output,
+            used=used,
+            reset_at=reset_at,
+            window_minutes=target_window_minutes,
+            priced=api_usd is not None,
+            api_usd=api_usd,
+            effort=current_effort,
+            reasoning_output=reasoning_output,
+            approval_policy=approval_policy or "unknown",
+            approvals_reviewer=approvals_reviewer or "unknown",
+            source_kind=source_kind or "unknown",
+            rate_windows=windows,
+            total_input=total_input,
+            total_cached=total_cached,
+            total_output=total_output,
+            source_index=source_index,
+        ))
+        source_index += 1
+        stats.candidate_events += 1
 
     path_fp = _rollout_fingerprint(path)
     if path_fp:
@@ -1216,15 +1218,42 @@ def load_events(home: str,
                 replay_min_events: int,
                 replay_min_growth_mtokens: float,
                 replay_start_max_mtokens: float,
-                dense_threshold: int) -> Tuple[List[Event], ParseStats]:
+                dense_threshold: int, *, use_cache=True, cache_dir=None, rebuild_cache=False) -> Tuple[List[Event], ParseStats]:
     """Return deduplicated events with evidence-based replay flags attached."""
     stats = ParseStats()
     paths = session_files(home)
     stats.files = len(paths)
 
     candidates: List[Event] = []
-    for path in paths:
-        candidates.extend(parse_file(path, prices, target_window_minutes, stats))
+    with Index(home, cache_dir, enabled=use_cache, rebuild=rebuild_cache) as index:
+        index.prune(paths)
+        for path in paths:
+            try:
+                cached, before = index.get(path, "quota", target_window_minutes)
+            except OSError:
+                continue
+            if cached is None:
+                local_stats = ParseStats()
+                events = parse_file(path, {}, target_window_minutes, local_stats)
+                cached = (events, local_stats)
+                index.put(path, "quota", target_window_minutes, before, cached)
+            events, local_stats = cached
+            for item in fields(ParseStats):
+                value = getattr(local_stats, item.name)
+                target = getattr(stats, item.name)
+                if isinstance(value, int):
+                    setattr(stats, item.name, target + value)
+                elif item.name in {"window_records", "link_schema_paths"}:
+                    for key, count in value.items():
+                        target[key] = target.get(key, 0) + count
+                else:
+                    target.update(value)
+            for event in events:
+                event.api_usd = price_event(event.model, event.uncached, event.cached, event.output, prices, ts=event.ts)
+                event.priced = event.api_usd is not None
+            candidates.extend(events)
+        if index.warning:
+            print(index.warning, file=sys.stderr)
     candidates.sort(key=lambda e: (e.ts, e.ts_raw, e.source))
 
     by_identity: Dict[Tuple[object, ...], Event] = {}
@@ -5782,6 +5811,10 @@ Everything except --charts uses only the Python standard library.
 
     common = p.add_argument_group("Common options")
     common.add_argument("--home", default="~/.codex", help="Codex data directory")
+    common.add_argument("--no-cache", action="store_true", help="read quota telemetry directly without using or writing the local cache")
+    common.add_argument("--rebuild-cache", action="store_true", help="re-extract cache entries for this Codex home")
+    common.add_argument("--cache-dir", metavar="DIRECTORY", help="override the local telemetry cache directory")
+
     common.add_argument("--prices", help="JSON file overriding/extending API normalization prices")
     common.add_argument("--include-replays", action="store_true",
                         help="include probable replay prefixes in the primary analysis (debug/sensitivity)")
@@ -6068,7 +6101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.path.expanduser(args.home), prices, args.window_minutes,
         args.replay_scan_seconds, args.replay_min_events,
         args.replay_min_growth_mtokens, args.replay_start_max_mtokens,
-        args.dense_threshold,
+        args.dense_threshold, use_cache=not args.no_cache, cache_dir=args.cache_dir, rebuild_cache=args.rebuild_cache,
     )
     if not all_records:
         print("No analyzable Codex events found.")

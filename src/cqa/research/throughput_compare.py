@@ -40,7 +40,7 @@ from ..workflow.response_efficiency import (
 
 SCHEMA = "cqa-throughput-comparison"
 SCHEMA_VERSION = "1.0.0"
-GENERATOR_VERSION = "0.8.0"
+GENERATOR_VERSION = "0.9.0"
 
 
 @dataclass(frozen=True)

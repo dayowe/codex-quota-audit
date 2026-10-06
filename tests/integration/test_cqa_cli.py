@@ -17,6 +17,14 @@ from cqa.workflow import candidates as finder
 
 
 class UnifiedCliTests(unittest.TestCase):
+    def test_combined_rebuild_does_not_discard_fresh_workflow_cache(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(cqa, "_call_main", side_effect=self._fake_call_main) as call:
+            self.assertEqual(cqa.dashboard_main(["--home", directory, "--workflow", "W-test",
+                                                  "--rebuild-cache", "--no-open", "--quiet"]), 0)
+            self.assertIn("--rebuild-cache", call.call_args_list[0].args[1])
+            self.assertNotIn("--rebuild-cache", call.call_args_list[1].args[1])
+
     def _session(self, key, when, tokens=100, *, source_kind="unknown", model=None):
         session = finder.Session(
             path=f"/{key}.jsonl", session_key=key,
@@ -212,6 +220,7 @@ class UnifiedCliTests(unittest.TestCase):
              mock.patch.object(cqa, "_call_main", side_effect=self._fake_call_main) as call, \
              mock.patch.object(cqa, "open_report"):
             role_map = str(Path(d) / "roles.json")
+            Path(role_map).write_text(json.dumps({"schema": "workflow-role-map-v1", "sessions": []}))
             rc = cqa.dashboard_main(["--home", d, "--workflow", "latest",
                                      "--workflow-root-role", "manager",
                                      "--workflow-role-map", role_map,

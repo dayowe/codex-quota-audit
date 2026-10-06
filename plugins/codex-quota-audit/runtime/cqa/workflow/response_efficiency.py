@@ -10,6 +10,7 @@ inference timing.
 from __future__ import annotations
 
 import json
+import contextlib
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import candidates as finder
+from .records import response_timing_hint
 
 
 @dataclass
@@ -119,7 +121,7 @@ def _response_result_type(payload_type: str) -> bool:
 
 def parse_tool_excluded_tasks(path: str, *, activation: Optional[datetime] = None,
                               after: Optional[datetime] = None,
-                              before: Optional[datetime] = None) -> List[ToolExcludedTask]:
+                              before: Optional[datetime] = None, records=None) -> List[ToolExcludedTask]:
     """Extract task/tool response timing without retaining content.
 
     Model/effort context is allowed to flow through pre-boundary records, but
@@ -157,21 +159,15 @@ def parse_tool_excluded_tasks(path: str, *, activation: Optional[datetime] = Non
         })
 
     try:
-        fh = open(path, "rb")
+        fh = open(path, "rb") if records is None else contextlib.nullcontext(records)
     except OSError:
         return []
 
-    with fh:
-        for raw in fh:
-            low = raw.lower()
-            if not (
-                b'"task_started"' in raw or b'"task_complete"' in raw
-                or b'"turn_context"' in raw or b'"token_usage_record"' in raw
-                or b'"item_completed"' in raw or b'"function_call"' in raw
-                or b'"custom_tool_call"' in raw or b'"tool_call"' in raw
-                or b'call_output' in low or b'call_result' in low
-                or b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
-            ):
+    with fh as stream:
+        for raw in stream:
+            # Cached records were selected using this same predicate before
+            # content was stripped; do not re-filter their sanitized payloads.
+            if records is None and not response_timing_hint(raw):
                 continue
             try:
                 obj = json.loads(raw)
@@ -508,7 +504,7 @@ def method_description() -> dict:
 def build_response_efficiency(family, sessions: Mapping[str, object], labels: Mapping[str, str],
                               identities: Mapping[str, Mapping[str, object]], *,
                               after: Optional[datetime] = None,
-                              before: Optional[datetime] = None) -> dict:
+                              before: Optional[datetime] = None, observations=None) -> dict:
     """Aggregate tool-excluded response efficiency for one workflow family."""
     all_tasks: List[ToolExcludedTask] = []
     by_model: Dict[str, List[ToolExcludedTask]] = defaultdict(list)
@@ -521,6 +517,7 @@ def build_response_efficiency(family, sessions: Mapping[str, object], labels: Ma
         tasks = parse_tool_excluded_tasks(
             session.path, activation=activation if isinstance(activation, datetime) else None,
             after=after, before=before,
+            records=((json.dumps(r).encode() for r in observations[key].response_records) if observations is not None else None)
         )
         label = labels[key]
         all_tasks.extend(tasks)

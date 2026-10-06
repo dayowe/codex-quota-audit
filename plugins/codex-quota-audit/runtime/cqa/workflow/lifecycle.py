@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
+    from . import records
     from . import candidates as finder
 except ImportError as exc:  # pragma: no cover - user-facing path
     raise SystemExit(
@@ -511,6 +512,10 @@ def extract_usage(payload: object, ts: datetime, session_key: str,
 
 
 def parse_family_session(path: str, session_key: str, roles: Sequence[str]) -> ParsedSession:
+    return records.read_consumer(path, session_consumer(session_key, roles), ParsedSession())
+
+
+def session_consumer(session_key: str, roles: Sequence[str]):
     out = ParsedSession()
     current_model = "unknown"
     current_effort = "unknown"
@@ -526,233 +531,230 @@ def parse_family_session(path: str, session_key: str, roles: Sequence[str]) -> P
     task_meta_pending: Dict[str, dict] = {}
     active_turn_id: Optional[str] = None
 
-    try:
-        fh = open(path, "rb")
-    except OSError:
-        return out
+    while True:
+        raw = yield
+        if raw is None:
+            break
+        # Fast skip while preserving model/effort/usage/action/output records.
+        low = raw.lower()
+        if not (
+            b'"token_count"' in raw or b'"token_usage_record"' in raw
+            or b'"item_completed"' in raw or b'"task_complete"' in raw
+            or b'"function_call"' in raw or b'"tool_call"' in raw
+            or b'"spawn_agent"' in low or b'"send_input"' in low
+            or b'wait_agent' in low or b'send_message' in low or b'followup_task' in low
+            or b'interrupt_agent' in low or b'"wait"' in low or b'"resume_agent"' in low or b'"close_agent"' in low
+            or b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
+            or b'"call_id"' in raw or b'"tool_call_id"' in raw
+        ):
+            continue
 
-    with fh:
-        for raw in fh:
-            # Fast skip while preserving model/effort/usage/action/output records.
-            low = raw.lower()
-            if not (
-                b'"token_count"' in raw or b'"token_usage_record"' in raw
-                or b'"item_completed"' in raw or b'"task_complete"' in raw
-                or b'"function_call"' in raw or b'"tool_call"' in raw
-                or b'"spawn_agent"' in low or b'"send_input"' in low
-                or b'wait_agent' in low or b'send_message' in low or b'followup_task' in low
-                or b'interrupt_agent' in low or b'"wait"' in low or b'"resume_agent"' in low or b'"close_agent"' in low
-                or b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
-                or b'"call_id"' in raw or b'"tool_call_id"' in raw
-            ):
-                continue
+        try:
+            obj = records.loads(raw)
+        except Exception:
+            out.parse_errors += 1
+            continue
 
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                out.parse_errors += 1
-                continue
+        ts = parse_ts(obj.get("timestamp"))
+        payload = obj.get("payload")
+        if ts is None or not isinstance(payload, dict):
+            continue
 
-            ts = parse_ts(obj.get("timestamp"))
-            payload = obj.get("payload")
-            if ts is None or not isinstance(payload, dict):
-                continue
+        model = finder.model_from_payload(payload)
+        if model:
+            current_model = model
+        effort = finder.effort_from_payload(payload)
+        if effort:
+            current_effort = effort
 
-            model = finder.model_from_payload(payload)
-            if model:
-                current_model = model
-            effort = finder.effort_from_payload(payload)
-            if effort:
-                current_effort = effort
+        # Timing telemetry is deliberately content-free. We retain only
+        # response-local timestamps and token counts. Raw response/turn IDs
+        # are one-way hashed before they enter privacy-safe objects.
+        top_type = str(obj.get("type", ""))
+        payload_type = str(payload.get("type", ""))
+        raw_turn_id = payload.get("turn_id")
+        meta = payload.get("internal_chat_message_metadata_passthrough")
+        if not isinstance(raw_turn_id, str) and isinstance(meta, dict):
+            raw_turn_id = meta.get("turn_id")
+        if isinstance(raw_turn_id, str) and raw_turn_id:
+            active_turn_id = raw_turn_id
 
-            # Timing telemetry is deliberately content-free. We retain only
-            # response-local timestamps and token counts. Raw response/turn IDs
-            # are one-way hashed before they enter privacy-safe objects.
-            top_type = str(obj.get("type", ""))
-            payload_type = str(payload.get("type", ""))
-            raw_turn_id = payload.get("turn_id")
-            meta = payload.get("internal_chat_message_metadata_passthrough")
-            if not isinstance(raw_turn_id, str) and isinstance(meta, dict):
-                raw_turn_id = meta.get("turn_id")
-            if isinstance(raw_turn_id, str) and raw_turn_id:
-                active_turn_id = raw_turn_id
+        def pending_for(rid: str) -> dict:
+            cand = timing_pending.setdefault(rid, {
+                "agent_intervals": [], "agent_message_count": 0, "reasoning_intervals": [],
+                "has_nonvisible_model_output": False,
+                "model": current_model, "effort": current_effort, "ts": ts,
+            })
+            cand["model"] = current_model or cand.get("model") or "unknown"
+            cand["effort"] = current_effort or cand.get("effort") or "unknown"
+            cand["ts"] = max(cand.get("ts", ts), ts)
+            return cand
 
-            def pending_for(rid: str) -> dict:
-                cand = timing_pending.setdefault(rid, {
+        if isinstance(raw_turn_id, str) and raw_turn_id and payload_type == "item_completed":
+            cand = pending_for(raw_turn_id)
+            item = payload.get("item")
+            if isinstance(item, dict):
+                item_type = str(item.get("type", "")).lower()
+                start_ms = payload.get("started_at_ms")
+                end_ms = payload.get("completed_at_ms")
+                if isinstance(start_ms, (int, float)) and isinstance(end_ms, (int, float)) and end_ms > start_ms:
+                    interval = (float(start_ms) / 1000.0, float(end_ms) / 1000.0)
+                    if item_type == "agentmessage":
+                        cand["agent_intervals"].append(interval)
+                    elif item_type == "reasoning":
+                        cand["reasoning_intervals"].append(interval)
+                if item_type == "agentmessage":
+                    cand["agent_message_count"] = int(cand.get("agent_message_count", 0)) + 1
+                # Known model-output call items share the same response token
+                # budget as visible text. Tool-result/output records are *not*
+                # model output and must not contaminate the next response.
+                if ("call" in item_type and "message" not in item_type
+                        and not item_type.endswith(("_output", "_result"))):
+                    cand["has_nonvisible_model_output"] = True
+
+        # response_item function/tool calls can lack a direct turn_id. Use
+        # the latest active turn in this serialized session as a conservative
+        # association solely to disqualify mixed-output responses.
+        if top_type == "response_item":
+            item_type = str(payload.get("type", "")).lower()
+            rid = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else active_turn_id
+            is_model_call = (
+                item_type in {"function_call", "custom_tool_call", "tool_call"}
+                or (item_type.endswith("_call") and not item_type.endswith(("_call_output", "_call_result")))
+            )
+            if rid and is_model_call:
+                pending_for(rid)["has_nonvisible_model_output"] = True
+
+        if top_type == "token_usage_record":
+            rid = payload.get("turn_id")
+            response_usage = payload.get("usage")
+            fallback_usage = payload.get("turn_token_usage")
+            usage_obj = response_usage if isinstance(response_usage, dict) else fallback_usage
+            if isinstance(rid, str) and rid and isinstance(usage_obj, dict):
+                cand = pending_for(rid)
+                agent_intervals = cand.get("agent_intervals") or []
+                reasoning_intervals = cand.get("reasoning_intervals") or []
+                generation_seconds = sum(max(0.0, b - a) for a, b in agent_intervals) or None
+                reasoning_seconds = sum(max(0.0, b - a) for a, b in reasoning_intervals) or None
+                out_tokens = max(0, int(usage_obj.get("output_tokens", 0) or 0))
+                reasoning_tokens = max(0, int(usage_obj.get("reasoning_output_tokens", 0) or 0))
+                response_level = isinstance(response_usage, dict)
+                qualified = False
+                reason = "missing_agent_message_timing"
+                if agent_intervals and generation_seconds and generation_seconds > 0:
+                    if not response_level:
+                        reason = "missing_response_level_usage"
+                    elif cand.get("has_nonvisible_model_output"):
+                        reason = "mixed_visible_and_tool_output"
+                    else:
+                        qualified = True
+                        reason = "timed_visible_response"
+                elif agent_intervals:
+                    reason = "zero_agent_message_duration"
+                response_id = payload.get("response_id") or f"{rid}:{len(out.turn_timings)+1}"
+                timing = TurnTiming(
+                    ts=ts, session_key=session_key, turn_key=short_hash(response_id, "T"),
+                    model=str(cand.get("model") or "unknown"), effort=str(cand.get("effort") or "unknown"),
+                    input_tokens=max(0, int(usage_obj.get("input_tokens", 0) or 0)),
+                    cached_input_tokens=max(0, int(usage_obj.get("cached_input_tokens", 0) or 0)),
+                    output_tokens=out_tokens, reasoning_tokens=reasoning_tokens,
+                    visible_output_tokens=max(0, out_tokens - reasoning_tokens) if qualified else 0,
+                    task_duration_seconds=None, time_to_first_token_seconds=None,
+                    visible_generation_seconds=generation_seconds if qualified else None,
+                    reasoning_duration_seconds=reasoning_seconds,
+                    visible_generation_qualified=qualified, qualification_reason=reason,
+                    is_first_response_in_task=rid not in first_response_by_turn,
+                    visible_message_count=int(cand.get("agent_message_count", len(agent_intervals))),
+                    response_level_usage=response_level,
+                    visible_message_seconds=generation_seconds,
+                )
+                if rid not in first_response_by_turn:
+                    first_response_by_turn[rid] = timing
+                    pending_meta = task_meta_pending.pop(rid, None)
+                    if pending_meta:
+                        timing.task_duration_seconds = pending_meta.get("task_duration_seconds")
+                        timing.time_to_first_token_seconds = pending_meta.get("ttft_seconds")
+                out.turn_timings.append(timing)
+                # The token record closes this model response. New output
+                # items in the same user task belong to a later response.
+                timing_pending[rid] = {
                     "agent_intervals": [], "agent_message_count": 0, "reasoning_intervals": [],
                     "has_nonvisible_model_output": False,
                     "model": current_model, "effort": current_effort, "ts": ts,
-                })
-                cand["model"] = current_model or cand.get("model") or "unknown"
-                cand["effort"] = current_effort or cand.get("effort") or "unknown"
-                cand["ts"] = max(cand.get("ts", ts), ts)
-                return cand
+                }
 
-            if isinstance(raw_turn_id, str) and raw_turn_id and payload_type == "item_completed":
-                cand = pending_for(raw_turn_id)
-                item = payload.get("item")
-                if isinstance(item, dict):
-                    item_type = str(item.get("type", "")).lower()
-                    start_ms = payload.get("started_at_ms")
-                    end_ms = payload.get("completed_at_ms")
-                    if isinstance(start_ms, (int, float)) and isinstance(end_ms, (int, float)) and end_ms > start_ms:
-                        interval = (float(start_ms) / 1000.0, float(end_ms) / 1000.0)
-                        if item_type == "agentmessage":
-                            cand["agent_intervals"].append(interval)
-                        elif item_type == "reasoning":
-                            cand["reasoning_intervals"].append(interval)
-                    if item_type == "agentmessage":
-                        cand["agent_message_count"] = int(cand.get("agent_message_count", 0)) + 1
-                    # Known model-output call items share the same response token
-                    # budget as visible text. Tool-result/output records are *not*
-                    # model output and must not contaminate the next response.
-                    if ("call" in item_type and "message" not in item_type
-                            and not item_type.endswith(("_output", "_result"))):
-                        cand["has_nonvisible_model_output"] = True
+        if isinstance(raw_turn_id, str) and raw_turn_id and payload_type == "task_complete":
+            duration_ms = payload.get("duration_ms")
+            ttft_ms = payload.get("time_to_first_token_ms")
+            meta_values = {}
+            if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
+                meta_values["task_duration_seconds"] = float(duration_ms) / 1000.0
+            if isinstance(ttft_ms, (int, float)) and ttft_ms >= 0:
+                meta_values["ttft_seconds"] = float(ttft_ms) / 1000.0
+            timing = first_response_by_turn.get(raw_turn_id)
+            if timing is not None:
+                timing.task_duration_seconds = meta_values.get("task_duration_seconds")
+                timing.time_to_first_token_seconds = meta_values.get("ttft_seconds")
+            elif meta_values:
+                task_meta_pending[raw_turn_id] = meta_values
 
-            # response_item function/tool calls can lack a direct turn_id. Use
-            # the latest active turn in this serialized session as a conservative
-            # association solely to disqualify mixed-output responses.
-            if top_type == "response_item":
-                item_type = str(payload.get("type", "")).lower()
-                rid = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else active_turn_id
-                is_model_call = (
-                    item_type in {"function_call", "custom_tool_call", "tool_call"}
-                    or (item_type.endswith("_call") and not item_type.endswith(("_call_output", "_call_result")))
-                )
-                if rid and is_model_call:
-                    pending_for(rid)["has_nonvisible_model_output"] = True
+        usage = extract_usage(payload, ts, session_key, current_model, current_effort)
+        if usage is not None:
+            if usage.cumulative_total is not None and usage.cumulative_total == prev_cumulative:
+                continue
+            if usage.cumulative_total is not None:
+                prev_cumulative = usage.cumulative_total
+            out.usage.append(usage)
 
-            if top_type == "token_usage_record":
-                rid = payload.get("turn_id")
-                response_usage = payload.get("usage")
-                fallback_usage = payload.get("turn_token_usage")
-                usage_obj = response_usage if isinstance(response_usage, dict) else fallback_usage
-                if isinstance(rid, str) and rid and isinstance(usage_obj, dict):
-                    cand = pending_for(rid)
-                    agent_intervals = cand.get("agent_intervals") or []
-                    reasoning_intervals = cand.get("reasoning_intervals") or []
-                    generation_seconds = sum(max(0.0, b - a) for a, b in agent_intervals) or None
-                    reasoning_seconds = sum(max(0.0, b - a) for a, b in reasoning_intervals) or None
-                    out_tokens = max(0, int(usage_obj.get("output_tokens", 0) or 0))
-                    reasoning_tokens = max(0, int(usage_obj.get("reasoning_output_tokens", 0) or 0))
-                    response_level = isinstance(response_usage, dict)
-                    qualified = False
-                    reason = "missing_agent_message_timing"
-                    if agent_intervals and generation_seconds and generation_seconds > 0:
-                        if not response_level:
-                            reason = "missing_response_level_usage"
-                        elif cand.get("has_nonvisible_model_output"):
-                            reason = "mixed_visible_and_tool_output"
-                        else:
-                            qualified = True
-                            reason = "timed_visible_response"
-                    elif agent_intervals:
-                        reason = "zero_agent_message_duration"
-                    response_id = payload.get("response_id") or f"{rid}:{len(out.turn_timings)+1}"
-                    timing = TurnTiming(
-                        ts=ts, session_key=session_key, turn_key=short_hash(response_id, "T"),
-                        model=str(cand.get("model") or "unknown"), effort=str(cand.get("effort") or "unknown"),
-                        input_tokens=max(0, int(usage_obj.get("input_tokens", 0) or 0)),
-                        cached_input_tokens=max(0, int(usage_obj.get("cached_input_tokens", 0) or 0)),
-                        output_tokens=out_tokens, reasoning_tokens=reasoning_tokens,
-                        visible_output_tokens=max(0, out_tokens - reasoning_tokens) if qualified else 0,
-                        task_duration_seconds=None, time_to_first_token_seconds=None,
-                        visible_generation_seconds=generation_seconds if qualified else None,
-                        reasoning_duration_seconds=reasoning_seconds,
-                        visible_generation_qualified=qualified, qualification_reason=reason,
-                        is_first_response_in_task=rid not in first_response_by_turn,
-                        visible_message_count=int(cand.get("agent_message_count", len(agent_intervals))),
-                        response_level_usage=response_level,
-                        visible_message_seconds=generation_seconds,
-                    )
-                    if rid not in first_response_by_turn:
-                        first_response_by_turn[rid] = timing
-                        pending_meta = task_meta_pending.pop(rid, None)
-                        if pending_meta:
-                            timing.task_duration_seconds = pending_meta.get("task_duration_seconds")
-                            timing.time_to_first_token_seconds = pending_meta.get("ttft_seconds")
-                    out.turn_timings.append(timing)
-                    # The token record closes this model response. New output
-                    # items in the same user task belong to a later response.
-                    timing_pending[rid] = {
-                        "agent_intervals": [], "agent_message_count": 0, "reasoning_intervals": [],
-                        "has_nonvisible_model_output": False,
-                        "model": current_model, "effort": current_effort, "ts": ts,
-                    }
+        output_record = extract_output_record(payload)
+        if output_record:
+            call_id, ids = output_record
+            out.action_outputs[call_id].update(ids)
+            result = parse_jsonish(payload.get("output", payload.get("result")))
+            if isinstance(result, dict):
+                task_name = compact_task_name(result.get("task_name"))
+                if task_name:
+                    result_tasks[call_id].add(task_name)
 
-            if isinstance(raw_turn_id, str) and raw_turn_id and payload_type == "task_complete":
-                duration_ms = payload.get("duration_ms")
-                ttft_ms = payload.get("time_to_first_token_ms")
-                meta_values = {}
-                if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
-                    meta_values["task_duration_seconds"] = float(duration_ms) / 1000.0
-                if isinstance(ttft_ms, (int, float)) and ttft_ms >= 0:
-                    meta_values["ttft_seconds"] = float(ttft_ms) / 1000.0
-                timing = first_response_by_turn.get(raw_turn_id)
-                if timing is not None:
-                    timing.task_duration_seconds = meta_values.get("task_duration_seconds")
-                    timing.time_to_first_token_seconds = meta_values.get("ttft_seconds")
-                elif meta_values:
-                    task_meta_pending[raw_turn_id] = meta_values
+        for node in action_node_candidates(payload):
+            names = []
+            if isinstance(node.get("name"), str):
+                names.append(node["name"])
+            if isinstance(node.get("tool_name"), str):
+                names.append(node["tool_name"])
+            fn = node.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                names.append(fn["name"])
+            name = next((n for n in names if classify_action(n)), None)
+            kind = classify_action(name) if name else None
+            if not kind:
+                continue
 
-            usage = extract_usage(payload, ts, session_key, current_model, current_effort)
-            if usage is not None:
-                if usage.cumulative_total is not None and usage.cumulative_total == prev_cumulative:
-                    continue
-                if usage.cumulative_total is not None:
-                    prev_cumulative = usage.cumulative_total
-                out.usage.append(usage)
+            args = node.get("arguments")
+            if args is None:
+                args = node.get("args")
+            if args is None and isinstance(fn, dict):
+                args = fn.get("arguments")
+            args = parse_jsonish(args)
 
-            output_record = extract_output_record(payload)
-            if output_record:
-                call_id, ids = output_record
-                out.action_outputs[call_id].update(ids)
-                result = parse_jsonish(payload.get("output", payload.get("result")))
-                if isinstance(result, dict):
-                    task_name = compact_task_name(result.get("task_name"))
-                    if task_name:
-                        result_tasks[call_id].add(task_name)
+            task_name = compact_task_name(args.get("task_name")) if isinstance(args, dict) and kind == "spawn" else None
 
-            for node in action_node_candidates(payload):
-                names = []
-                if isinstance(node.get("name"), str):
-                    names.append(node["name"])
-                if isinstance(node.get("tool_name"), str):
-                    names.append(node["tool_name"])
-                fn = node.get("function")
-                if isinstance(fn, dict) and isinstance(fn.get("name"), str):
-                    names.append(fn["name"])
-                name = next((n for n in names if classify_action(n)), None)
-                kind = classify_action(name) if name else None
-                if not kind:
-                    continue
+            call_raw = (
+                node.get("call_id") or node.get("tool_call_id")
+                or node.get("function_call_id") or node.get("id")
+            )
+            call_id = hash_id(call_raw) if call_raw is not None else None
 
-                args = node.get("arguments")
-                if args is None:
-                    args = node.get("args")
-                if args is None and isinstance(fn, dict):
-                    args = fn.get("arguments")
-                args = parse_jsonish(args)
-
-                task_name = compact_task_name(args.get("task_name")) if isinstance(args, dict) and kind == "spawn" else None
-
-                call_raw = (
-                    node.get("call_id") or node.get("tool_call_id")
-                    or node.get("function_call_id") or node.get("id")
-                )
-                call_id = hash_id(call_raw) if call_raw is not None else None
-
-                out.actions.append(ActionEvent(
-                    ts=ts,
-                    caller_key=session_key,
-                    kind=kind,
-                    name=str(name),
-                    call_id=call_id,
-                    target_ids=collect_action_target_ids(args),
-                    role_hints=collect_role_hints(args, roles),
-                    task_name=task_name,
-                ))
+            out.actions.append(ActionEvent(
+                ts=ts,
+                caller_key=session_key,
+                kind=kind,
+                name=str(name),
+                call_id=call_id,
+                target_ids=collect_action_target_ids(args),
+                role_hints=collect_role_hints(args, roles),
+                task_name=task_name,
+            ))
 
     out.turn_timings.sort(key=lambda t: (t.ts, t.turn_key))
 

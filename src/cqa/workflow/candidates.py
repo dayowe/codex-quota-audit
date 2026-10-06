@@ -4,7 +4,7 @@ Codex workflow candidate finder v2
 
 Find recent, clean multi-agent workflow families in local Codex rollout logs.
 
-This helper is intentionally read-only and privacy-conscious:
+Source logs are read-only; extracted observations are cached locally:
 - scans ~/.codex/sessions and ~/.codex/archived_sessions
 - reconstructs parent -> subagent relationships from session/thread/rollout IDs
 - fingerprints linkage IDs before storing or printing them
@@ -28,7 +28,10 @@ import json
 import math
 import os
 import re
+from functools import lru_cache
+from . import records
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -222,11 +225,16 @@ def is_noisy_path(path: Tuple[str, ...]) -> bool:
     return any(part.lower() in NOISY_PATH_TERMS for part in path)
 
 
+@lru_cache(maxsize=256)
+def _role_pattern(role):
+    return re.compile(rf"(?<![a-z0-9]){re.escape(role)}(?![a-z0-9])")
+
+
 def role_match(value: str, roles: Sequence[str]) -> List[str]:
     lower = value.lower()
     found = []
     for role in roles:
-        if re.search(rf"(?<![a-z0-9]){re.escape(role)}(?![a-z0-9])", lower):
+        if _role_pattern(role).search(lower):
             found.append(role)
     return found
 
@@ -455,6 +463,8 @@ class Discovery:
     edges: List[Edge]
     families: List[Family]
     link_schema: Counter
+    roles: tuple = ()
+    stats: dict = field(default_factory=dict)
 
 
 def file_paths(home: str) -> List[str]:
@@ -465,6 +475,10 @@ def file_paths(home: str) -> List[str]:
 
 
 def scan_session(path: str, roles: Sequence[str]) -> Session:
+    return records.read_consumer(path, summary_consumer(path, roles), Session(path, short_key("S", rollout_fp(path) or hashlib.sha256(path.encode()).hexdigest()[:24])))
+
+
+def summary_consumer(path: str, roles: Sequence[str]):
     path_seed = rollout_fp(path) or hashlib.sha256(path.encode()).hexdigest()[:24]
     s = Session(path=path, session_key=short_key("S", path_seed))
     rf = rollout_fp(path)
@@ -476,92 +490,90 @@ def scan_session(path: str, roles: Sequence[str]) -> Session:
     source_kind = "unknown"
     prev_total: Optional[Tuple[int, int, int]] = None
 
-    try:
-        fh = open(path, "rb")
-    except OSError:
-        return s
+    line_no = 0
+    while True:
+        raw = yield
+        if raw is None:
+            break
+        line_no += 1
+        # Parse only records likely to contain metadata, role labels, or usage.
+        low = raw.lower()
+        role_hint = any(role.encode() in low for role in roles)
+        metadata_hint = (
+            line_no <= 80
+            or role_hint
+            or b'"token_count"' in raw
+            or b'"token_usage_record"' in raw
+            or b'"source"' in raw
+            or b'"parent' in raw
+            or b'"session_id"' in raw
+            or b'"thread_id"' in raw
+            or b'"conversation_id"' in raw
+            or b'"rollout_id"' in raw
+            or b'"subagent"' in raw
+            or b'"agent_path"' in raw
+            or b'"recipient"' in raw
+            or b'"environments"' in raw
+            or b'"model"' in raw
+            or b'"effort"' in raw
+            or b'"reasoning_effort"' in raw
+        )
+        if not metadata_hint:
+            continue
 
-    with fh:
-        for line_no, raw in enumerate(fh, 1):
-            # Parse only records likely to contain metadata, role labels, or usage.
-            low = raw.lower()
-            role_hint = any(role.encode() in low for role in roles)
-            metadata_hint = (
-                line_no <= 80
-                or role_hint
-                or b'"token_count"' in raw
-                or b'"token_usage_record"' in raw
-                or b'"source"' in raw
-                or b'"parent' in raw
-                or b'"session_id"' in raw
-                or b'"thread_id"' in raw
-                or b'"conversation_id"' in raw
-                or b'"rollout_id"' in raw
-                or b'"subagent"' in raw
-                or b'"agent_path"' in raw
-                or b'"recipient"' in raw
-                or b'"environments"' in raw
-                or b'"model"' in raw
-                or b'"effort"' in raw
-                or b'"reasoning_effort"' in raw
-            )
-            if not metadata_hint:
-                continue
+        try:
+            obj = records.loads(raw)
+        except Exception:
+            s.parse_errors += 1
+            continue
 
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                s.parse_errors += 1
-                continue
+        ts = parse_ts(obj.get("timestamp"))
+        if ts is not None:
+            if s.first_ts is None or ts < s.first_ts:
+                s.first_ts = ts
+            if s.last_ts is None or ts > s.last_ts:
+                s.last_ts = ts
 
-            ts = parse_ts(obj.get("timestamp"))
-            if ts is not None:
-                if s.first_ts is None or ts < s.first_ts:
-                    s.first_ts = ts
-                if s.last_ts is None or ts > s.last_ts:
-                    s.last_ts = ts
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
 
-            payload = obj.get("payload")
-            if not isinstance(payload, dict):
-                continue
+        new_source = source_kind_from_payload(payload)
+        if new_source:
+            source_kind = new_source
+            s.source_updates[new_source] += 1
+            s.source_kind = new_source
 
-            new_source = source_kind_from_payload(payload)
-            if new_source:
-                source_kind = new_source
-                s.source_updates[new_source] += 1
-                s.source_kind = new_source
+        new_model = model_from_payload(payload)
+        if new_model:
+            model = new_model
+        new_effort = effort_from_payload(payload)
+        if new_effort:
+            effort = new_effort
 
-            new_model = model_from_payload(payload)
-            if new_model:
-                model = new_model
-            new_effort = effort_from_payload(payload)
-            if new_effort:
-                effort = new_effort
+        collect_link_ids(payload, s.links)
+        if role_hint:
+            collect_role_evidence(payload, roles, source_kind, s.roles, obj.get("type"))
+        collect_actions(payload, s.actions)
 
-            collect_link_ids(payload, s.links)
-            if role_hint:
-                collect_role_evidence(payload, roles, source_kind, s.roles, obj.get("type"))
-            collect_actions(payload, s.actions)
+        usage = usage_from_payload(payload)
+        if usage is None:
+            continue
+        inp, cached, out, cumulative = usage
+        if cumulative is not None and cumulative == prev_total:
+            s.duplicate_usage_records += 1
+            continue
+        if cumulative is not None:
+            prev_total = cumulative
 
-            usage = usage_from_payload(payload)
-            if usage is None:
-                continue
-            inp, cached, out, cumulative = usage
-            if cumulative is not None and cumulative == prev_total:
-                s.duplicate_usage_records += 1
-                continue
-            if cumulative is not None:
-                prev_total = cumulative
-
-            s.usage_records += 1
-            s.input_tokens += inp
-            s.cached_tokens += min(cached, inp)
-            s.output_tokens += out
-            if model:
-                s.models[model] += 1
-            if effort:
-                s.efforts[effort] += 1
-
+        s.usage_records += 1
+        s.input_tokens += inp
+        s.cached_tokens += min(cached, inp)
+        s.output_tokens += out
+        if model:
+            s.models[model] += 1
+        if effort:
+            s.efforts[effort] += 1
     return s
 
 
@@ -775,32 +787,131 @@ def build_families(sessions: Dict[str, Session], edges: Sequence[Edge]) -> List[
     return families
 
 
-def discover_workflow_families(home: str, roles: Sequence[str] = DEFAULT_ROLES,
-                               allow_shared: bool = True, progress=None) -> Discovery:
-    """Scan local Codex logs and return the privacy-safe workflow graph.
+def extract_summary(path, roles):
+    """Worker-safe extraction; SQLite writes remain in the calling process."""
+    from ..quota import audit
+    local_stats = audit.ParseStats()
+    consumers = [summary_consumer(path, roles), audit.quota_consumer(path, {}, 10080, local_stats)]
+    try:
+        for consumer in consumers:
+            next(consumer)
+        with open(path, "rb") as stream:
+            for line in stream:
+                raw = records.Record(line)
+                for consumer in consumers:
+                    consumer.send(raw)
+        session, events = [records.finish(c) for c in consumers]
+        return session, events, local_stats
+    except OSError:
+        return None
+    finally:
+        for consumer in consumers:
+            consumer.close()
 
-    ``progress`` may be a callable ``(scanned, total)``. No prompt/response or
-    raw linkage identifiers are returned; sessions use the existing one-way
-    hashed keys.
-    """
+
+def discover_workflow_families(home: str, roles: Sequence[str] = DEFAULT_ROLES,
+                              allow_shared: bool = True, progress=None, *, index=None,
+                              use_cache=True, cache_dir=None, rebuild_cache=False,
+                              events=None, recent_days=None, workers=1) -> Discovery:
+    """Refresh changed files, then reconstruct relationships from indexed evidence."""
+    def emit(name, **meta):
+        if events:
+            events(name, **meta)
+        if progress and name == "scan_progress" and meta["current"] % 500 == 0:
+            progress(meta["current"], meta["total"])
+    from .cache import Index
+    owned = index is None
+    index = index or Index(home, cache_dir, enabled=use_cache, rebuild=rebuild_cache)
     home = os.path.abspath(os.path.expanduser(home))
     paths = file_paths(home)
     sessions: Dict[str, Session] = {}
     link_schema = Counter()
-    for idx, path in enumerate(paths, 1):
-        session = scan_session(path, roles)
-        key = session.session_key
-        if key in sessions:
-            key = short_key("S", path)
-            session.session_key = key
-        sessions[key] = session
-        link_schema.update(session.links.schema_paths)
-        if progress is not None and idx % 500 == 0:
-            progress(idx, len(paths))
+    try:
+        index.prune(paths)
+        if events or progress:
+            emit("scan_start", total=len(paths))
+        summaries = {}
+        pending = []
+        pool = None
+        if not 1 <= workers <= 16:
+            raise ValueError("--workers must be between 1 and 16")
 
-    edges = build_edges(sessions, allow_shared=allow_shared)
-    families = build_families(sessions, edges)
-    return Discovery(paths=paths, sessions=sessions, edges=edges, families=families, link_schema=link_schema)
+        def flush():
+            if not pending:
+                return
+            if pool is None:
+                results = (extract_summary(path, roles) for path, before in pending)
+            else:
+                results = pool.map(extract_summary, (path for path, before in pending),
+                                   (roles for _ in pending))
+            for (path, before), result in zip(pending, results):
+                if result is None:
+                    index.warning = "A rollout could not be read during discovery; retry to refresh changed history."
+                    continue
+                session, events, local_stats = result
+                index.put(path, "quota", 10080, before, (events, local_stats))
+                index.put(path, "discovery", list(roles), before, session)
+                summaries[path] = session
+            pending.clear()
+
+        try:
+            for position, path in enumerate(paths, 1):
+                try:
+                    session, before = index.get(path, "discovery", list(roles))
+                except OSError:
+                    continue
+                if session is not None:
+                    summaries[path] = session
+                else:
+                    if workers > 1 and pool is None:
+                        from concurrent.futures import ProcessPoolExecutor
+                        from multiprocessing import get_context
+                        pool = ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"))
+                    pending.append((path, before))
+                    if len(pending) >= workers * 2:
+                        flush()
+                if (events or progress) and position % 250 == 0:
+                    emit("scan_progress", current=len(summaries), total=len(paths), **index.stats())
+            flush()
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+        for path in paths:
+            session = summaries.get(path)
+            if session is None:
+                continue
+            key = session.session_key
+            if key in sessions:
+                key = short_key("S", path)
+                session.session_key = key
+            sessions[key] = session
+            link_schema.update(session.links.schema_paths)
+        if events or progress:
+            emit("scan_progress", current=len(summaries), total=len(paths), **index.stats())
+        edges = build_edges(sessions, allow_shared=allow_shared)
+        families = build_families(sessions, edges)
+        # Date filtering operates on cached timestamps and never drops an older
+        # parent/worker from a selected connected family. A partial index is not
+        # used as a coverage guarantee (e.g. files growing during extraction).
+        if recent_days is not None:
+            keys = index.recent_keys(list(roles), recent_days)
+            if keys is not None and index.warning is None:
+                observed = max((s.last_ts.timestamp() for s in sessions.values() if s.last_ts), default=None)
+                expected = {k for k, s in sessions.items() if s.last_ts and observed is not None
+                            and s.last_ts.timestamp() >= observed - recent_days * 86400}
+                if keys == expected:
+                    recent = [f for f in families if keys.intersection(f.members)]
+                    families = recent or families
+        stats = index.stats()
+        if events or progress:
+            emit("discovery_done", total=len(paths), **stats)
+        if index.warning:
+            print(index.warning, file=sys.stderr)
+        return Discovery(paths, sessions, edges, families, link_schema, tuple(roles), stats)
+    finally:
+        if owned:
+            index.close()
+
 
 
 WORKFLOW_QUALITY_RANK = {
@@ -1104,6 +1215,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 """,
     )
     ap.add_argument("--home", default=os.path.expanduser("~/.codex"), help="Codex data directory")
+    ap.add_argument("--no-cache", action="store_true", help="discover directly from logs without reading or writing the cache")
+    ap.add_argument("--rebuild-cache", action="store_true", help="re-extract workflow cache entries")
+    ap.add_argument("--cache-dir", metavar="DIRECTORY", help="override the workflow cache directory")
+    ap.add_argument("--workers", type=int, choices=range(1,17), default=1, metavar="N", help="bounded processes for changed-file indexing (1–16; default 1)")
+
     ap.add_argument("--roles", nargs="+", default=list(DEFAULT_ROLES),
                     help="role labels to recognize")
     ap.add_argument("--top", type=int, default=10,
@@ -1139,7 +1255,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     discovery = discover_workflow_families(
         home, roles, allow_shared=not args.no_shared_link_fallback,
-        progress=lambda scanned, total: print(f"scanned {scanned:,}/{total:,} files...", flush=True),
+        use_cache=not args.no_cache, rebuild_cache=args.rebuild_cache, cache_dir=args.cache_dir, recent_days=args.recent_days, workers=args.workers,
+        events=lambda name, **meta: print(f"scanned {meta['current']:,}/{meta['total']:,} files...", flush=True) if name == "scan_progress" else None,
     )
     sessions = discovery.sessions
     link_schema = discovery.link_schema

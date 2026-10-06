@@ -61,6 +61,7 @@ import shlex
 import statistics
 import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,9 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import candidates as finder
+from . import records
+from . import telemetry
+from .cache import Index
 from . import lifecycle
 from ..quota import audit
 from . import attribution
@@ -85,6 +89,32 @@ DEFAULT_SUCCESSOR_MAP = {
     "implementer": "validator",
     "validator": "implementer",
 }
+
+
+class StageTimes:
+    """Measure real stage transitions, independently of terminal output."""
+    def __init__(self, callback):
+        self.callback = callback
+        self.stage = None
+        self.started = time.monotonic()
+        self.seconds = {}
+
+    def finish(self):
+        if self.stage:
+            self.seconds[self.stage] = self.seconds.get(self.stage, 0) + time.monotonic() - self.started
+            self.stage = None
+
+    def event(self, name, **meta):
+        if name.endswith("_start"):
+            self.finish()
+            self.stage = name[:-6]
+            self.started = time.monotonic()
+        elif name == "discovery_done":
+            self.finish()
+            if meta.get("reused"):
+                self.seconds["scan"] = float(meta.get("seconds", 0))
+        if self.callback:
+            self.callback(name, **meta)
 
 
 @dataclass
@@ -330,6 +360,7 @@ class RawCompactionSession:
     tools: List[ToolAccessEvent] = field(default_factory=list)
     parse_errors: int = 0
     tool_duplicates: int = 0
+    tool_records: list = field(default_factory=list)
 
 
 @dataclass
@@ -815,6 +846,10 @@ def _resource_hashes_from_args(args: object, tool_name: str) -> frozenset[str]:
 def scan_raw_compaction_session(path: str, session_key: str,
                                 analysis_start: Optional[datetime],
                                 analysis_end: Optional[datetime]) -> RawCompactionSession:
+    return records.read_consumer(path, compaction_consumer(session_key, analysis_start, analysis_end), RawCompactionSession())
+
+
+def compaction_consumer(session_key, analysis_start, analysis_end, *, keep_duplicates=False):
     """Scan one rollout for explicit compaction markers, raw token usage, and tool access metadata.
 
     Raw token usage is intentionally retained separately from lifecycle.ParsedSession:
@@ -826,69 +861,72 @@ def scan_raw_compaction_session(path: str, session_key: str,
     current_model = "unknown"
     current_effort = "unknown"
     seen_tools = set()
-    try:
-        fh = open(path, "rb")
-    except OSError:
-        return out
-    with fh:
-        for raw in fh:
-            low = raw.lower()
-            maybe_compaction = b'compacted' in low or b'compaction' in low
-            maybe_usage = b'"token_count"' in raw or b'"token_usage_record"' in raw
-            maybe_tool = b'"function_call"' in raw or b'"tool_call"' in raw or b'"custom_tool_call"' in raw or b'"tool_name"' in raw
-            maybe_settings = b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
-            if not (maybe_compaction or maybe_usage or maybe_tool or maybe_settings):
-                continue
+    while True:
+        raw = yield
+        if raw is None:
+            break
+        low = raw.lower()
+        maybe_compaction = b'compacted' in low or b'compaction' in low
+        maybe_usage = b'"token_count"' in raw or b'"token_usage_record"' in raw
+        maybe_tool = b'"function_call"' in raw or b'"tool_call"' in raw or b'"custom_tool_call"' in raw or b'"tool_name"' in raw
+        maybe_settings = b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
+        if not (maybe_compaction or maybe_usage or maybe_tool or maybe_settings):
+            continue
 
-            # Giant legacy compacted records can embed the entire replacement
-            # history. Detect the marker from the line prefix and skip JSON decode.
-            marker = _compaction_marker_from_record(raw)
-            if marker is not None and marker.kind == "compacted":
-                if in_time_window(marker.ts, analysis_start, analysis_end):
-                    out.markers.append(marker)
-                continue
+        # Giant legacy compacted records can embed the entire replacement
+        # history. Detect the marker from the line prefix and skip JSON decode.
+        marker = _compaction_marker_from_record(raw)
+        if marker is not None and marker.kind == "compacted":
+            if in_time_window(marker.ts, analysis_start, analysis_end):
+                out.markers.append(marker)
+            continue
 
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                out.parse_errors += 1
-                continue
-            ts = lifecycle.parse_ts(obj.get("timestamp"))
-            payload = obj.get("payload")
-            if ts is None or not isinstance(payload, dict):
-                continue
+        try:
+            obj = records.loads(raw)
+        except Exception:
+            out.parse_errors += 1
+            continue
+        ts = lifecycle.parse_ts(obj.get("timestamp"))
+        payload = obj.get("payload")
+        if ts is None or not isinstance(payload, dict):
+            continue
 
-            model = finder.model_from_payload(payload)
-            if model:
-                current_model = model
-            effort = finder.effort_from_payload(payload)
-            if effort:
-                current_effort = effort
+        model = finder.model_from_payload(payload)
+        if model:
+            current_model = model
+        effort = finder.effort_from_payload(payload)
+        if effort:
+            current_effort = effort
 
-            if maybe_compaction:
-                marker = _compaction_marker_from_record(raw, obj)
-                if marker is not None and in_time_window(marker.ts, analysis_start, analysis_end):
-                    out.markers.append(marker)
+        if maybe_compaction:
+            marker = _compaction_marker_from_record(raw, obj)
+            if marker is not None and in_time_window(marker.ts, analysis_start, analysis_end):
+                out.markers.append(marker)
 
-            if maybe_usage and in_time_window(ts, analysis_start, analysis_end):
-                req = lifecycle.extract_usage(payload, ts, session_key, current_model, current_effort)
-                if req is not None:
-                    out.usage.append(RawUsageSample(ts, req, req.cumulative_total))
+        if maybe_usage and in_time_window(ts, analysis_start, analysis_end):
+            req = lifecycle.extract_usage(payload, ts, session_key, current_model, current_effort)
+            if req is not None:
+                out.usage.append(RawUsageSample(ts, req, req.cumulative_total))
 
-            if maybe_tool and in_time_window(ts, analysis_start, analysis_end):
-                for node in _generic_tool_nodes(payload):
-                    name, args = _tool_name_and_args_generic(node)
-                    if not name:
+        if maybe_tool and in_time_window(ts, analysis_start, analysis_end):
+            for node in _generic_tool_nodes(payload):
+                name, args = _tool_name_and_args_generic(node)
+                if not name:
+                    continue
+                call_id = node.get("call_id") or node.get("tool_call_id")
+                identity = (str(call_id), name) if call_id else (ts, name, json.dumps(args, sort_keys=True))
+                if identity in seen_tools:
+                    out.tool_duplicates += 1
+                    if not keep_duplicates:
                         continue
-                    call_id = node.get("call_id") or node.get("tool_call_id")
-                    identity = (str(call_id), name) if call_id else (ts, name, json.dumps(args, sort_keys=True))
-                    if identity in seen_tools:
-                        out.tool_duplicates += 1
-                        continue
-                    seen_tools.add(identity)
-                    category = _classify_tool(name, args)
-                    resources = _resource_hashes_from_args(args, name) if category != "opaque-wrapper" else frozenset()
-                    out.tools.append(ToolAccessEvent(ts, category, resources))
+                seen_tools.add(identity)
+                category = _classify_tool(name, args)
+                resources = _resource_hashes_from_args(args, name) if category != "opaque-wrapper" else frozenset()
+                event = ToolAccessEvent(ts, category, resources)
+                if keep_duplicates:
+                    out.tool_records.append((hashlib.sha256(repr(identity).encode()).hexdigest(), event))
+                else:
+                    out.tools.append(event)
     out.markers.sort(key=lambda m: (m.ts, m.kind))
     out.usage.sort(key=lambda r: r.ts)
     out.tools.sort(key=lambda t: t.ts)
@@ -936,7 +974,7 @@ def build_compaction_audit(family: finder.Family,
                            direct_usage_seconds: float,
                            refill_fraction: float,
                            resource_lookback_minutes: float,
-                           heuristic_input_threshold: int) -> CompactionAudit:
+                           heuristic_input_threshold: int, observations=None) -> CompactionAudit:
     audit_out = CompactionAudit()
     raw_by_session: Dict[str, RawCompactionSession] = {}
     clusters_by_session: Dict[str, List[Tuple[datetime, datetime, Tuple[str, ...]]]] = {}
@@ -945,7 +983,8 @@ def build_compaction_audit(family: finder.Family,
 
     for key in family.members:
         starts = [t for t in (analysis_start, activations.get(key)) if t is not None]
-        raw = scan_raw_compaction_session(sessions[key].path, key, max(starts) if starts else None, analysis_end)
+        raw = (telemetry.compaction_view(observations[key], max(starts) if starts else None, analysis_end)
+               if observations is not None else scan_raw_compaction_session(sessions[key].path, key, max(starts) if starts else None, analysis_end))
         raw_by_session[key] = raw
         audit_out.parse_errors += raw.parse_errors
         counts = Counter(t.category for t in raw.tools)
@@ -1519,7 +1558,7 @@ def build_spawn_assignment_fingerprints(family: finder.Family,
                 if b'spawn_agent' not in raw.lower() and b'create_agent' not in raw.lower():
                     continue
                 try:
-                    obj = json.loads(raw)
+                    obj = records.loads(raw)
                 except Exception:
                     continue
                 ts = lifecycle.parse_ts(obj.get("timestamp"))
@@ -1562,7 +1601,7 @@ def build_spawn_assignment_fingerprints(family: finder.Family,
                     if b'"call_id"' not in raw and b'"tool_call_id"' not in raw and b'"function_call_id"' not in raw:
                         continue
                     try:
-                        obj = json.loads(raw)
+                        obj = records.loads(raw)
                     except Exception:
                         continue
                     ts = lifecycle.parse_ts(obj.get("timestamp"))
@@ -2648,7 +2687,9 @@ def build_schema_audit(family: finder.Family,
                        parsed: Dict[str, lifecycle.ParsedSession],
                        roles: Sequence[str],
                        analysis_start: Optional[datetime] = None,
-                       analysis_end: Optional[datetime] = None) -> SchemaAudit:
+                       analysis_end: Optional[datetime] = None, observations=None) -> SchemaAudit:
+    if observations is not None:
+        return telemetry.schema_audit(family, sessions, parsed, roles, analysis_start, analysis_end, observations)
     out = SchemaAudit()
     family_ids = set()
     for key in family.members:
@@ -2674,7 +2715,7 @@ def build_schema_audit(family: finder.Family,
                 if not any(x in low for x in (b'spawn_agent', b'send_input', b'wait', b'resume_agent', b'close_agent', b'create_agent')):
                     continue
                 try:
-                    obj = json.loads(raw)
+                    obj = records.loads(raw)
                 except Exception:
                     continue
                 ts = lifecycle.parse_ts(obj.get("timestamp"))
@@ -2724,7 +2765,7 @@ def build_schema_audit(family: finder.Family,
                 if b'"call_id"' not in raw and b'"tool_call_id"' not in raw and b'"function_call_id"' not in raw:
                     continue
                 try:
-                    obj = json.loads(raw)
+                    obj = records.loads(raw)
                 except Exception:
                     continue
                 ts = lifecycle.parse_ts(obj.get("timestamp"))
@@ -2827,9 +2868,15 @@ def build_exact_role_target_map(family: finder.Family,
                                 sessions: Dict[str, finder.Session],
                                 roles: Sequence[str],
                                 analysis_start: Optional[datetime] = None,
-                                analysis_end: Optional[datetime] = None) -> Dict[str, str]:
+                                analysis_end: Optional[datetime] = None, observations=None) -> Dict[str, str]:
     """Map hashed action call IDs to exact role-level targets from safe routing fields."""
     out: Dict[str, str] = {}
+    if observations is not None:
+        for key in family.members:
+            for ts, call_id, role in observations[key].role_targets:
+                if in_time_window(ts, analysis_start, analysis_end):
+                    out[call_id] = role if call_id not in out or out[call_id] == role else "__ambiguous__"
+        return {k: v for k, v in out.items() if v != "__ambiguous__"}
     for key in family.members:
         path = sessions[key].path
         try:
@@ -2842,7 +2889,7 @@ def build_exact_role_target_map(family: finder.Family,
                 if b'send_input' not in low and b'send_message' not in low and b'message_agent' not in low:
                     continue
                 try:
-                    obj = json.loads(raw)
+                    obj = records.loads(raw)
                 except Exception:
                     continue
                 ts = lifecycle.parse_ts(obj.get("timestamp"))
@@ -4255,7 +4302,7 @@ def self_test() -> None:
     print("self-test: OK")
 
 
-def main(argv: Optional[Sequence[str]] = None, *, progress: Optional[Callable[..., None]] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None, *, progress: Optional[Callable[..., None]] = None, discovery=None) -> int:
     ap = argparse.ArgumentParser(
         description="Profile token/API-equivalent work in a Codex session or linked session family.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4282,6 +4329,14 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--family", "--session", "--session-id", dest="family", metavar="ID",
                     help="family W-..., member S-..., or exact Codex session/thread ID")
     ap.add_argument("--home", default=os.path.expanduser("~/.codex"), help="Codex data directory")
+    ap.add_argument("--no-cache", action="store_true", help="read logs directly without using or writing the workflow cache")
+    ap.add_argument("--rebuild-cache", action="store_true", help="re-extract cached workflow data for this Codex home")
+    ap.add_argument("--cache-dir", metavar="DIRECTORY", help="override the local workflow cache directory")
+    ap.add_argument("--scope", choices=("family", "subtree", "session"), default="family",
+                    help="profile the containing family (default), selected session's descendants, or only that session")
+    ap.add_argument("--timings", action="store_true", help="print stage timings and cache/file counters")
+    ap.add_argument("--workers", type=int, choices=range(1,17), default=1, metavar="N", help="bounded processes for changed-file indexing (1–16; default 1)")
+
     ap.add_argument("--after", metavar="ISO8601", help="analyze only the post-boundary segment; timezone offset is required")
     ap.add_argument("--before", metavar="ISO8601", help="optional exclusive end of analysis window; timezone offset is required")
     ap.add_argument("--analysis-root", "--orchestrator", dest="orchestrator", metavar="ID", help="override the analysis root with a hashed key or exact raw session ID")
@@ -4396,46 +4451,70 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     home = os.path.abspath(os.path.expanduser(args.home))
     prices = audit.load_prices(args.prices)
     args._prices = prices
-    paths = finder.file_paths(home)
-    if progress is not None:
-        progress("scan_start", total=len(paths))
-
-    print(f"Codex workflow cost profiler v{__version__}")
-    print("=================================")
-    print("Source: ~/.codex" if home == os.path.abspath(os.path.expanduser("~/.codex")) else f"Source: {home}")
-    print(f"Files: {len(paths):,}")
-    print(f"Roles: {', '.join(roles)}")
-    print(f"Core activity: all roles; workflow interpretation: {args.workflow_profile}")
-    print("Rebuilding privacy-safe family graph...\n")
-
-    sessions: Dict[str, finder.Session] = {}
-    for idx, path in enumerate(paths, 1):
-        session = finder.scan_session(path, roles)
-        key = session.session_key
-        if key in sessions:
-            key = finder.short_key("S", path)
-            session.session_key = key
-        sessions[key] = session
-        if progress is not None and (idx == len(paths) or idx % 250 == 0):
-            progress("scan_progress", current=idx, total=len(paths))
-        if idx % 500 == 0:
-            print(f"scanned {idx:,}/{len(paths):,} files...", flush=True)
-
-    edges = finder.build_edges(sessions)
-    families = finder.build_families(sessions, edges)
-    family = lifecycle.resolve_family(args.family, families, sessions)
-    if family is None:
-        print("Could not uniquely resolve the supplied family/session selector against the current log graph.", file=sys.stderr)
-        return 2
-
-    print(f"\nParsing {len(family.members)} rollout files for {family.family_key}...")
-    if progress is not None:
-        progress("parse_start", total=len(family.members))
-    parsed: Dict[str, lifecycle.ParsedSession] = {}
-    for idx, key in enumerate(family.members, 1):
-        parsed[key] = lifecycle.parse_family_session(sessions[key].path, key, roles)
-        if progress is not None and (idx == len(family.members) or idx % 25 == 0):
-            progress("parse_progress", current=idx, total=len(family.members))
+    stage_times = StageTimes(progress)
+    progress = stage_times.event
+    observations = {}
+    with Index(home, args.cache_dir, enabled=not args.no_cache, rebuild=args.rebuild_cache and discovery is None) as index:
+        if discovery is None or discovery.roles != roles:
+            discovery = finder.discover_workflow_families(home, roles, index=index, events=progress, workers=args.workers)
+        elif progress:
+            progress("discovery_done", total=len(discovery.paths), reused=True, **discovery.stats)
+        sessions = discovery.sessions
+        family = None
+        if not args.family.startswith(("W-", "S-")):
+            identifier = finder.fp(args.family)
+            paths = index.identifier_paths(identifier, list(roles))
+            # Treat the catalog as a hint and verify it against this run's
+            # refreshed metadata. Preserve existing ambiguity/rollout priority.
+            if len(paths) == 1:
+                keys = {key for key, session in sessions.items()
+                        if session.path in paths and identifier in session.links.own_ids}
+                matches = [f for f in discovery.families if keys.intersection(f.members)]
+                if len(matches) == 1:
+                    family = matches[0]
+        if family is None:
+            family = lifecycle.resolve_family(args.family, discovery.families, sessions)
+        if family is None:
+            print("Could not uniquely resolve the supplied family/session selector against the current log graph.", file=sys.stderr)
+            return 2
+        if args.scope != "family":
+            selected = (family.root if args.family == family.family_key else lifecycle.resolve_session(args.family, sessions))
+            if selected is None:
+                ap.error("--scope requires an unambiguous session or family selector")
+            members = {selected}
+            if args.scope == "subtree":
+                changed = True
+                while changed:
+                    before = len(members)
+                    members.update(e.child for e in family.edges if e.parent in members)
+                    changed = len(members) != before
+            family = replace(family, root=selected, members=[k for k in family.members if k in members],
+                             edges=[e for e in family.edges if e.parent in members and e.child in members])
+        print(f"Codex workflow cost profiler v{__version__}")
+        print(f"Files: {len(discovery.paths):,}; selected sessions: {len(family.members):,}; scope: {args.scope}")
+        if progress:
+            progress("parse_start", total=len(family.members))
+        parsed = {}
+        parse_baseline = index.stats()
+        for position, key in enumerate(family.members, 1):
+            path = sessions[key].path
+            options = [key, list(roles)]
+            try:
+                observation, before = index.get(path, "telemetry", options)
+                if observation is None:
+                    observation = telemetry.extract(path, key, roles)
+                    index.put(path, "telemetry", options, before, observation)
+            except OSError:
+                print("A selected rollout disappeared or could not be read; retry profiling.", file=sys.stderr)
+                return 2
+            observations[key] = observation
+            parsed[key] = observation.parsed
+            if progress and (position % 25 == 0 or position == len(family.members)):
+                progress("parse_progress", current=position, total=len(family.members),
+                         **{name: index.stats()[name] - parse_baseline[name] for name in ("cached", "processed", "bytes_read")})
+        if index.warning:
+            print(index.warning, file=sys.stderr)
+        cache_stats = index.stats()
     lifecycle.match_actions(
         family, sessions, parsed,
         spawn_window_minutes=args.spawn_window_minutes,
@@ -4538,7 +4617,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     turn_performance = build_turn_performance(family, sessions, parsed, labels)
     response_efficiency_stats = response_efficiency.build_response_efficiency(
         family, sessions, labels, identities,
-        after=analysis_meta.analysis_start, before=analysis_meta.analysis_end,
+        after=analysis_meta.analysis_start, before=analysis_meta.analysis_end, observations=observations,
     )
     root_states = root_active_state_costs(family, parsed, windows, prices)
     root_child_counts = root_child_count_costs(family, parsed, windows, prices)
@@ -4547,7 +4626,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     overlap_pairs = pairwise_overlap_rows(windows)
     lingering = build_lingering_exposures(family, parsed, windows, prices, successor_map)
     role_target_map = build_exact_role_target_map(
-        family, sessions, roles, analysis_meta.analysis_start, analysis_meta.analysis_end
+        family, sessions, roles, analysis_meta.analysis_start, analysis_meta.analysis_end, observations=observations
     )
     role_target_counts, role_target_costs, role_target_unmatched = role_targeted_root_send_costs(
         family, parsed, role_target_map, prices, args.action_inference_window_seconds
@@ -4596,7 +4675,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             direct_usage_seconds=args.compaction_direct_usage_seconds,
             refill_fraction=args.compaction_refill_fraction,
             resource_lookback_minutes=args.compaction_resource_lookback_minutes,
-            heuristic_input_threshold=args.large_context_input_tokens,
+            heuristic_input_threshold=args.large_context_input_tokens, observations=observations,
         )
     comparison = comparison_metrics(
         family, role_totals, root_child_counts, concurrency, context_rows,
@@ -4607,7 +4686,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
         print("Building privacy-safe action schema audit...", flush=True)
         schema = build_schema_audit(
             family, sessions, parsed, roles,
-            analysis_meta.analysis_start, analysis_meta.analysis_end,
+            analysis_meta.analysis_start, analysis_meta.analysis_end, observations=observations
         )
 
     try:
@@ -4702,6 +4781,12 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             print(f"Wrote workflow dashboard: {dashboard_path}")
     pauses.print_summary(pause_analysis, args.export_json, args.pause_store)
 
+    stage_times.finish()
+    if args.timings:
+        progress("timings_done", stages=stage_times.seconds, **cache_stats)
+        if stage_times.callback is None:
+            print("\nWorkflow timings: " + ", ".join(f"{k}={v:.3f}s" for k, v in stage_times.seconds.items()))
+            print(f"cache hits={cache_stats['cached']} processed entries={cache_stats['processed']} bytes read={cache_stats['bytes_read']}")
     print("\nInterpretation")
     print("--------------")
     print("Active-state labels come from trusted spawn matches, strong role metadata, and observed child lifetimes.")

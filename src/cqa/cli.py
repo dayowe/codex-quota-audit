@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -27,7 +28,7 @@ from .workflow import candidates as finder
 from .workflow import profile as profiler
 from . import reports as reportlib
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 
 def report_dir(home: str) -> Path:
@@ -78,11 +79,11 @@ def _call_main(func: Callable[[Optional[Sequence[str]]], int], argv: Sequence[st
             rc = int(func(argv, **kwargs) or 0)
     except SystemExit as exc:
         rc = int(exc.code or 0)
+    captured_err = stderr.getvalue().strip()
+    if captured_err:
+        print(captured_err, file=sys.stderr)
     if rc:
-        captured_err = stderr.getvalue().strip()
         captured_out = stdout.getvalue().strip()
-        if captured_err:
-            print(captured_err, file=sys.stderr)
         if captured_out:
             print(captured_out, file=sys.stderr)
     return rc
@@ -134,7 +135,7 @@ class _ProgressReporter:
             return
         elapsed = time.monotonic() - self.stage_started
         if self.tty:
-            self.stream.write(f"\r\x1b[2K✓ {self.label} · {elapsed:.1f}s\n")
+            self.stream.write(f"\r\x1b[2K✓ {self._text(self.label, self.detail)} · {elapsed:.1f}s\n")
             self.stream.flush()
         self.label = None
         self.detail = ""
@@ -156,14 +157,24 @@ class _ProgressReporter:
     def event(self, name: str, **meta: object) -> None:
         current = int(meta.get("current") or 0)
         total = int(meta.get("total") or 0)
-        if name == "scan_start":
+        counters = ""
+        if "cached" in meta:
+            counters = f" · {int(meta.get('cached') or 0):,} cached, {int(meta.get('processed') or 0):,} processed, {int(meta.get('bytes_read') or 0)/1048576:.1f} MiB read"
+        if name == "timings_done":
+            self.finish()
+            stages = meta.get("stages") or {}
+            print("[cqa] Timings · " + ", ".join(f"{k}={float(v):.3f}s" for k, v in stages.items()), file=self.stream)
+        elif name == "discovery_done":
+            self.update(f"{total:,} log files{counters}" + (" · discovery reused" if meta.get("reused") else ""))
+            self.finish()
+        elif name == "scan_start":
             self.begin("Resolving workflow", f"{total:,} log files")
         elif name == "scan_progress":
-            self.update(f"{current:,}/{total:,} log files")
+            self.update(f"{current:,}/{total:,} log files{counters}")
         elif name == "parse_start":
             self.begin("Reading workflow telemetry", f"{total:,} sessions")
         elif name == "parse_progress":
-            self.update(f"{current:,}/{total:,} sessions")
+            self.update(f"{current:,}/{total:,} sessions{counters}")
         elif name == "structure_start":
             self.begin("Building workflow structure")
         elif name == "usage_start":
@@ -176,8 +187,55 @@ class _ProgressReporter:
             self.begin("Rendering dashboard")
 
 
-def _discover_latest(home: str, recent_days: float, *, multi_agent_only: bool = False) -> tuple[Optional[finder.Family], finder.Discovery]:
-    discovery = finder.discover_workflow_families(home, finder.DEFAULT_ROLES)
+def _discovery_options(extra, root_role=None, role_map=None, reporter=None):
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--workers", type=int, choices=range(1,17), default=1, metavar="N")
+    parser.add_argument("--roles", nargs="+", default=list(finder.DEFAULT_ROLES))
+    args, _ = parser.parse_known_args(extra)
+    options = {}
+    if args.no_cache:
+        options["use_cache"] = False
+    if args.rebuild_cache:
+        options["rebuild_cache"] = True
+    if args.cache_dir:
+        options["cache_dir"] = args.cache_dir
+    if args.workers != 1:
+        options["workers"] = args.workers
+    roles = [r.strip().lower() for r in args.roles if r.strip()]
+    if root_role:
+        roles.append(profiler.attribution._normalize_declared_role(root_role))
+    if role_map:
+        roles.extend(sorted(profiler.attribution.role_map_roles(role_map)))
+    roles = tuple(dict.fromkeys(roles))
+    if roles != finder.DEFAULT_ROLES:
+        options["roles"] = roles
+    if reporter is not None:
+        options["events"] = reporter.event
+    return options
+
+
+def _cache_arguments(extra):
+    """Forward shared cache controls without forwarding quota-only switches."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--cache-dir")
+    args, _ = parser.parse_known_args(extra)
+    result = []
+    if args.no_cache:
+        result.append("--no-cache")
+    if args.rebuild_cache:
+        result.append("--rebuild-cache")
+    if args.cache_dir:
+        result.extend(("--cache-dir", args.cache_dir))
+    return result
+
+
+def _discover_latest(home: str, recent_days: float, *, multi_agent_only: bool = False, **options) -> tuple[Optional[finder.Family], finder.Discovery]:
+    discovery = finder.discover_workflow_families(home, options.pop("roles", finder.DEFAULT_ROLES), recent_days=recent_days, **options)
     family = finder.latest_workflow_family(
         discovery.families, discovery.sessions, recent_days=recent_days,
         allow_standalone_fallback=not multi_agent_only,
@@ -259,7 +317,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
                    help="show verbose output from the underlying analyzers instead of the concise front-end summary")
     args, extra = p.parse_known_args(argv)
     _reject_forwarded_output_controls(extra, p)
-    if args.recent_days <= 0:
+    if not math.isfinite(args.recent_days) or args.recent_days <= 0:
         p.error("--recent-days must be positive")
 
     home = os.path.expanduser(args.home)
@@ -274,6 +332,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
     profiles = [str(Path(x).expanduser()) for x in args.workflow_profile_json]
     workflow_selector = args.workflow.strip()
     selected_source = None
+    discovery = None
     reporter = None if args.quiet or args.show_analysis_output else _ProgressReporter(sys.stdout)
     if reporter is not None:
         reporter.header("Codex Quota Audit · dashboard")
@@ -284,7 +343,14 @@ def dashboard_main(argv: Sequence[str]) -> int:
             if workflow_selector.lower() == "latest":
                 if not args.quiet:
                     print("Discovering latest workflow…")
-                family, discovery = _discover_latest(home, args.recent_days, multi_agent_only=args.workflow_multi_agent_only)
+                try:
+                    family, discovery = _discover_latest(home, args.recent_days, multi_agent_only=args.workflow_multi_agent_only, **_discovery_options(extra, args.workflow_root_role, args.workflow_role_map, reporter))
+                except ValueError as exc:
+                    p.error(str(exc))
+                except KeyboardInterrupt:
+                    if reporter is not None:
+                        reporter.interrupted()
+                    return 130
                 if family is None:
                     if args.workflow_multi_agent_only:
                         print("No recent multi-agent workflow with delegated non-Guardian worker usage was found in the selected Codex history.", file=sys.stderr)
@@ -302,6 +368,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
                 "--workflow-profile", args.workflow_profile,
                 "--export-json", str(profile_path),
             ]
+            profile_args += _cache_arguments(extra)
             if args.prices:
                 profile_args += ["--prices", args.prices]
             if args.workflow_root_role:
@@ -313,7 +380,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
             try:
                 rc = _call_main(
                     profiler.main, profile_args, quiet=not args.show_analysis_output,
-                    call_kwargs={"progress": reporter.event} if reporter is not None else None,
+                    call_kwargs=({**({"progress": reporter.event} if reporter is not None else {}), **({"discovery": discovery} if discovery is not None else {})} or None),
                 )
             except KeyboardInterrupt:
                 if reporter is not None:
@@ -342,7 +409,8 @@ def dashboard_main(argv: Sequence[str]) -> int:
             quota_args.append("--include-replays")
         for path in profiles:
             quota_args += ["--workflow-profile-json", path]
-        quota_args += list(extra)
+        # A fresh workflow already rebuilt and seeded the shared cache.
+        quota_args += [token for token in extra if token != "--rebuild-cache" or workflow_selector.lower() == "none"]
 
         if reporter is not None:
             reporter.begin("Building quota dashboard")
@@ -428,7 +496,7 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
     p.add_argument("--quiet", action="store_true", help="suppress progress chatter; still print the final report path")
     p.add_argument("--show-analysis-output", action="store_true", help="show detailed profiler output")
     args, extra = p.parse_known_args(argv)
-    if args.recent_days <= 0:
+    if not math.isfinite(args.recent_days) or args.recent_days <= 0:
         p.error("--recent-days must be positive")
     forbidden = {"--family", "--session", "--session-id", "--dashboard", "--report-json", "--home"}
     for token in extra:
@@ -441,10 +509,18 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
     if reporter is not None:
         reporter.header("Codex Quota Audit · workflow profile")
     selector = args.selector
+    discovery = None
     if selector.lower() == "latest":
         if not args.quiet:
             print("Discovering latest workflow…")
-        family, discovery = _discover_latest(home, args.recent_days, multi_agent_only=args.multi_agent_only)
+        try:
+            family, discovery = _discover_latest(home, args.recent_days, multi_agent_only=args.multi_agent_only, **_discovery_options(extra, args.root_role, args.role_map, reporter))
+        except ValueError as exc:
+            p.error(str(exc))
+        except KeyboardInterrupt:
+            if reporter is not None:
+                reporter.interrupted()
+            return 130
         if family is None:
             if args.multi_agent_only:
                 print("No recent multi-agent workflow with delegated non-Guardian worker usage was found in the selected Codex history.", file=sys.stderr)
@@ -476,7 +552,7 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
         try:
             rc = _call_main(
                 profiler.main, profile_args, quiet=not args.show_analysis_output,
-                call_kwargs={"progress": reporter.event} if reporter is not None else None,
+                call_kwargs=({**({"progress": reporter.event} if reporter is not None else {}), **({"discovery": discovery} if discovery is not None else {})} or None),
             )
         except KeyboardInterrupt:
             if reporter is not None:

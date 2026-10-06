@@ -148,6 +148,29 @@ python3 -m cqa.workflow.lifecycle --family W-YOUR_FAMILY --export-json workflow-
 
 Lifecycle extraction separates trusted, diagnostic, and unresolved matches. Diagnostic timing hints do not create cost attribution. The module's `--help` lists its controls.
 
+## Workflow cache and profiling scope
+
+CQA automatically keeps a rebuildable SQLite cache at `<Codex home>/codex-quota-audit/cache/workflow.sqlite3`. Initial indexing reads the history once; later runs check files and reuse unchanged observations. New or changed files are reparsed. Quota and workflow analysis share cached quota observations, and `latest` reuses its discovery result during profiling. Source logs remain unchanged. See [performance and cache behavior](performance.md).
+
+| Option | Effect |
+| --- | --- |
+| `--no-cache` | Read directly without using or writing the cache. |
+| `--rebuild-cache` | Re-extract cache entries for the selected Codex home. |
+| `--cache-dir DIRECTORY` | Store the cache in another local directory. |
+| `--scope family` | Profile the containing workflow; the default. |
+| `--scope subtree` | Profile the selected session and its descendants. |
+| `--scope session` | Profile only the selected session. |
+| `--workers N` | Use 1–16 processes for changed-file workflow indexing; default 1. |
+| `--timings` | Show workflow stage timings and cache/file counters. |
+
+Cache controls work with `cqa audit`, `cqa dashboard`, `cqa workflow candidates` and `cqa workflow profile`. Scope and timing controls apply to workflow profiling; workers apply to workflow candidates/profile. A family selector with `--scope subtree` or `--scope session` selects the family's root. `--recent-days` selects candidates for `latest`, relative to the newest observed log; it preserves older linked sessions and does not constrain an explicit session ID.
+
+```bash
+cqa workflow profile YOUR_SESSION_ID --scope subtree --timings
+cqa workflow profile latest --rebuild-cache --workers 2
+cqa workflow profile YOUR_SESSION_ID --no-cache
+```
+
 ## Roles and assignments
 
 Normal profiling uses a generic interpretation: solo sessions, flat teams, nested teams, and unnamed workers all contribute. Responsibilities require explicit role evidence; root position does not imply coordinator or planner.
