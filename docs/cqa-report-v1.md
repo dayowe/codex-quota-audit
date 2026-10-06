@@ -175,6 +175,14 @@ A period references its approval episodes by report-local IDs. This directly sup
 
 Guardian quota overhead is observational. The report preserves the source estimate, bounds, rate-card information, and pairing metadata rather than presenting it as server billing truth. Workflow-only reports may also carry additive `extensions.pricing` evidence (coverage, rate-card provenance/as-of date, historical Auto-review mapping, long-context rules, per-model/rate-row priced totals, and long-context request/uplift evidence); this does not change the frozen v1 schema.
 
+### Auto-review policy extension (0.9.1+)
+
+The frozen v1 schema and statistical estimate fields are unchanged. `guardian.extensions.auto_review_quota_policy`, each Guardian period/episode's equivalent extension, and `workflow.profiles[].extensions.auto_review_quota_policy` carry additive policy evidence. Workflow `extensions.pricing.by_model[]` rows and `timeline.guardian_activity[].extensions` also preserve `auto_review_quota_policy` evidence.
+
+The object includes `version`, `status` (`historical`, `free`, `transition`, `unknown`, `outside_scope`, `mixed`, or `none`), `announced_at`, `source_ref`, a scope/uncertainty `note`, `auth_declaration`, `auth_modes`, `auth_bases`, and `tokens_by_status` / `requests_by_status`. `policy_quota_points` is zero only for wholly eligible free activity; otherwise it is null. Optional `historical_estimate` contains a supported historical subtotal (`value`, `lo`, `hi`, an 80% coefficient-bootstrap range).
+
+Free policy attribution is **not** stored as a statistical `estimated_quota_overhead` and has no fabricated interval. Mixed and unresolved periods leave that field null, with any historical subtotal in the extension. A wholly free Guardian section can be complete without a fitted estimate. Observed account meter movement and API-equivalent work remain unchanged. `quota.extensions.auto_review_policy_excluded_buckets` reports conservative evidence exclusions from quota-value fits. Renderers without these extensions must keep legacy reports readable without reclassifying their dates or authentication.
+
 ## `banked_resets`
 
 Banked-reset data separates two questions:

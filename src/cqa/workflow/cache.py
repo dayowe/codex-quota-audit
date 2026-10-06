@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Bump when extraction semantics or cached dataclass layouts change.
-EXTRACTION_VERSION = 2
+EXTRACTION_VERSION = 3
 _MODULES = {"cqa.workflow.candidates", "cqa.workflow.lifecycle",
             "cqa.workflow.profile", "cqa.workflow.telemetry", "cqa.quota.audit"}
 

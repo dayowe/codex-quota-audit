@@ -40,6 +40,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from .. import auto_review_policy as review_policy
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -276,6 +277,8 @@ class UsageRequest:
     model: str
     effort: str
     cumulative_total: Optional[int] = None
+    auth_mode: str = "unknown"
+    auth_source: str = "unknown"
 
     @property
     def total_tokens(self) -> int:
@@ -519,6 +522,7 @@ def session_consumer(session_key: str, roles: Sequence[str]):
     out = ParsedSession()
     current_model = "unknown"
     current_effort = "unknown"
+    auth_mode, auth_source = "unknown", "unknown"
     prev_cumulative: Optional[int] = None
     result_tasks = defaultdict(set)
     # Performance timing is response-scoped, even when multiple model responses
@@ -546,6 +550,7 @@ def session_consumer(session_key: str, roles: Sequence[str]):
             or b'interrupt_agent' in low or b'"wait"' in low or b'"resume_agent"' in low or b'"close_agent"' in low
             or b'"model"' in raw or b'"effort"' in raw or b'"reasoning_effort"' in raw
             or b'"call_id"' in raw or b'"tool_call_id"' in raw
+            or b'"auth_mode"' in raw or b'"authentication_mode"' in raw
         ):
             continue
 
@@ -559,6 +564,9 @@ def session_consumer(session_key: str, roles: Sequence[str]):
         payload = obj.get("payload")
         if ts is None or not isinstance(payload, dict):
             continue
+
+        auth = review_policy.auth_evidence(payload, obj.get("type"))
+        auth_mode, auth_source = review_policy.update_auth(auth_mode, auth_source, auth)
 
         model = finder.model_from_payload(payload)
         if model:
@@ -700,6 +708,7 @@ def session_consumer(session_key: str, roles: Sequence[str]):
 
         usage = extract_usage(payload, ts, session_key, current_model, current_effort)
         if usage is not None:
+            usage.auth_mode, usage.auth_source = auth_mode, auth_source
             if usage.cumulative_total is not None and usage.cumulative_total == prev_cumulative:
                 continue
             if usage.cumulative_total is not None:

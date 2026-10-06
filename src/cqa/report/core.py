@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
+from .. import auto_review_policy as review_policy
 
 
 SCHEMA_NAME = "cqa-report"
@@ -386,7 +387,8 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
             },
             "approval_episode_ids": [],
             "status": str(row.get("estimate_status") or ("supported" if est else "not-identifiable")),
-            "extensions": {},
+            "extensions": {"auto_review_quota_policy": review_policy.normalize(row.get("quota_policy"))}
+                if row.get("quota_policy") else {},
         })
 
     period_by_id = {p[2]: next(x for x in periods if x["id"] == p[2]) for p in period_bounds}
@@ -440,7 +442,8 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
                 "base_usd": max(0.0, _number(row.get("guardian_ratecard_base_usd"))),
                 "long_context_events": max(0, _integer(row.get("guardian_long_context_events"))),
             },
-            "extensions": {},
+            "extensions": {"auto_review_quota_policy": review_policy.normalize(row.get("quota_policy"))}
+                if row.get("quota_policy") else {},
         }
         guardian_episodes.append(episode)
 
@@ -451,7 +454,9 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
         guardian_episodes = []
     else:
         guardian_status = "complete"
-        if guardian_episodes and any(p.get("estimated_quota_overhead") is None for p in periods):
+        if guardian_episodes and any(p.get("estimated_quota_overhead") is None and
+                                    (p.get("extensions", {}).get("auto_review_quota_policy") or {}).get("status") != "free"
+                                    for p in periods):
             guardian_status = "partial"
         gs_est = _estimate(
             guardian_summary_data.get("estimated_points"),
@@ -463,6 +468,9 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
                 getattr(args, "guardian_fit_bootstraps", None),
             ),
         )
+        summary_policy = review_policy.normalize(guardian_summary_data.get("quota_policy"))
+        if summary_policy and summary_policy["status"] != "historical":
+            gs_est = None
         guardian_summary_out = {
             "approval_episodes": len(guardian_episodes),
             "inference_events": sum(int(x["guardian_events"]) for x in guardian_episodes),
@@ -702,6 +710,14 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
             "message": f"{unmapped_approvals} Guardian approval episodes could not be mapped to a reconstructed reset period and are omitted from report drill-downs.",
             "refs": [],
         })
+    excluded_buckets = max(0, _integer(getattr(args, "auto_review_excluded_buckets", 0)))
+    if excluded_buckets:
+        warnings.append({
+            "code": "AUTO_REVIEW_POLICY_FIT_EXCLUSIONS",
+            "level": "info",
+            "message": f"Quota-value fits exclude {excluded_buckets} buckets containing free or unresolved Auto-review; observed work and meter readings are retained.",
+            "refs": [],
+        })
     if supplied_markers and matched_markers < supplied_markers:
         warnings.append({
             "code": "BANKED_MARKERS_PARTIALLY_MATCHED",
@@ -780,14 +796,16 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
             },
             "regimes": regime_records,
             "cohorts": cohorts,
-            "extensions": {},
+            "extensions": {"auto_review_policy_excluded_buckets": max(0, _integer(getattr(args, "auto_review_excluded_buckets", 0))),
+                           "auto_review_policy_exclusion_reason": "Buckets with free, transitional, unknown or API Auto-review are excluded from quota-value fits; work and meter observations are retained."},
         },
         "guardian": {
             "status": guardian_status,
             "summary": guardian_summary_out,
             "periods": periods,
             "approval_episodes": guardian_episodes,
-            "extensions": {},
+            "extensions": {"auto_review_quota_policy": review_policy.normalize(guardian_summary_data.get("quota_policy"))}
+                if guardian_requested and guardian_summary_data.get("quota_policy") else {},
         },
         "banked_resets": {
             "status": banked_status,
@@ -1252,7 +1270,8 @@ def workflow_profile_to_cqa(profile_source: Mapping[str, object], profile_index:
             "start": start_ts,
             "end": end_ts,
             "usage": _workflow_usage(row.get("cost") if isinstance(row.get("cost"), Mapping) else {}),
-            "extensions": {"burst_index": _integer(row.get("index"))},
+            "extensions": {"burst_index": _integer(row.get("index")),
+                           "auto_review_quota_policy": review_policy.normalize(row.get("quota_policy"))},
         })
 
     timeline_handoffs: list[Dict[str, object]] = []
@@ -1522,6 +1541,7 @@ def workflow_profile_to_cqa(profile_source: Mapping[str, object], profile_index:
                 "cached_input": _finite(rates.get("cached_input")),
                 "output": _finite(rates.get("output")),
             } if rates else None,
+            "auto_review_quota_policy": review_policy.normalize(raw_row.get("quota_policy")),
         })
     if nested_price_coverage is None:
         pricing_status = "unknown"
@@ -1657,6 +1677,7 @@ def workflow_profile_to_cqa(profile_source: Mapping[str, object], profile_index:
                 ),
             } if response_source else None,
             "pricing": pricing_extension,
+            "auto_review_quota_policy": review_policy.normalize(profile_source.get("auto_review_quota_policy")),
         },
     }
 

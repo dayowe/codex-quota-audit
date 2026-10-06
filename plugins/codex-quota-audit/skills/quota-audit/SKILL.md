@@ -49,7 +49,8 @@ When quoting results, preserve these interpretation boundaries:
 
 - quota-efficiency measurements are empirical observations from local telemetry, not OpenAI's internal quota formula;
 - `API$eq` is a public API-list-price-equivalent normalization ruler, not a subscription bill or internal compute-cost estimate;
-- Guardian quota attribution is observational and carries uncertainty;
+- historical Guardian quota estimates are observational and carry uncertainty; eligible ChatGPT Auto-review is shown as 0 quota points under the October 6, 2026 announced policy, separately from estimates;
+- preserve transition/unknown/API activity as unresolved and nonzero API-equivalent work as normalization; use `--auto-review-auth-mode` only when the user supplies the missing historical sign-in mode, never infer it from current credentials;
 - banked-reset comparisons apply only to user-confirmed reset timestamps and matched model/effort/policy evidence;
 - policy regimes are detected from observed behavior and should remain attached to cross-model comparisons.
 

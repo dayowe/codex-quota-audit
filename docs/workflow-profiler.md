@@ -192,6 +192,8 @@ Turn cadence, observed work rate, and workflow-normalized output rate answer wor
 
 ## Timing-qualified model performance
 
+Auto-review's October 6, 2026 free quota policy does not remove reviewer tokens, timing, throughput or timeline intervals. Workflow pricing/timeline drawers separate eligible free quota attribution from nonzero API-list-equivalent work. Sign-in evidence comes from the rollout or the explicit `--auto-review-auth-mode` declaration, never your current credentials. Historical, transition, unknown and API activity remain distinct; see [the quota-policy methodology](quota-methodology.md#auto-reviews-announced-free-quota-policy).
+
 Modern Codex rollout telemetry can contain three independent timing/token scopes that must not be conflated:
 
 1. `item_completed` events with `started_at_ms` / `completed_at_ms` for visible `AgentMessage` and `Reasoning` items inside a model response;

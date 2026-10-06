@@ -53,11 +53,33 @@ Guardian/auto-review inference is identified from local session metadata and `co
 2. Groups related review activity into approval episodes.
 3. Measures tokens, cached/uncached input, and price-normalized work.
 4. Associates episodes with available quota evidence.
-5. Estimates quota overhead by reset period, with uncertainty and coverage information.
+5. Applies the date/authentication policy and estimates historical quota overhead by reset period, with uncertainty and coverage information.
 
 Reports can distinguish total extra review inference, its share of local approval context, and estimated allowance consumption. These are different quantities. The account-global quota meter can include other work around an approval event; nearby movement cannot be attributed solely to Guardian.
 
 When no review inference is observed, Guardian tables and charts are skipped. Weak pairing or quota evidence remains a limitation rather than a precise-looking estimate. The bundled historical price mapping is date-aware; see [price normalization](#price-normalization).
+
+### Auto-review's announced free quota policy
+
+On October 6, 2026, Tibo Sottiaux announced that Auto-review is free for users signed in through a ChatGPT account and does not draw usage from their plan. The source is [the announcement](https://x.com/thsottiaux/status/2107368734981517634), published at **07:13:54.094 UTC**. CQA uses publication as a reporting reference, not as proof of the exact server activation time or retroactivity.
+
+Review requests are classified individually:
+
+| Activity | Quota attribution |
+| --- | --- |
+| Before October 6 UTC | Historical observational estimates, when supported by pairing and meter evidence. |
+| Earlier October 6 UTC, before publication | Transition: unresolved. |
+| At/after publication with ChatGPT sign-in evidence | **0 quota points under announced policy**; no statistical confidence interval. |
+| At/after publication without sign-in evidence | Unknown; never silently assumed free. |
+| Explicit API-key sign-in | Outside the announcement's scope; API billing is unspecified here. |
+
+CQA reads only structured rollout `auth_mode` / `authentication_mode` metadata and recognized subscription `rate_limits.plan_type` values. Explicit authentication evidence takes precedence over a plan label. It does not read credentials or infer historical sign-in from your current account. `--auto-review-auth-mode chatgpt` or `api` fills missing evidence as a recorded local assumption; it cannot override explicit evidence or conflicting metadata.
+
+Approval bursts split at policy and reconstructed reset boundaries. Thus a reported approval episode can be a segment of one burst. Reset periods retain one row and separate historical, free, transition, unknown and API token portions. Mixed periods may show a **historical estimated subtotal**; they do not present that subtotal as the full period's review cost. Historical coefficients use only pre-October 6 episodes whose parent context and quota snapshots also predate the transition day. Matched manual-approval comparisons use the same historical restriction.
+
+The account-global meter remains observed evidence even during free reviews: concurrent work can move it. To prevent such movement from being attributed to free or unresolved review, quota-value fits and matched banked-reset comparisons conservatively exclude affected buckets/periods. This can reduce usable evidence. Raw review tokens, timing, timeline activity and nonzero API-list-equivalent work remain visible. Historical-only PNG/SVG quota charts retain their statistical intervals; the dashboard also displays free and unresolved activity.
+
+Policy classification is applied when generating a report. Cached facts are reused when you change the declaration. Older saved reports keep their original results; regenerate them to apply this policy.
 
 ## User-confirmed banked resets
 

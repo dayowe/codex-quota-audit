@@ -108,6 +108,7 @@ from ..report.core import (
 
 from ..workflow import records
 from ..workflow.cache import Index
+from .. import auto_review_policy as review_policy
 
 __version__ = "2.16"
 
@@ -276,6 +277,8 @@ class Event:
     source_index: int = 0
     probable_replay: bool = False
     uncertain_dense: bool = False
+    auth_mode: str = "unknown"
+    auth_source: str = "unknown"
 
     @property
     def cumulative_tokens(self) -> Optional[int]:
@@ -367,6 +370,7 @@ class Bucket:
     core_total_tokens: int = 0
     core_model_tokens: Dict[str, int] = field(default_factory=dict)
     core_effort_tokens: Dict[str, int] = field(default_factory=dict)
+    quota_fit_excluded: bool = False
 
     @property
     def price_coverage(self) -> float:
@@ -936,6 +940,7 @@ def quota_consumer(path, prices, target_window_minutes, stats):
     approval_policy: Optional[str] = None
     approvals_reviewer: Optional[str] = None
     source_kind: Optional[str] = None
+    auth_mode, auth_source = "unknown", "unknown"
     link_info = SessionLinkInfo()
     approval_markers: List[Tuple[datetime, str]] = []
     prev_total: Optional[Tuple[int, int, int]] = None
@@ -969,6 +974,7 @@ def quota_consumer(path, prices, target_window_minutes, stats):
             or b'"rollout_id"' in raw
             or b'"subagent"' in raw
             or b'"approval' in raw
+            or b'"auth_mode"' in raw or b'"authentication_mode"' in raw
         )
         if not is_usage_hint and not metadata_hint:
             continue
@@ -981,6 +987,9 @@ def quota_consumer(path, prices, target_window_minutes, stats):
         payload = obj.get("payload") or {}
         if not isinstance(payload, dict):
             continue
+
+        auth = review_policy.auth_evidence(payload, obj.get("type"))
+        auth_mode, auth_source = review_policy.update_auth(auth_mode, auth_source, auth)
 
         _collect_link_ids(payload, link_info, stats)
         marker_kind = _approval_marker_kind(payload, obj.get("type"))
@@ -1095,6 +1104,7 @@ def quota_consumer(path, prices, target_window_minutes, stats):
             total_cached=total_cached,
             total_output=total_output,
             source_index=source_index,
+            auth_mode=auth_mode, auth_source=auth_source,
         ))
         source_index += 1
         stats.candidate_events += 1
@@ -1379,6 +1389,11 @@ def make_bucket(reset_k: int, reset_at: float,
         core_total_tokens=core_total_tokens,
         core_model_tokens=dict(core_model_tokens),
         core_effort_tokens=dict(core_effort_tokens),
+        # Keep all work and meter observations. Conservatively omit an affected
+        # bucket from charge-related fits rather than attribute concurrent meter
+        # movement to free or uncertain reviewer work.
+        quota_fit_excluded=any(e.is_auto_review_inference and
+                               review_policy.observation(e)["status"] != "historical" for e in events),
     )
 
 
@@ -1589,6 +1604,13 @@ def build_accounting_episodes(raw_episodes: Sequence[EpisodeSummary],
 
 
 def analyze_events(events: Sequence[Event], args: argparse.Namespace) -> Analysis:
+    declaration = getattr(args, "auto_review_auth_mode", "unknown")
+    if declaration in {"chatgpt", "api"}:
+        # Apply assumptions after cache extraction, on copies. This also keeps
+        # bucket eligibility consistent with episode attribution for API history.
+        events = [replace(e, auth_mode=declaration, auth_source="declared")
+                  if e.is_auto_review_inference and e.auth_mode == "unknown" and e.auth_source != "conflicting_metadata"
+                  else e for e in events]
     raw_grouped = group_episodes(events, args.reset_tolerance)
     raw_episodes = [summarize_episode(k, raw_grouped[k], args.window_minutes) for k in raw_grouped]
     raw_episodes.sort(key=lambda ep: (ep.activation_at, ep.reset_at, ep.first_ts))
@@ -1606,7 +1628,8 @@ def analyze_events(events: Sequence[Event], args: argparse.Namespace) -> Analysi
 # ---------------------------------------------------------------------------
 
 def usable_bucket(b: Bucket, min_price_coverage: float) -> bool:
-    return b.points > EPS and b.price_coverage + EPS >= min_price_coverage and b.usage.api_usd is not None
+    return (not b.quota_fit_excluded and b.points > EPS and
+            b.price_coverage + EPS >= min_price_coverage and b.usage.api_usd is not None)
 
 
 def episode_api_per_point(ep: EpisodeSummary, min_price_coverage: float) -> Tuple[float, float]:
@@ -1625,6 +1648,10 @@ def print_banner(args: argparse.Namespace) -> None:
     print("API $ values are public list-price-equivalent normalization, never plan billing.")
     print("Auto review $eq maps codex-auto-review historically: GPT-5.4 before 2026-07-30; "
           "GPT-5.6 Luna on/after.\n")
+    excluded = getattr(args, "auto_review_excluded_buckets", 0)
+    if excluded:
+        print(f"Quota-value fits exclude {excluded:,} buckets containing free or unresolved Auto-review.")
+        print("All observed work and account meter readings are retained.\n")
 
 
 def print_header(args: argparse.Namespace, stats: ParseStats, analysis: Analysis,
@@ -1834,6 +1861,7 @@ def build_banked_capacity_rows(primary: Analysis, regimes: Sequence[PolicyRegime
         core_api = core_usd if core_tokens and core_cov + EPS >= args.min_price_coverage else float("nan")
         eligible = (
             points + EPS >= args.banked_capacity_min_points
+            and not any(b.quota_fit_excluded for b in bs)
             and model_share + EPS >= args.banked_capacity_model_purity
             and effort_share + EPS >= args.banked_capacity_effort_purity
             and model != "unknown" and effort != "unknown" and regime != "unknown"
@@ -2104,6 +2132,7 @@ def _quota_slice_from_buckets(buckets: Sequence[Bucket], wanted_points: float, *
     meter_start: Optional[float] = None
     meter_end: Optional[float] = None
     interpolated = False
+    policy_excluded = False
 
     for b in ordered:
         if remain <= EPS:
@@ -2111,6 +2140,7 @@ def _quota_slice_from_buckets(buckets: Sequence[Bucket], wanted_points: float, *
         if b.points <= EPS:
             continue
         take = min(remain, float(b.points))
+        policy_excluded = policy_excluded or b.quota_fit_excluded
         frac = take / float(b.points)
         if frac < 1.0 - EPS:
             interpolated = True
@@ -2167,6 +2197,7 @@ def _quota_slice_from_buckets(buckets: Sequence[Bucket], wanted_points: float, *
         "requested_points": wanted_points,
         "points": used_points,
         "complete": complete,
+        "auto_review_policy_excluded": policy_excluded,
         "interpolated_boundary": interpolated,
         "meter_start": meter_start if meter_start is not None else float("nan"),
         "meter_end": meter_end if meter_end is not None else float("nan"),
@@ -2230,6 +2261,7 @@ def build_banked_boundary_slice_rows(primary: Analysis, regimes: Sequence[Policy
             after_start_used = float(after.get("meter_start", float("nan")))
             eligible = bool(
                 before["complete"] and after["complete"]
+                and not before["auto_review_policy_excluded"] and not after["auto_review_policy_excluded"]
                 and math.isfinite(after_start_used)
                 and after_start_used <= args.banked_slice_start_used_max + EPS
                 and same_model and same_effort and same_regime
@@ -2858,7 +2890,7 @@ def _fit_candidate(rows: Sequence[WeightRow], spec: str, boots: int,
 def _dominant_weight_rows(buckets: Sequence[Bucket], purity: float) -> List[WeightRow]:
     rows = []
     for b in buckets:
-        if b.points <= EPS:
+        if b.points <= EPS or b.quota_fit_excluded:
             continue
         model, share = b.dominant_model
         if model == "unknown" or share + EPS < purity:
@@ -3348,6 +3380,7 @@ def _quota_envelope(index: Dict[str, object], start: datetime, end: datetime,
         "before_used": before.used, "after_used": after.used,
         "before_high": float(highs[before_i]), "after_high": float(highs[after_i]),
         "before_gap_s": before_gap, "after_gap_s": after_gap,
+        "before_ts": before.ts, "after_ts": after.ts,
     }
 
 
@@ -3366,6 +3399,26 @@ def _regime_label(regimes: Sequence[PolicyRegime], model: str, ts: datetime) -> 
     return "unknown"
 
 
+def _review_policy_groups(auto: Sequence[Event], args: argparse.Namespace,
+                          primary: Optional[Analysis]) -> Iterable[List[Event]]:
+    """Split observed bursts at policy and reconstructed reset boundaries."""
+    starts = sorted(ep.activation_at for ep in primary.episodes) if primary else []
+    declaration = getattr(args, "auto_review_auth_mode", "unknown")
+    for burst in _split_event_groups(auto, args.guardian_episode_gap_seconds):
+        group: List[Event] = []
+        previous = None
+        for event in burst:
+            key = (review_policy.observation(event, declaration)["status"],
+                   bisect.bisect_right(starts, event.ts))
+            if group and key != previous:
+                yield group
+                group = []
+            group.append(event)
+            previous = key
+        if group:
+            yield group
+
+
 def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: argparse.Namespace,
                             primary: Optional[Analysis] = None,
                             prices: Optional[Dict[str, Tuple[float, float, float]]] = None) -> List[Dict[str, object]]:
@@ -3381,7 +3434,7 @@ def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: ar
         auto = [e for e in sev if e.is_auto_review_inference]
         if not auto:
             continue
-        for group in _split_event_groups(auto, args.guardian_episode_gap_seconds):
+        for group in _review_policy_groups(auto, args, primary):
             episode_id += 1
             pair = _pair_guardian_group(group, src, by_source, stats, args)
             parent_all = by_source.get(pair.parent_source or "", [])
@@ -3430,6 +3483,11 @@ def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: ar
                 "approval_markers_nearby": len(markers),
                 "guardian_share_local": guardian_tokens / (guardian_tokens + parent_tokens)
                     if guardian_tokens + parent_tokens else float("nan"),
+                "quota_policy": review_policy.summarize(
+                    ((review_policy.observation(e, getattr(args, "auto_review_auth_mode", "unknown")), e.tokens)
+                     for e in group), getattr(args, "auto_review_auth_mode", "unknown")),
+                # Do not fit an old review against parent work from the transition day.
+                "historical_fit_eligible": hi < review_policy.TRANSITION_START,
             }
             for minutes, idx in quota_indexes.items():
                 q = _quota_envelope(idx, start, end, args.guardian_quota_snapshot_seconds)
@@ -3438,6 +3496,8 @@ def build_approval_episodes(events: Sequence[Event], stats: ParseStats, args: ar
                 row[prefix + "points"] = q.get("points", float("nan"))
                 row[prefix + "before"] = q.get("before_high", q.get("before_used", float("nan")))
                 row[prefix + "after"] = q.get("after_high", q.get("after_used", float("nan")))
+                row[prefix + "historical_fit_eligible"] = (
+                    isinstance(q.get("after_ts"), datetime) and q["after_ts"] < review_policy.TRANSITION_START)
             rows.append(row)
     return rows
 
@@ -3493,6 +3553,8 @@ def _matched_manual_pairs(auto_rows: Sequence[Dict[str, object]], manual_rows: S
     used = set()
     pairs = []
     for a in auto_rows:
+        if not review_policy.historical_fit_eligible(a) or not a.get(f"quota_{minutes}m_historical_fit_eligible", True):
+            continue
         if a.get("pair_confidence") not in {"high", "medium"}:
             continue
         if a.get(f"quota_{minutes}m_status") != "ok":
@@ -3557,6 +3619,8 @@ def guardian_incremental_fit(episodes: Sequence[Dict[str, object]], minutes: int
     rows = []
     groups: Dict[str, List[Tuple[float, float, float]]] = defaultdict(list)
     for r in episodes:
+        if not review_policy.historical_fit_eligible(r) or not r.get(f"quota_{minutes}m_historical_fit_eligible", True):
+            continue
         if r.get("pair_confidence") not in {"high", "medium"}:
             continue
         if r.get(f"quota_{minutes}m_status") != "ok":
@@ -3613,7 +3677,7 @@ def guardian_period_cost_rows(primary: Analysis,
     The quota meter is cumulative within a reset period, so ``high_used`` is the
     best local estimate of how much of that period's 100-point allowance was
     consumed before the next reset. Guardian cost is model-based: the supported
-    global Guardian coefficient is applied to Guardian tokens in each period.
+    historical Guardian coefficient is applied only to historical Guardian tokens.
     The bootstrap coefficient interval is propagated directly into the period
     estimate. This is observational attribution, not a server-side billing field.
     """
@@ -3663,12 +3727,25 @@ def guardian_period_cost_rows(primary: Analysis,
 
         good_pairs = sum(r.get("pair_confidence") in {"high", "medium"} for r in period_approvals)
         guardian_m = guardian_tokens / 1e6
+        declaration = getattr(args, "auto_review_auth_mode", "unknown")
+        quota_policy = review_policy.summarize(
+            ((review_policy.episode_policy(r), int(r.get("guardian_tokens", 0) or 0)) for r in period_approvals),
+            declaration)
+        historical_m = quota_policy["tokens_by_status"]["historical"] / 1e6
+        historical_est = historical_m * coef if supported and math.isfinite(coef) else float("nan")
+        historical_lo = historical_m * lo_coef if supported and math.isfinite(lo_coef) else float("nan")
+        historical_hi = historical_m * hi_coef if supported and math.isfinite(hi_coef) else float("nan")
+        if historical_m > 0 and math.isfinite(historical_est):
+            quota_policy["historical_estimate"] = {"value": historical_est, "lo": historical_lo, "hi": historical_hi}
         used_points = max(float(ep.high_used), 0.0)
         observed_new_points = max(float(ep.new_high_points), 0.0)
 
-        est = guardian_m * coef if supported and math.isfinite(coef) else float("nan")
-        est_lo = guardian_m * lo_coef if supported and math.isfinite(lo_coef) else float("nan")
-        est_hi = guardian_m * hi_coef if supported and math.isfinite(hi_coef) else float("nan")
+        # Frozen estimate fields remain statistical estimates for wholly historical
+        # periods. Policy-based zero and mixed-period subtotals live in extensions.
+        historical_only = quota_policy["status"] == "historical"
+        est = historical_est if historical_only else float("nan")
+        est_lo = historical_lo if historical_only else float("nan")
+        est_hi = historical_hi if historical_only else float("nan")
         share_used = 100.0 * est / used_points if est == est and used_points > EPS else float("nan")
         share_used_lo = 100.0 * est_lo / used_points if est_lo == est_lo and used_points > EPS else float("nan")
         share_used_hi = 100.0 * est_hi / used_points if est_hi == est_hi and used_points > EPS else float("nan")
@@ -3692,7 +3769,10 @@ def guardian_period_cost_rows(primary: Analysis,
             "guardian_ratecard_priced_approvals": priced_approvals,
             "guardian_long_context_events": long_context_events,
             "guardian_ratecard_usd_per_approval": guardian_ratecard_usd / len(period_approvals) if priced_approvals and period_approvals else float("nan"),
-            "estimate_status": "supported" if supported else "not-identifiable",
+            "quota_policy": quota_policy,
+            "estimate_status": ("policy-free" if quota_policy["status"] == "free" else
+                                "supported" if supported and historical_only else
+                                "not-identifiable" if historical_only else quota_policy["status"]),
             "estimated_guardian_points": est,
             "estimated_guardian_points_lo": est_lo,
             "estimated_guardian_points_hi": est_hi,
@@ -3723,6 +3803,24 @@ def _period_label(row: Dict[str, object]) -> str:
     return f"{left}..{right}"
 
 
+def print_auto_review_policy(policy: Dict[str, object]) -> None:
+    print(f"Auto-review quota policy:                {policy['status']}")
+    tokens = policy.get("tokens_by_status", {})
+    if tokens.get("free"):
+        print(f"  announced free activity:              {tokens['free']:,} tokens; 0 quota points under announced policy")
+    uncertain = sum(tokens.get(s, 0) for s in ("transition", "unknown", "outside_scope"))
+    if uncertain:
+        print(f"  transition / unknown / API activity:   {uncertain:,} tokens; quota attribution unresolved")
+    historical = policy.get("historical_estimate")
+    if policy["status"] == "mixed" and historical:
+        print(f"  historical estimated subtotal:        {historical['value']:.1f} quota points "
+              f"(80% {historical['lo']:.1f}-{historical['hi']:.1f}); not a full-period total")
+    print("  Historical estimates use pre-October 6 episodes only; API $eq still measures work.")
+    print("  October 6 publication is a policy reference, not the exact server activation time.")
+    if policy.get("auth_declaration") != "unknown":
+        print(f"  Missing authentication evidence:      declared {policy['auth_declaration']} (local assumption)")
+
+
 def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str, object],
                                minutes: int) -> None:
     print("\nApprove-for-me estimated cost by reset period")
@@ -3730,13 +3828,15 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
     if not rows:
         print(f"No Guardian activity could be assigned to reconstructed {window_label(minutes)} reset periods.")
         return
-    if fit.get("status") != "supported":
-        print("Guardian tokens can be counted per period, but quota cost is not identifiable from the current data.")
+    if fit.get("status") != "supported" and any(review_policy.episode_policy(r)["status"] == "historical" for r in rows):
+        print("Historical Guardian tokens can be counted per period, but historical quota cost is not identifiable from the current data.")
         if fit.get("reason"):
             print(f"Reason: {fit.get('reason')}")
 
     print("Guardian M = million auto-review tokens; Guardian $eq = date-aware public Work/Codex rate-card equivalent.")
-    print("Est quota pt = estimated points of the 100-point allowance consumed by Guardian.")
+    print("Est quota pt = historical estimated points of the 100-point allowance consumed by Guardian.")
+    print("Free activity has 0 quota points under the announced policy, without a statistical interval.")
+    print("Mixed periods show a historical subtotal separately; transition/unknown/API attribution is unresolved.")
     print("Intervals propagate the 80% bootstrap range of the observational Guardian coefficient;")
     print("quota estimates are not server billing data, and $eq is not your Pro subscription charge.\n")
     print(f"{'period':<15} {'used':>6} {'approvals':>9} {'Guardian M':>10} {'Guardian $eq':>12} {'est quota pt':>12} {'80% range':>15} {'% of used':>10}")
@@ -3752,6 +3852,11 @@ def print_guardian_period_cost(rows: Sequence[Dict[str, object]], fit: Dict[str,
         usd_s = f"${usd:.2f}" if math.isfinite(usd) else "n/a"
         print(f"{_period_label(r):<15} {float(r['period_used_points']):>5.0f}% {int(r['approvals']):>9} "
               f"{float(r['guardian_mtokens']):>10.1f} {usd_s:>12} {est_s:>12} {rng:>15} {share_s:>10}")
+        policy = review_policy.episode_policy(r)
+        historical = policy.get("historical_estimate")
+        extra = (f"; historical subtotal {historical['value']:.1f} points (80% {historical['lo']:.1f}-{historical['hi']:.1f})"
+                 if historical and policy["status"] == "mixed" else "")
+        print(f"  policy: {policy['status']}" + ("; 0 quota points under announced policy" if policy["status"] == "free" else "") + extra)
 
     supported_rows = [r for r in rows if float(r.get("estimated_guardian_points", float("nan"))) ==
                       float(r.get("estimated_guardian_points", float("nan")))]
@@ -3787,11 +3892,13 @@ def export_guardian_period_cost_csv(path: str, rows: Sequence[Dict[str, object]]
         "estimated_share_of_used_percent", "estimated_share_of_used_percent_lo",
         "estimated_share_of_used_percent_hi",
     ]
+    fields += list(review_policy.CSV_FIELDS)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for row in rows:
             cooked = dict(row)
+            cooked.update(review_policy.add_csv_fields(row))
             for key in ("period_start", "period_end", "first_seen", "last_seen"):
                 value = cooked.get(key)
                 cooked[key] = value.isoformat() if isinstance(value, datetime) else ""
@@ -3853,16 +3960,16 @@ def render_guardian_period_chart(rows: Sequence[Dict[str, object]], prefix: str,
     ax.set_xlim(0, xmax)
     ax.set_yticks(ys)
     ax.set_yticklabels(labels, color=pal["fg"], fontsize=9.5)
-    ax.set_xlabel("Estimated percentage points of the 100-point allowance", color=pal["muted"], labelpad=10)
+    ax.set_xlabel("Historical estimated percentage points of the 100-point allowance", color=pal["muted"], labelpad=10)
     ax.set_title(
-        "Estimated weekly allowance consumed by Approve for me\n"
+        "Historical estimated allowance consumed by Approve for me\n"
         "Point = estimate · whisker = 80% bootstrap interval",
         color=pal["fg"], fontsize=12.5, fontweight="bold", loc="left", pad=12,
     )
-    fig.text(.08, .965, f"Approve-for-me cost by {window_label(minutes)} reset period",
+    fig.text(.08, .965, f"Historical Approve-for-me cost by {window_label(minutes)} reset period",
              color=pal["fg"], fontsize=17, fontweight="bold", ha="left", va="top")
     fig.text(.08, .028,
-             "Estimated from local quota telemetry; not a server billing field. Hollow marker = current incomplete period.",
+             "Historical periods only; free and unresolved portions excluded. Not server billing. Hollow marker = incomplete period.",
              color=pal["muted"], fontsize=8.7, ha="left")
     fig.subplots_adjust(left=.17, right=.965, bottom=.18, top=.84)
     png, svg = prefix + ".png", prefix + ".svg"
@@ -4268,6 +4375,7 @@ Matched manual-approval comparison")
     print("\
 Incremental Guardian quota fit (exploratory)")
     print("--------------------------------------------")
+    print("Only historical episodes with pre-October 6 parent context and meter snapshots enter this fit.")
     fits: Dict[int, Dict[str, object]] = {}
     for minutes in available:
         if minutes == args.window_minutes and target_guardian_fit is not None:
@@ -4350,12 +4458,14 @@ def export_approval_episodes_csv(path: str, rows: Sequence[Dict[str, object]]) -
         "policy_regime", "approval_markers_nearby", "guardian_share_local",
     ]
     quota_fields = sorted({k for r in rows for k in r if k.startswith("quota_")})
-    fields = base + quota_fields
+    quota_fields = [k for k in quota_fields if k != "quota_policy"]
+    fields = base + quota_fields + list(review_policy.CSV_FIELDS)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for row in rows:
             cooked = dict(row)
+            cooked.update(review_policy.add_csv_fields(row))
             for key in ("start", "end"):
                 if isinstance(cooked.get(key), datetime):
                     cooked[key] = cooked[key].isoformat()
@@ -4417,6 +4527,7 @@ def _stable_seed(*parts: object) -> int:
 
 
 def _metric_from_buckets(bs: Sequence[Bucket], min_price_coverage: float) -> Dict[str, float]:
+    bs = [b for b in bs if not b.quota_fit_excluded]
     pts = sum(b.points for b in bs)
     toks = sum(b.total_tokens for b in bs)
     unc = sum(b.usage.uncached for b in bs)
@@ -4492,7 +4603,7 @@ def build_chart_rows(buckets: Sequence[Bucket], args: argparse.Namespace) -> Lis
         regime_by_key[(rg.model, rg.index)] = rg
         episode_ids = set(rg.episode_ids)
         for b in buckets:
-            if b.reset_key not in episode_ids or b.points <= EPS:
+            if b.reset_key not in episode_ids or b.points <= EPS or b.quota_fit_excluded:
                 continue
             model, model_share = b.dominant_model
             effort, effort_share = b.dominant_effort
@@ -4655,9 +4766,15 @@ def guardian_summary(period_cost_rows: Sequence[Dict[str, object]],
     out: Dict[str, object] = {"detected": bool(approval_episodes), "approval_episodes": len(approval_episodes)}
     if not approval_episodes:
         return out
-    good = [r for r in approval_episodes if r.get("pair_confidence") in {"high", "medium"}]
-    out["guardian_tokens"] = sum(int(r.get("guardian_tokens", 0) or 0) for r in good)
-    dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in good]
+    out["guardian_tokens"] = sum(int(r.get("guardian_tokens", 0) or 0) for r in approval_episodes)
+    out["quota_policy"] = review_policy.summarize(
+        ((review_policy.episode_policy(r), int(r.get("guardian_tokens", 0) or 0)) for r in approval_episodes),
+        next((str(r["quota_policy"].get("auth_declaration", "unknown")) for r in approval_episodes if r.get("quota_policy")), "unknown"))
+    historical = [r["quota_policy"]["historical_estimate"] for r in period_cost_rows
+                  if isinstance(r.get("quota_policy"), dict) and r["quota_policy"].get("historical_estimate")]
+    if historical:
+        out["quota_policy"]["historical_estimate"] = {key: sum(r[key] for r in historical) for key in ("value", "lo", "hi")}
+    dollars = [float(r.get("guardian_ratecard_usd", float("nan"))) for r in approval_episodes]
     dollars = [x for x in dollars if math.isfinite(x)]
     out["ratecard_usd"] = sum(dollars)
     out["ratecard_median_per_approval"] = _q(dollars, .50) if dollars else float("nan")
@@ -4742,14 +4859,15 @@ def print_key_findings(args: argparse.Namespace,
             print(f"public Work/Codex rate-card $eq:            ${usd:,.2f}")
             print(f"$eq / approval median / p90:            ${float(gs['ratecard_median_per_approval']):.2f} / ${float(gs['ratecard_p90_per_approval']):.2f}")
         if "estimated_points" in gs:
-            print("Estimated Approve-for-me overhead")
+            print("Historical estimated Approve-for-me overhead (supported historical periods only)")
             print(f"  typical active reset period:          ~{float(gs['median_period_points']):.1f} / 100 quota points")
             print(f"  worst observed reset period:          ~{float(gs['worst_period_points']):.1f} / 100 "
                   f"({gs.get('worst_period', '?')})")
             print(f"  share of consumed quota while active: ~{float(gs['estimated_share_of_consumed_percent']):.1f}%")
             print(f"  worst-period 80% interval:            {float(gs['worst_period_lo']):.1f}-{float(gs['worst_period_hi']):.1f} points")
-        elif guardian_fit.get("status") != "supported":
+        elif gs["quota_policy"]["status"] == "historical" and guardian_fit.get("status") != "supported":
             print("Guardian quota cost:                    not identifiable from the available meter data")
+        print_auto_review_policy(gs["quota_policy"])
 
     by_model: Dict[str, int] = Counter(rg.model for rg in regimes)
     changed = sorted(m for m, n in by_model.items() if n > 1)
@@ -4835,6 +4953,7 @@ def write_summary_json(path: str, args: argparse.Namespace, coverage: Dict[str, 
             "estimated_guardian_points": _json_float(float(r.get("estimated_guardian_points", float("nan")))),
             "estimated_guardian_points_lo": _json_float(float(r.get("estimated_guardian_points_lo", float("nan")))),
             "estimated_guardian_points_hi": _json_float(float(r.get("estimated_guardian_points_hi", float("nan")))),
+            "quota_policy": review_policy.normalize(r.get("quota_policy")),
         })
     model_rows = []
     for r in chart_rows:
@@ -4952,24 +5071,35 @@ def write_markdown_report(path: str, args: argparse.Namespace, coverage: Dict[st
         if math.isfinite(float(gs.get("ratecard_usd", float("nan")))):
             lines.append(f"- Public Work/Codex rate-card equivalent: ${float(gs['ratecard_usd']):.2f}")
         if "estimated_share_of_consumed_percent" in gs:
-            lines += [f"- Estimated share of consumed quota while Guardian was active: {float(gs['estimated_share_of_consumed_percent']):.1f}%",
+            lines += [f"- Historical estimated share of consumed quota (supported historical periods): {float(gs['estimated_share_of_consumed_percent']):.1f}%",
                       f"- Typical active reset-period cost: {float(gs['median_period_points']):.1f} / 100 quota points",
                       f"- Worst observed reset period: {gs['worst_period']} = {float(gs['worst_period_points']):.1f} / 100 "
                       f"(80% interval {float(gs['worst_period_lo']):.1f}-{float(gs['worst_period_hi']):.1f})"]
         lines += [""]
+        policy = gs["quota_policy"]
+        lines += [f"- Auto-review quota policy: **{policy['status']}**", f"- {review_policy.NOTE}"]
+        if policy["tokens_by_status"]["free"]:
+            lines.append(f"- Eligible free review activity: {policy['tokens_by_status']['free']:,} tokens, **0 quota points under announced policy**.")
+        if policy["auth_declaration"] != "unknown":
+            lines.append(f"- Missing authentication evidence filled with declared `{policy['auth_declaration']}` mode (local assumption).")
+        lines += [""]
         if period_cost_rows:
-            lines += ["### Estimated cost by reset period", "",
-                      "| Period | Used | Approvals | Guardian tokens | Guardian $eq | Est. quota points | 80% interval |",
-                      "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+            lines += ["### Quota policy and historical estimates by reset period", "",
+                      "| Period | Used | Approvals | Guardian tokens | Guardian $eq | Historical est. subtotal | 80% interval | Policy |",
+                      "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
             for r in period_cost_rows:
                 est = float(r.get("estimated_guardian_points", float("nan")))
                 lo = float(r.get("estimated_guardian_points_lo", float("nan")))
                 hi = float(r.get("estimated_guardian_points_hi", float("nan")))
+                historical = review_policy.episode_policy(r).get("historical_estimate")
+                if historical:
+                    est, lo, hi = historical["value"], historical["lo"], historical["hi"]
                 usd = float(r.get("guardian_ratecard_usd", float("nan")))
                 lines.append(f"| {_period_label(r)} | {float(r.get('period_used_points',0)):.0f}% | {int(r.get('approvals',0))} | "
                              f"{float(r.get('guardian_mtokens',0)):.1f}M | {'$'+format(usd,'.2f') if math.isfinite(usd) else 'n/a'} | "
                              f"{format(est,'.1f') if math.isfinite(est) else 'n/a'} | "
-                             f"{format(lo,'.1f')+'-'+format(hi,'.1f') if math.isfinite(lo) and math.isfinite(hi) else 'n/a'} |")
+                             f"{format(lo,'.1f')+'-'+format(hi,'.1f') if math.isfinite(lo) and math.isfinite(hi) else 'n/a'} | "
+                             f"{review_policy.episode_policy(r)['status']} |")
             lines += [""]
 
     lines += ["## Banked-reset effective capacity", ""]
@@ -5890,6 +6020,7 @@ Everything except --charts uses only the Python standard library.
                           help="minimum quota points for a model x month row")
 
     guardian = p.add_argument_group("Guardian / auto-review audit")
+    review_policy.add_arguments(guardian)
     guardian.add_argument("--guardian-purity", type=float, default=DEFAULT_GUARDIAN_PURITY,
                           help="minimum codex-auto-review raw-token share for a Guardian-dominant quota bucket")
     guardian.add_argument("--guardian-isolation-seconds", type=float, default=DEFAULT_GUARDIAN_ISOLATION_SECONDS,
@@ -6125,6 +6256,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stats.analyzed_events = len(primary_events)
 
     primary = analyze_events(primary_events, args)
+    args.auto_review_excluded_buckets = sum(b.quota_fit_excluded for b in primary.buckets)
 
     # Build user-facing summaries before printing. The compact summary avoids
     # expensive bootstrap resampling unless charts/exported chart data need it.

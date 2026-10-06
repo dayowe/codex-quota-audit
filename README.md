@@ -18,7 +18,7 @@ Use the reports to investigate questions such as:
 
 - **Which model and reasoning effort get more work from my quota?** Compare observed tokens and price-normalized work per quota point, with evidence coverage visible.
 - **Has quota efficiency changed over time?** Inspect historical trends and detected policy regimes instead of mixing incompatible periods into one average.
-- **How much work does Approve for me / Guardian add?** Separate auto-review inference from ordinary agent work and inspect estimated quota overhead.
+- **How much work does Approve for me / Guardian add?** Inspect review tokens and timing, historical quota estimates, and eligible free activity under the October 6, 2026 policy.
 - **Does a banked reset provide comparable capacity?** Supply reset timestamps you personally confirmed, then compare matched periods and equal quota slices before and after each reset.
 - **Where does an agent workflow spend its work and time?** Explore roles and individual agents, model response timing, overlapping lifetimes, context growth, and compactions on an interactive timeline.
 
@@ -97,7 +97,7 @@ Keep these limits in mind:
 
 - **More observed work does not establish better results.** Tokens, overlap, context growth, and validation effort do not by themselves prove waste or achievable savings.
 - **API$eq is a comparison unit.** Price-normalized work is not your subscription bill, OpenAI's internal cost, or the actual quota formula.
-- **The evidence is observational.** Meter readings are coarse; workload, policy periods, and incomplete logs can affect comparisons. Guardian quota attribution is an estimate with uncertainty.
+- **The evidence is observational.** Meter readings are coarse; workload, policy periods, and incomplete logs can affect comparisons. Historical Guardian quota estimates carry uncertainty; eligible free activity is attributed under the announced policy.
 - **Timing metrics answer different questions.** Visible generation, time to first token, tool-excluded output rate, and whole-workflow pace use different denominators. Inspect the report's metric guides and coverage before comparing models.
 
 ## Further documentation

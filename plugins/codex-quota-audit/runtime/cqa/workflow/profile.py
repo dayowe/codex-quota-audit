@@ -74,6 +74,7 @@ from . import telemetry
 from .cache import Index
 from . import lifecycle
 from ..quota import audit
+from .. import auto_review_policy as review_policy
 from . import attribution
 from . import pauses
 from . import response_efficiency
@@ -443,6 +444,7 @@ def build_pricing_breakdown(
     prices: Dict[str, Tuple[float, float, float]],
     *,
     custom_price_override: bool = False,
+    auto_review_auth_mode: str = "unknown",
 ) -> Dict[str, object]:
     """Aggregate auditable request-level pricing evidence by resolved rate row.
 
@@ -458,6 +460,7 @@ def build_pricing_breakdown(
     total_base = 0.0
     total_adjusted = 0.0
     long_context_requests = 0
+    review_items: Dict[Tuple[str, str], list] = defaultdict(list)
 
     for req in reqs:
         base, adjusted, is_long, resolved = audit.ratecard_event_cost(
@@ -469,6 +472,8 @@ def build_pricing_breakdown(
             ts=req.ts,
         )
         key = (req.model, resolved)
+        if req.model == audit.AUTO_REVIEW_ALIAS:
+            review_items[key].append((review_policy.observation(req, auto_review_auth_mode), req.total_tokens))
         row = rows.setdefault(key, {
             "observed_model": req.model,
             "ratecard_model": resolved,
@@ -520,6 +525,9 @@ def build_pricing_breakdown(
 
     out_rows: List[Dict[str, object]] = []
     for row in rows.values():
+        key = (str(row["observed_model"]), str(row["ratecard_model"]))
+        if key in review_items:
+            row["quota_policy"] = review_policy.summarize(review_items[key], auto_review_auth_mode)
         row_total = int(row["total_tokens"])
         row_priced = int(row["priced_tokens"])
         row["price_coverage"] = (row_priced / row_total) if row_total else None
@@ -544,6 +552,8 @@ def build_pricing_breakdown(
         "long_context_priced_requests": long_context_requests,
         "long_context_price_uplift_usd": round(total_adjusted - total_base, 6) if priced_requests else None,
         "custom_price_override": bool(custom_price_override),
+        "auto_review_quota_policy": review_policy.summarize(
+            (item for items in review_items.values() for item in items), auto_review_auth_mode),
         "price_coverage": (priced_tokens / total_tokens) if total_tokens else None,
     }
 
@@ -3233,6 +3243,19 @@ def build_export_object(family: finder.Family,
         }
 
     supervision = _cycle_supervision_summary(cycles)
+    burst_policies = {}
+    declaration = str(((pricing_breakdown or {}).get("auto_review_quota_policy") or {}).get("auth_declaration", "unknown"))
+    for key, session_bursts in bursts.items():
+        guardians = [b for b in session_bursts if b.role == "guardian/auto-review"]
+        if not guardians:
+            continue
+        requests = sorted(parsed[key].usage, key=lambda r: r.ts)
+        times = [r.ts for r in requests]
+        for burst in guardians:
+            selected = requests[bisect.bisect_left(times, burst.start):bisect.bisect_right(times, burst.end)]
+            burst_policies[(key, burst.index)] = review_policy.summarize(
+                ((review_policy.observation(r, declaration), r.total_tokens) for r in selected
+                 if r.model == audit.AUTO_REVIEW_ALIAS), declaration)
     obj = {
         "schema": "codex-workflow-cost-profile-v6.9",
         "version": __version__,
@@ -3262,6 +3285,7 @@ def build_export_object(family: finder.Family,
             "custom_price_override": bool((pricing_breakdown or {}).get("custom_price_override", False)),
         },
         "root_role": lifecycle.role_for_session(sessions[family.root]),
+        "auto_review_quota_policy": (pricing_breakdown or {}).get("auto_review_quota_policy"),
         "workflow_analysis": workflow_analysis,
         "pause_analysis": pause_analysis,
         "nested_attribution": nested,
@@ -3393,6 +3417,7 @@ def build_export_object(family: finder.Family,
                 "last_input_tokens": b.last_input,
                 "peak_input_tokens": b.peak_input,
                 "cost": tt(b.totals),
+                "quota_policy": burst_policies.get((key, b.index)),
             }
             for key in sorted(bursts) for b in bursts[key]
         ],
@@ -4329,6 +4354,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--family", "--session", "--session-id", dest="family", metavar="ID",
                     help="family W-..., member S-..., or exact Codex session/thread ID")
     ap.add_argument("--home", default=os.path.expanduser("~/.codex"), help="Codex data directory")
+    review_policy.add_arguments(ap)
     ap.add_argument("--no-cache", action="store_true", help="read logs directly without using or writing the workflow cache")
     ap.add_argument("--rebuild-cache", action="store_true", help="re-extract cached workflow data for this Codex home")
     ap.add_argument("--cache-dir", metavar="DIRECTORY", help="override the local workflow cache directory")
@@ -4607,9 +4633,14 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
         (req for key in family.members for req in parsed[key].usage),
         prices,
         custom_price_override=bool(args.prices),
+        auto_review_auth_mode=args.auto_review_auth_mode,
     )
     if progress is not None:
         progress("performance_start")
+    policy = pricing_breakdown["auto_review_quota_policy"]
+    if policy["status"] != "none":
+        print()
+        audit.print_auto_review_policy(policy)
     turn_throughput = build_turn_throughput(
         family, sessions, parsed, labels, analysis_meta.analysis_start,
         analysis_meta.analysis_end, args.burst_gap_seconds,

@@ -1,6 +1,6 @@
 {
   "name": "codex-quota-audit",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Analyze local Codex quota efficiency, Guardian overhead, banked resets, and multi-agent workflow usage in a privacy-safe local dashboard.",
   "author": {
     "name": "dayowe"

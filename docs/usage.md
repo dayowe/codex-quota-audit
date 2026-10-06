@@ -239,6 +239,20 @@ cqa audit --diagnostics
 
 `--history` adds monthly/model trends and detected regime tables. `--diagnostics` (alias `--verbose`) adds reset, replay, telemetry, and Guardian diagnostics. Guardian analysis is included when data exists; `--no-guardian-audit` skips it.
 
+### Auto-review sign-in and quota policy
+
+From the October 6, 2026 announcement, eligible ChatGPT-account Auto-review activity is shown as **0 quota points under announced policy**. Historical estimates remain separate; transition-day activity, missing authentication and API-key sign-in are unresolved. Tokens and API-equivalent work remain visible. See [the policy and its reporting reference](quota-methodology.md#auto-reviews-announced-free-quota-policy).
+
+When logs lack sign-in evidence, you can declare the mode that applied to the analyzed history:
+
+```bash
+cqa dashboard --auto-review-auth-mode chatgpt
+cqa workflow profile YOUR_SESSION_ID --auto-review-auth-mode chatgpt --report-json
+cqa audit --auto-review-auth-mode api
+```
+
+The default is `unknown`. The declaration is recorded as an assumption and fills missing evidence only. Use it only if that mode accurately describes the selected history; explicit rollout evidence takes precedence. Combined dashboards forward it to both fresh analyzers. Imported or previously saved reports retain their own metadata; regenerate a profile to change its policy classification.
+
 For banked-reset analysis, pass timestamps of resets you personally confirmed:
 
 ```bash

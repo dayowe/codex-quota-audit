@@ -89,7 +89,7 @@ class PluginPackagingTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("cqa 0.9.0", result.stdout)
+            self.assertIn("cqa 0.9.1", result.stdout)
 
     def test_plugin_skill_commands_cover_quota_workflow_and_combined_modes(self):
         quota = (PLUGIN / "skills" / "quota-audit" / "SKILL.md").read_text()

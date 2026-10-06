@@ -27,8 +27,9 @@ from .quota import audit
 from .workflow import candidates as finder
 from .workflow import profile as profiler
 from . import reports as reportlib
+from . import auto_review_policy as review_policy
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 def report_dir(home: str) -> Path:
@@ -289,6 +290,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
     )
     p.add_argument("--home", default="~/.codex", help="Codex data directory")
     p.add_argument("--prices", help="price normalization override accepted by the quota/workflow analyzers")
+    review_policy.add_arguments(p)
     p.add_argument("--output", metavar="PATH", help="explicit HTML export path; bypasses the report library")
     p.add_argument("--name", metavar="LABEL", help="optional friendly label stored with this report")
     p.add_argument("--report-json", nargs="?", const="__DEFAULT__", metavar="PATH",
@@ -369,6 +371,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
                 "--export-json", str(profile_path),
             ]
             profile_args += _cache_arguments(extra)
+            profile_args += ["--auto-review-auth-mode", args.auto_review_auth_mode]
             if args.prices:
                 profile_args += ["--prices", args.prices]
             if args.workflow_root_role:
@@ -395,6 +398,7 @@ def dashboard_main(argv: Sequence[str]) -> int:
         output = custom_output or (tmpdir / "report.html")
         temp_json = tmpdir / "report.json"
         quota_args: list[str] = ["--home", home, "--dashboard", str(output), "--report-json", str(temp_json)]
+        quota_args += ["--auto-review-auth-mode", args.auto_review_auth_mode]
         if args.prices:
             quota_args += ["--prices", args.prices]
         for marker in args.banked_reset:
@@ -495,6 +499,7 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
     p.add_argument("--no-open", action="store_true", help="write the dashboard without opening it")
     p.add_argument("--quiet", action="store_true", help="suppress progress chatter; still print the final report path")
     p.add_argument("--show-analysis-output", action="store_true", help="show detailed profiler output")
+    review_policy.add_arguments(p)
     args, extra = p.parse_known_args(argv)
     if not math.isfinite(args.recent_days) or args.recent_days <= 0:
         p.error("--recent-days must be positive")
@@ -540,6 +545,7 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
         output = custom_output or (tmpdir / "workflow.html")
         temp_json = tmpdir / "workflow-report.json"
         profile_args: list[str] = ["--family", selector, "--home", home, "--dashboard", str(output), "--report-json", str(temp_json)]
+        profile_args += ["--auto-review-auth-mode", args.auto_review_auth_mode]
         if args.export_json:
             profile_args += ["--export-json", args.export_json]
         if args.root_role:
