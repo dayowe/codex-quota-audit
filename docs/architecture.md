@@ -6,6 +6,10 @@ Codex Quota Audit has one editable implementation: `src/cqa/`.
 local Codex telemetry
         |
         +-- cqa.quota.audit -------- quota / Guardian / banked-reset analysis
+        |      +-- usage.loader --- shared extraction/cache/dedup/replay loading
+        |
+        +-- cqa.usage.analysis ----- calendar totals / coverage / pricing
+        |      +-- usage.cli ------- terminal / HTML / CSV consumers
         |
         +-- cqa.workflow.profile --- workflow attribution / pricing / timing
         |      +-- candidates
@@ -22,8 +26,10 @@ local Codex telemetry
         +-- plugin / future clients
 ```
 
-`cqa.cli` is a thin orchestrator. Analytical logic belongs in the quota/workflow
+`cqa.cli` is a thin orchestrator. Analytical logic belongs in the quota/usage/workflow
 packages, not in the browser, plugin skills, or CLI glue.
+
+Quota and calendar usage share a loader and the existing metadata/token consumer. The quota compatibility entry point retains its meter-backed extraction semantics; the usage projection also keeps valid observations without meters. Cache extraction versions are independent by kind, preserving prior discovery/quota/telemetry entries. Dates, prices and model filters are applied after extraction; replay classification precedes calendar selection. Daily aggregates use the requested calendar timezone. The shared HTML renderer displays a usage view and the local library archives it as report type `usage`, without a second extraction pass. Calendar aggregates live in the additive `report.extensions.usage` payload and do not change the frozen report schema or run workflow/quota inference.
 
 ## Repository layout
 

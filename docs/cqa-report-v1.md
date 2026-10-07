@@ -163,6 +163,18 @@ A cohort carries:
 
 API-dollar-equivalent values are normalization against public list prices. They are **not** subscription billing or OpenAI internal cost.
 
+## Calendar usage extension (0.10.0+)
+
+`cqa usage --report-json PATH` writes a normal export with the frozen top-level shape and `report.extensions.usage.schema_version = "1.0.0"`. Quota, Guardian, banked-reset and workflow sections are `not_requested`; calendar work does not trigger their analyses. The current HTML renderer displays a dedicated usage view; older renderers ignore this extension.
+
+The extension carries `status`, inclusive/exclusive `period` bounds plus calendar timezone/local boundaries, exact model `filters`, `summary`, `by_day`, `by_model`, `by_auth_mode`, `by_activity`, disjoint `rows`, `coverage`, `pricing` and `warnings`. The same calculated result drives HTML, the terminal and CSV. `by_day` (0.10.1+) contains the same aggregate measures for observed local calendar dates only, in ascending order. Missing dates do not imply inactivity; older exports without this additive field remain loadable with daily detail unavailable. Observed timestamps remain UTC; requested calendar boundaries and timezone are distinct from observed coverage.
+
+Model rows also carry `rate_models` (0.10.1+), the actual resolved rate rows used for their priced records, including historical Auto-review mappings. Unpriced model rows have an empty list.
+
+Aggregates preserve uncached/cached input, output, reasoning-output subset, total tokens, requests, priced/unpriced records and tokens, token-price coverage, authentication evidence sources, and request-level long-context counts/uplift. `priced_subtotal_usd` sums known prices and can be zero. `api_list_equivalent_usd` is non-null only when retained observations are fully priced; `pricing_status` distinguishes complete, partial, unavailable and not-available evidence. Zero retained records leave the equivalent unavailable rather than establishing zero real activity.
+
+`coverage` distinguishes selected-period observed days, meter-free records, excluded probable replay and retained counting uncertainty from full-history extraction/duplicate/parse diagnostics. Coverage and prices do not establish included plan allowance, purchased-credit use, a bill or maximum capacity. Prices retain source/as-of provenance, actual rate rows, overrides and long-context/historical review mappings. Unobserved charges remain explicitly unaccounted for. All values follow `dashboard-safe-v1`; no source paths, raw IDs, credentials or conversation content are exported.
+
 ## `guardian`
 
 Guardian is modeled at three levels:

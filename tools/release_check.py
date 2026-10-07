@@ -8,6 +8,7 @@ cleans local build metadata so a release check does not litter the checkout.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import shlex
 import shutil
@@ -86,7 +87,7 @@ def main() -> int:
     py = sys.executable
     source_env = {"PYTHONPATH": str(ROOT / "src")}
     have_git_check = bool(shutil.which("git") and (ROOT / ".git").exists())
-    total = 15 if have_git_check else 14
+    total = 16 if have_git_check else 15
     runner = Runner(total=total)
 
     with tempfile.TemporaryDirectory(prefix="cqa-release-check-") as scratch:
@@ -129,6 +130,10 @@ def main() -> int:
             "cqa/workflow/response_efficiency.py",
             "cqa/report/core.py",
             "cqa/research/throughput_compare.py",
+            "cqa/usage/__init__.py",
+            "cqa/usage/analysis.py",
+            "cqa/usage/cli.py",
+            "cqa/usage/loader.py",
             "cqa/assets/dashboard/cqa-dashboard-v1.template.html",
             "cqa/assets/schema/cqa-report-v1.schema.json",
         }
@@ -150,6 +155,31 @@ def main() -> int:
         installed_env = {"PYTHONPATH": os.pathsep.join(str(x) for x in site_candidates)}
         runner.run("installed cqa console smoke", [str(exe), "--version"], env=installed_env, timeout=30)
         runner.run("installed research help smoke", [str(exe), "research", "help"], env=installed_env, timeout=30)
+        usage_home = scratch_path / "usage-home"
+        (usage_home / "sessions").mkdir(parents=True)
+        usage_rows = [
+            {"timestamp": "2026-09-12T12:00:00Z", "type": "session_meta",
+             "payload": {"model": "gpt-6.1-sol", "auth_mode": "chatgpt"}},
+            {"timestamp": "2026-09-12T12:00:01Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"last_token_usage": {
+                 "input_tokens": 100, "cached_input_tokens": 50, "output_tokens": 10}}}},
+        ]
+        (usage_home / "sessions" / "sample.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in usage_rows) + "\n", encoding="utf-8")
+        usage_json = scratch_path / "usage.json"
+        usage_html = scratch_path / "usage.html"
+        runner.run("installed usage totals smoke", [str(exe), "usage", "--home", str(usage_home),
+                   "--month", "2026-09", "--quiet", "--report-json", str(usage_json),
+                   "--dashboard", str(usage_html), "--no-open"],
+                   env=installed_env, timeout=30)
+        usage_result = json.loads(usage_json.read_text(encoding="utf-8"))["report"]["extensions"]["usage"]
+        if (usage_result["summary"]["requests"] != 1 or usage_result["summary"]["total_tokens"] != 110
+                or usage_result["coverage"]["without_quota_snapshot_requests"] != 1
+                or abs(usage_result["summary"]["api_list_equivalent_usd"] - .000205) > 1e-12):
+            raise SystemExit("installed usage command did not preserve unmetered tokens and pricing")
+        if (usage_result["by_day"][0]["total_tokens"] != 110
+                or 'id="usageDailyChart"' not in usage_html.read_text(encoding="utf-8")):
+            raise SystemExit("installed usage dashboard did not preserve daily work or include its renderer")
 
     if have_git_check:
         runner.run("git diff --check", ["git", "diff", "--check"], timeout=30)

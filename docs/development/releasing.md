@@ -1,6 +1,6 @@
 # Releasing Codex Quota Audit
 
-Current package/plugin version: **0.9.1**.
+Current package/plugin version: **0.10.1**.
 
 The package/plugin surface follows Semantic Versioning. Internal quota/workflow
 analyzer versions remain independent for research reproducibility.
@@ -22,7 +22,7 @@ It verifies:
 - plugin launchers;
 - privacy-canary report generation;
 - offline wheel construction and package contents;
-- wheel import/install and console/research smokes;
+- wheel import/install and console/research/usage smokes;
 - `git diff --check` when Git metadata is present.
 
 Every subprocess stage is named, flushed, time-bounded, and prints captured
@@ -37,7 +37,7 @@ Release archives are built from a clean clone of the exact committed HEAD, not
 from the development directory:
 
 ```bash
-python3 tools/build_release.py --output ../CodexQuotaAudit_0.9.1_with_git.zip
+python3 tools/build_release.py --output ../CodexQuotaAudit_0.10.1_with_git.zip
 ```
 
 The archive includes `.git` history intentionally. Because the tool refuses a

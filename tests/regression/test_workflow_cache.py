@@ -82,7 +82,7 @@ class WorkflowCacheTests(unittest.TestCase):
             self.fixture(d)
             finder.discover_workflow_families(d)
             self.assertEqual(finder.discover_workflow_families(d, ["custom-role"]).stats["processed"], 3)
-            with mock.patch("cqa.workflow.cache.EXTRACTION_VERSION", 99):
+            with mock.patch.dict("cqa.workflow.cache.EXTRACTION_VERSIONS", discovery=99):
                 self.assertEqual(finder.discover_workflow_families(d).stats["processed"], 3)
 
     def test_no_cache_writes_nothing_and_rebuild_refreshes_all_files(self):

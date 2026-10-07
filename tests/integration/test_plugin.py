@@ -15,6 +15,17 @@ PLUGIN = ROOT / "plugins" / "codex-quota-audit"
 
 
 class PluginPackagingTests(unittest.TestCase):
+    def setUp(self):
+        self._original_cqa_modules = {key: module for key, module in sys.modules.items()
+                                      if key == "cqa" or key.startswith("cqa.")}
+
+    def tearDown(self):
+        # Bundled-runtime checks must not replace canonical modules used by
+        # later CLI tests (including their extraction/browser mocks).
+        for key in [key for key in sys.modules if key == "cqa" or key.startswith("cqa.")]:
+            sys.modules.pop(key, None)
+        sys.modules.update(self._original_cqa_modules)
+
     def test_manifest_and_marketplace_are_consistent(self):
         manifest = json.loads((PLUGIN / ".codex-plugin" / "plugin.json").read_text())
         marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text())
@@ -89,7 +100,7 @@ class PluginPackagingTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("cqa 0.9.1", result.stdout)
+            self.assertIn("cqa 0.10.1", result.stdout)
 
     def test_plugin_skill_commands_cover_quota_workflow_and_combined_modes(self):
         quota = (PLUGIN / "skills" / "quota-audit" / "SKILL.md").read_text()

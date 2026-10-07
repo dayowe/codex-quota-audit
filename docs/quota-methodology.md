@@ -105,6 +105,8 @@ A ratio near `0.50x` across several slice sizes is consistent with a persistent 
 
 ## Price normalization
 
+`cqa usage` uses the same pricing and duplicate/replay rules for calendar totals, while retaining valid token records without quota snapshots. The quota analyzer continues to require meter evidence for its existing analyses. Usage totals therefore can contain work absent from meter-backed monthly efficiency tables. See [calendar usage](usage.md#monthly-and-timestamp-range-usage) for coverage, sign-in attribution and export semantics.
+
 **API$eq is a normalization ruler**, not a subscription charge, internal compute cost, or the server's quota formula. CQA applies a bundled public ChatGPT Work/Codex Standard token-rate table consistently to quota and workflow requests.
 
 The report records rate-card provenance, an as-of date, priced/unpriced request counts, and token coverage. Inspect these rather than assuming the bundled table represents current prices. The implementation and its source references live in [the quota analyzer](../src/cqa/quota/audit.py).

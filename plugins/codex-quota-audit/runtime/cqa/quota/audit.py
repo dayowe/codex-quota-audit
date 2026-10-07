@@ -924,16 +924,18 @@ def extract_rate_windows(rate_limits: object) -> Dict[int, RateWindow]:
 
 
 def parse_file(path: str, prices: Dict[str, Tuple[float, float, float]],
-               target_window_minutes: int, stats: ParseStats) -> List[Event]:
-    return records.read_consumer(path, quota_consumer(path, prices, target_window_minutes, stats), [])
+               target_window_minutes: int, stats: ParseStats, *, include_unmetered=False) -> List[Event]:
+    return records.read_consumer(path, quota_consumer(path, prices, target_window_minutes, stats,
+                                 include_unmetered=include_unmetered), [])
 
 
-def quota_consumer(path, prices, target_window_minutes, stats):
+def quota_consumer(path, prices, target_window_minutes, stats, *, include_unmetered=False):
     """Parse one rollout file once, retaining every Codex rate-limit window.
 
     `used`/`reset_at` continue to refer to the requested main-analysis window so
     the existing weekly analysis remains backward compatible. `rate_windows`
-    retains 5h/7d (and any future windows) for the Guardian audit.
+    retains 5h/7d (and any future windows) for the Guardian audit. Usage loading
+    also retains records without a meter; the legacy quota projection does not.
     """
     model: Optional[str] = None
     effort: Optional[str] = None
@@ -981,6 +983,10 @@ def quota_consumer(path, prices, target_window_minutes, stats):
         try:
             obj = records.loads(raw)
         except ValueError:
+            stats.json_errors += 1
+            continue
+
+        if not isinstance(obj, dict):
             stats.json_errors += 1
             continue
 
@@ -1038,8 +1044,12 @@ def quota_consumer(path, prices, target_window_minutes, stats):
 
         total_input = total_cached = total_output = None
         if isinstance(total, dict):
-            cur_total = tuple(int(total.get(k, 0) or 0) for k in
-                              ("input_tokens", "cached_input_tokens", "output_tokens"))
+            try:
+                cur_total = tuple(int(total.get(k, 0) or 0) for k in
+                                  ("input_tokens", "cached_input_tokens", "output_tokens"))
+            except (TypeError, ValueError, OverflowError):
+                stats.missing_usage += 1
+                continue
             if cur_total == prev_total:
                 stats.immediate_duplicate_totals += 1
                 continue
@@ -1047,7 +1057,7 @@ def quota_consumer(path, prices, target_window_minutes, stats):
             total_input, total_cached, total_output = cur_total
 
         windows = extract_rate_windows(payload.get("rate_limits"))
-        if not windows:
+        if not windows and not include_unmetered:
             stats.missing_target_limit += 1
             continue
         for minutes in windows:
@@ -1070,10 +1080,19 @@ def quota_consumer(path, prices, target_window_minutes, stats):
             stats.json_errors += 1
             continue
 
-        inp = int(last.get("input_tokens", 0) or 0)
-        cached = int(last.get("cached_input_tokens", 0) or 0)
-        output = int(last.get("output_tokens", 0) or 0)
-        reasoning_output = int(last.get("reasoning_output_tokens", 0) or 0)
+        try:
+            inp = int(last.get("input_tokens", 0) or 0)
+            cached = int(last.get("cached_input_tokens", 0) or 0)
+            output = int(last.get("output_tokens", 0) or 0)
+            reasoning_output = int(last.get("reasoning_output_tokens", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            stats.missing_usage += 1
+            continue
+        if include_unmetered:
+            # Invalid usage cannot contribute a plausible dollar subtotal.
+            if min(inp, cached, output, reasoning_output) < 0 or cached > inp:
+                stats.missing_usage += 1
+                continue
         uncached = max(inp - cached, 0)
         current_model = model or "unknown"
         current_effort = effort or "unknown"
@@ -1229,72 +1248,14 @@ def load_events(home: str,
                 replay_min_growth_mtokens: float,
                 replay_start_max_mtokens: float,
                 dense_threshold: int, *, use_cache=True, cache_dir=None, rebuild_cache=False) -> Tuple[List[Event], ParseStats]:
-    """Return deduplicated events with evidence-based replay flags attached."""
-    stats = ParseStats()
-    paths = session_files(home)
-    stats.files = len(paths)
-
-    candidates: List[Event] = []
-    with Index(home, cache_dir, enabled=use_cache, rebuild=rebuild_cache) as index:
-        index.prune(paths)
-        for path in paths:
-            try:
-                cached, before = index.get(path, "quota", target_window_minutes)
-            except OSError:
-                continue
-            if cached is None:
-                local_stats = ParseStats()
-                events = parse_file(path, {}, target_window_minutes, local_stats)
-                cached = (events, local_stats)
-                index.put(path, "quota", target_window_minutes, before, cached)
-            events, local_stats = cached
-            for item in fields(ParseStats):
-                value = getattr(local_stats, item.name)
-                target = getattr(stats, item.name)
-                if isinstance(value, int):
-                    setattr(stats, item.name, target + value)
-                elif item.name in {"window_records", "link_schema_paths"}:
-                    for key, count in value.items():
-                        target[key] = target.get(key, 0) + count
-                else:
-                    target.update(value)
-            for event in events:
-                event.api_usd = price_event(event.model, event.uncached, event.cached, event.output, prices, ts=event.ts)
-                event.priced = event.api_usd is not None
-            candidates.extend(events)
-        if index.warning:
-            print(index.warning, file=sys.stderr)
-    candidates.sort(key=lambda e: (e.ts, e.ts_raw, e.source))
-
-    by_identity: Dict[Tuple[object, ...], Event] = {}
-    for e in candidates:
-        ident = event_identity(e)
-        prev = by_identity.get(ident)
-        if prev is None:
-            by_identity[ident] = e
-        else:
-            stats.global_duplicates += 1
-            prev_quality = (
-                int(prev.model != "unknown") + int(prev.effort != "unknown")
-                + int(prev.approvals_reviewer != "unknown")
-                + int(prev.approval_policy != "unknown")
-                + int(prev.source_kind != "unknown")
-            )
-            new_quality = (
-                int(e.model != "unknown") + int(e.effort != "unknown")
-                + int(e.approvals_reviewer != "unknown")
-                + int(e.approval_policy != "unknown")
-                + int(e.source_kind != "unknown")
-            )
-            if new_quality > prev_quality:
-                by_identity[ident] = e
-
-    deduped = sorted(by_identity.values(), key=lambda e: (e.ts, e.ts_raw, e.source))
-    detect_replay_prefixes(
-        deduped, stats, replay_scan_seconds, replay_min_events,
+    """Compatibility entry point for the shared, meter-backed usage loader."""
+    from ..usage.loader import load_events as load_usage_events
+    return load_usage_events(
+        home, prices, target_window_minutes, replay_scan_seconds, replay_min_events,
         replay_min_growth_mtokens, replay_start_max_mtokens, dense_threshold,
+        use_cache=use_cache, cache_dir=cache_dir, rebuild_cache=rebuild_cache,
+        index_factory=Index,
     )
-    return deduped, stats
 
 
 def events_for_window(events: Sequence[Event], window_minutes: int) -> List[Event]:

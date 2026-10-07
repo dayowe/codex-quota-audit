@@ -29,7 +29,7 @@ from .workflow import profile as profiler
 from . import reports as reportlib
 from . import auto_review_policy as review_policy
 
-__version__ = "0.9.1"
+__version__ = "0.10.1"
 
 
 def report_dir(home: str) -> Path:
@@ -615,9 +615,9 @@ def reports_main(argv: Sequence[str]) -> int:
     p.add_argument("--home", default="~/.codex", help="Codex data directory")
     sub = p.add_subparsers(dest="command")
     lp = sub.add_parser("list", help="list recent reports in the terminal")
-    lp.add_argument("--type", choices=("quota", "workflow", "combined"))
+    lp.add_argument("--type", choices=("quota", "workflow", "combined", "usage"))
     op = sub.add_parser("open", help="open a report by ID or latest alias")
-    op.add_argument("selector", nargs="?", default="latest", help="report ID, unique friendly name, latest, latest-workflow, latest-quota, or latest-combined")
+    op.add_argument("selector", nargs="?", default="latest", help="report ID, unique friendly name, latest, latest-workflow, latest-quota, latest-combined, or latest-usage")
     args = p.parse_args(argv)
     home = os.path.expanduser(args.home)
     reportlib.ensure_dirs(home)
@@ -642,13 +642,17 @@ def reports_main(argv: Sequence[str]) -> int:
                 analyzed = "—"
             name = e.get("name") or e.get("workflow_ref") or ""
             summary = e.get("summary") if isinstance(e.get("summary"), dict) else {}
+            if e.get("type") == "usage":
+                analyzed = str(summary.get("period_label") or analyzed)
             if not name:
-                name = "Quota audit" if e.get("type") == "quota" else "CQA report"
+                name = "Quota audit" if e.get("type") == "quota" else "Usage report" if e.get("type") == "usage" else "CQA report"
             extra = []
             if summary.get("sessions") is not None:
                 extra.append(f"{int(summary['sessions']):,} sessions")
             if summary.get("requests") is not None:
-                extra.append(f"{int(summary['requests']):,} turns")
+                extra.append(f"{int(summary['requests']):,} {'usage records' if e.get('type') == 'usage' else 'turns'}")
+            if e.get("type") == "usage":
+                extra.append(str(summary.get("timezone") or "UTC"))
             print(f"{str(e.get('id') or ''):<28} {str(e.get('type') or ''):<9} {analyzed:<20} {name}{(' · ' + ' · '.join(extra)) if extra else ''}")
         return 0
     if args.command == "open":
@@ -696,6 +700,7 @@ def print_help() -> None:
 Usage:
   cqa dashboard [options]                 Build the quota dashboard
   cqa audit [quota-analyzer options]      Run the existing quota CLI
+  cqa usage [options]                    Count monthly or timestamp-range usage
   cqa workflow candidates [options]       Find privacy-safe workflow candidates
   cqa workflow profile [ID|latest]        Profile a workflow and build its dashboard
   cqa reports [list|open]                 Browse the local report library
@@ -711,6 +716,7 @@ Common examples:
   cqa workflow profile latest --multi-agent-only
   cqa reports
   cqa reports list
+  cqa usage --month 2026-09 --timezone Europe/Berlin --dashboard
   cqa research throughput-compare latest
 
 Historical direct-script entry points live under compat/; the cqa command is the supported interface.
@@ -731,6 +737,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return dashboard_main(args)
     if command == "audit":
         return audit_main(args)
+    if command == "usage":
+        from .usage import cli as usage_cli
+        return usage_cli.main(args)
     if command == "workflow":
         if not args or args[0] in {"-h", "--help", "help"}:
             print("Usage: cqa workflow candidates [options]\n       cqa workflow profile [ID|latest] [options]")

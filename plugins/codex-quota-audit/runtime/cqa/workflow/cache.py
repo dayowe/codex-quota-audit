@@ -17,8 +17,9 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# Bump when extraction semantics or cached dataclass layouts change.
-EXTRACTION_VERSION = 3
+# Independent formats preserve the existing v3 keys for unchanged extractors.
+# Bump only the kind whose extraction semantics or cached layouts change.
+EXTRACTION_VERSIONS = {"discovery": 3, "quota": 3, "telemetry": 3, "usage": 1}
 _MODULES = {"cqa.workflow.candidates", "cqa.workflow.lifecycle",
             "cqa.workflow.profile", "cqa.workflow.telemetry", "cqa.quota.audit"}
 
@@ -83,7 +84,7 @@ def signature(path):
 
 
 class Index:
-    def __init__(self, home, directory=None, *, enabled=True, rebuild=False):
+    def __init__(self, home, directory=None, *, enabled=True, rebuild=False, rebuild_kind=None):
         self.home = str(Path(home).expanduser().resolve())
         self.path = Path(directory).expanduser() / "workflow.sqlite3" if directory else Path(self.home) / "codex-quota-audit" / "cache" / "workflow.sqlite3"
         self.connection = None
@@ -123,18 +124,24 @@ class Index:
             self.connection.execute("PRAGMA user_version=1")
             if rebuild:
                 with self.connection:
-                    for table in ("entries", "sessions", "identifiers"):
-                        self.connection.execute(f"DELETE FROM {table} WHERE home=?", (self.home,))
+                    if rebuild_kind:
+                        self.connection.execute("DELETE FROM entries WHERE home=? AND kind=?", (self.home, rebuild_kind))
+                        if rebuild_kind == "discovery":
+                            for table in ("sessions", "identifiers"):
+                                self.connection.execute(f"DELETE FROM {table} WHERE home=?", (self.home,))
+                    else:
+                        for table in ("entries", "sessions", "identifiers"):
+                            self.connection.execute(f"DELETE FROM {table} WHERE home=?", (self.home,))
         except (OSError, sqlite3.Error) as exc:
             self.warning = f"Workflow cache unavailable ({type(exc).__name__}); reading logs directly."
             self.close()
 
     @staticmethod
-    def config(options):
-        return json.dumps([EXTRACTION_VERSION, options], sort_keys=True, separators=(",", ":"))
+    def config(options, kind="discovery"):
+        return json.dumps([EXTRACTION_VERSIONS[kind], options], sort_keys=True, separators=(",", ":"))
 
     def get(self, path, kind, options):
-        config = self.config(options)
+        config = self.config(options, kind)
         before = signature(path)
         if self.connection:
             try:
@@ -145,7 +152,7 @@ class Index:
                     expected = {"discovery": "Session", "telemetry": "Telemetry"}
                     if kind in expected and type(result).__name__ != expected[kind]:
                         raise ValueError("Unexpected cached record type")
-                    if kind == "quota" and not (isinstance(result, tuple) and len(result) == 2
+                    if kind in {"quota", "usage"} and not (isinstance(result, tuple) and len(result) == 2
                                                 and isinstance(result[0], list)
                                                 and type(result[1]).__name__ == "ParseStats"):
                         raise ValueError("Unexpected cached quota record")
@@ -164,7 +171,7 @@ class Index:
         try:
             if signature(path) != before:
                 return  # A live writer changed the file while we read it.
-            config = self.config(options)
+            config = self.config(options, kind)
             data = json.dumps(encode(result), separators=(",", ":"))
             with self.connection:
                 self.connection.execute("INSERT OR REPLACE INTO entries VALUES(?,?,?,?,?,?)",

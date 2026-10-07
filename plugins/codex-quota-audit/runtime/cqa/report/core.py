@@ -13,6 +13,7 @@ import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional, Sequence
 from .. import auto_review_policy as review_policy
 
@@ -841,6 +842,44 @@ def build_cqa_report_v1(*, generator_version: str, args: Any,
     }
     return report
 
+
+
+def build_usage_only_report_v1(usage_result: Mapping[str, object], *, generator_version: str,
+                               report_kind: str = "export") -> Dict[str, object]:
+    """Package an already-computed calendar usage result as an additive v1 export.
+
+    No quota fits or workflow analyses run. Older renderers safely ignore the
+    versioned usage extension; HTML, terminal and CSV consumers use the same values.
+    """
+    coverage = usage_result["coverage"]
+    history = coverage["history"]
+    report = build_cqa_report_v1(
+        generator_version=generator_version,
+        args=SimpleNamespace(no_guardian_audit=True),
+        coverage={"files": history["files_checked"], "records": usage_result["summary"]["requests"],
+                  "log_start": coverage["first_observed"], "log_end": coverage["last_observed"]},
+        chart_rows=[], regimes=[], approval_episodes=[], period_cost_rows=[],
+        guardian_summary_data={}, banked_rows=[], banked_summary={},
+        banked_slice_rows=[], banked_slice_summary={},
+    )
+    report["report"]["extensions"] = {"usage": copy.deepcopy(dict(usage_result))}
+    report["report"]["kind"] = report_kind
+    report["analysis"]["methods"] = {
+        "usage": "calendar_token_rate_equivalent_v1",
+        "duplicates": "global_usage_identity_and_immediate_cumulative_duplicates",
+        "replay": "evidence_based_full_file_prefix_before_calendar_selection",
+    }
+    report["analysis"]["parameters"] = {
+        "usage_period": copy.deepcopy(usage_result["period"]),
+        "usage_filters": copy.deepcopy(usage_result["filters"]),
+    }
+    report["quota"]["status"] = "not_requested"
+    report["quota"]["summary"] = None
+    report["quota"]["extensions"] = {}
+    report["data_quality"]["warnings"] = copy.deepcopy(usage_result["warnings"])
+    report["data_quality"]["overall"] = ("unknown" if usage_result["status"] == "not_available"
+                                          else "caution" if usage_result["warnings"] else "good")
+    return report
 
 
 def _semantic_workflow_role(value: object) -> str:

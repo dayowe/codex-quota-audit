@@ -118,10 +118,17 @@ def report_type(report: Mapping[str, object]) -> str:
         return "combined"
     if w:
         return "workflow"
+    info = report.get("report")
+    extensions = info.get("extensions") if isinstance(info, Mapping) else None
+    if not q and isinstance(extensions, Mapping) and isinstance(extensions.get("usage"), Mapping):
+        return "usage"
     return "quota"
 
 
 def _analysis_range(report: Mapping[str, object], rtype: str) -> tuple[Optional[str], Optional[str]]:
+    if rtype == "usage":
+        period = report["report"]["extensions"]["usage"]["period"]
+        return period["start_inclusive"], period["end_exclusive"]
     if rtype in {"workflow", "combined"}:
         wf = report.get("workflow")
         profiles = wf.get("profiles") if isinstance(wf, Mapping) else None
@@ -138,6 +145,14 @@ def _analysis_range(report: Mapping[str, object], rtype: str) -> tuple[Optional[
 
 def _summary(report: Mapping[str, object], rtype: str) -> dict:
     result = {}
+    if rtype == "usage":
+        usage = report["report"]["extensions"]["usage"]
+        for key in ("requests", "total_tokens", "api_list_equivalent_usd", "priced_subtotal_usd", "pricing_status"):
+            result[key] = usage["summary"][key]
+        result["period_label"] = usage["period"]["label"]
+        result["timezone"] = usage["period"]["timezone"]
+        result["calendar_start"] = usage["period"]["calendar_start"]
+        result["calendar_end"] = usage["period"]["calendar_end"]
     if rtype in {"workflow", "combined"}:
         wf = report.get("workflow")
         profiles = wf.get("profiles") if isinstance(wf, Mapping) else None
@@ -180,7 +195,10 @@ def register_report(home: str, html_source: str | Path, report: Mapping[str, obj
     start, end = _analysis_range(report, rtype)
     workflow_ref = _workflow_ref(source_selector, report)
 
-    if rtype == "workflow" and start:
+    if rtype == "usage":
+        period = report["report"]["extensions"]["usage"]["period"]
+        date_part = slugify(period["label"] if period["label"] != "timestamp range" else period["calendar_start"][:10])
+    elif rtype == "workflow" and start:
         basis = _parse_dt(start) or generated
         date_part = basis.astimezone().strftime("%Y-%m-%d")
     elif rtype == "combined" and start:
@@ -253,6 +271,12 @@ def _fmt_dt(value: object, *, date_only: bool = False) -> str:
 
 
 def _fmt_range(entry: Mapping[str, object]) -> str:
+    if entry.get("type") == "usage":
+        summary = entry.get("summary") or {}
+        label = summary.get("period_label", "Usage")
+        if label == "timestamp range":
+            label = f"{summary.get('calendar_start', '—')} ≤ timestamp < {summary.get('calendar_end', '—')}"
+        return f"{label} · {summary.get('timezone', 'UTC')}"
     start = _parse_dt(entry.get("analysis_start"))
     end = _parse_dt(entry.get("analysis_end"))
     if not start and not end:
@@ -271,7 +295,16 @@ def _summary_text(entry: Mapping[str, object]) -> str:
     if "sessions" in s:
         parts.append(f"{int(s['sessions']):,} sessions")
     if "requests" in s:
-        parts.append(f"{int(s['requests']):,} turns")
+        parts.append(f"{int(s['requests']):,} {'usage records' if entry.get('type') == 'usage' else 'turns'}")
+    if "total_tokens" in s:
+        parts.append(f"{int(s['total_tokens']):,} tokens")
+        status = s.get("pricing_status")
+        if status in {"complete", "partial"}:
+            value = float(s["priced_subtotal_usd"])
+            dollars = "<$0.01" if 0 < value < .01 else f"${value:,.2f}"
+            parts.append(dollars + (" priced subtotal" if status == "partial" else " API equivalent"))
+        else:
+            parts.append("API equivalent unavailable")
     if "raw_tokens" in s:
         n = float(s["raw_tokens"])
         parts.append(f"{n/1e6:.1f}M tokens" if n < 1e9 else f"{n/1e9:.2f}B tokens")
@@ -293,11 +326,12 @@ def write_index(home: str, catalog: Mapping[str, object] | None = None) -> Path:
         if not isinstance(e, Mapping):
             continue
         href = html.escape(str(e.get("html") or ""), quote=True)
-        label = html.escape(str(e.get("name") or ("Workflow report" if e.get("type") == "workflow" else "Combined report" if e.get("type") == "combined" else "Quota audit")))
+        default_label = {"workflow": "Workflow report", "combined": "Combined report", "usage": "Usage report"}.get(e.get("type"), "Quota audit")
+        label = html.escape(str(e.get("name") or default_label))
         typ = html.escape(str(e.get("type") or "report").title())
         wref = f" · {html.escape(str(e.get('workflow_ref')))}" if e.get("workflow_ref") else ""
         cards.append(f'''<a class="card" href="{href}"><div class="title">{label}</div><div class="meta">{typ}{wref}</div><div class="range">{html.escape(_fmt_range(e))}</div><div class="summary">{html.escape(_summary_text(e))}</div><div class="generated">Generated {_fmt_dt(e.get('generated_at'))}</div></a>''')
-    empty = '<div class="empty">No reports yet. Run <code>cqa dashboard</code> or <code>cqa workflow profile latest</code>.</div>'
+    empty = '<div class="empty">No reports yet. Run <code>cqa dashboard</code>, <code>cqa workflow profile latest</code>, or <code>cqa usage --dashboard</code>.</div>'
     doc = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Quota Audit · Reports</title><style>
 :root{{--bg:#090d12;--panel:#101720;--border:#202b37;--text:#e7edf4;--muted:#7f8c9a;--blue:#9bb9d5}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 Inter,system-ui,sans-serif}}main{{max-width:1000px;margin:auto;padding:42px 24px 80px}}h1{{margin:0;font-size:30px;letter-spacing:-.03em}}p{{color:var(--muted);margin:6px 0 28px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}.card{{display:block;text-decoration:none;color:inherit;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:17px;transition:.15s}}.card:hover,.card:focus-visible{{border-color:#39516a;transform:translateY(-1px);outline:none}}.title{{font-size:15px;font-weight:650}}.meta{{font-size:10px;color:var(--blue);margin-top:3px;text-transform:uppercase;letter-spacing:.07em}}.range{{font-size:12px;margin-top:15px}}.summary,.generated{{font-size:11px;color:var(--muted);margin-top:4px}}.empty{{border:1px dashed var(--border);border-radius:12px;padding:28px;color:var(--muted)}}code{{color:var(--blue)}}
 </style></head><body><main><h1>Codex Quota Audit</h1><p>Local report library · newest first · report contents stay on this machine.</p><div class="grid">{''.join(cards) if cards else empty}</div></main></body></html>'''
@@ -322,6 +356,7 @@ def resolve_entry(home: str, selector: str) -> Optional[dict]:
         "latest-quota": "quota",
         "latest-workflow": "workflow",
         "latest-combined": "combined",
+        "latest-usage": "usage",
     }
     if s in aliases:
         want = aliases[s]

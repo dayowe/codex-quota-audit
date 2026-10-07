@@ -7,6 +7,7 @@ Use the [README](../README.md) for an overview and the recommended Codex plugin 
 - [Select and interpret workflows](#select-and-interpret-workflows)
 - [Roles and assignments](#roles-and-assignments)
 - [Review pauses](#review-pauses)
+- [Monthly and timestamp-range usage](#monthly-and-timestamp-range-usage)
 - [Quota analysis and banked resets](#quota-analysis-and-banked-resets)
 - [Charts and exports](#charts-and-exports)
 - [Price overrides and diagnostics](#price-overrides-and-diagnostics)
@@ -64,7 +65,7 @@ These create quota-only, combined quota/workflow, and workflow-only dashboards r
 | `--report-json PATH` | Also copy the normalized JSON to a chosen path. |
 | `--output PATH` | Write HTML to a chosen path, bypassing the report library. |
 
-Normal reports are archived under `<Codex home>/codex-quota-audit/reports/`. The library maintains `index.html`, a local `catalog.json`, and stable copies under `latest/`: `quota.html`, `workflow.html`, and `combined.html`. JSON companions are opt-in. Default Codex home is `~/.codex`.
+Normal reports are archived under `<Codex home>/codex-quota-audit/reports/`. The library maintains `index.html`, a local `catalog.json`, and stable copies under `latest/`: `quota.html`, `workflow.html`, `combined.html`, and `usage.html`. JSON companions are opt-in. Default Codex home is `~/.codex`.
 
 ```bash
 cqa reports
@@ -74,7 +75,7 @@ cqa reports open latest-workflow
 cqa reports open "Frontend migration"
 ```
 
-`cqa reports` opens the library in a browser. `open` also accepts a report ID, a unique friendly name, `latest`, `latest-quota`, or `latest-combined`. Reopening saved reports does not rescan logs. Friendly labels are user-provided metadata; avoid including private details in labels you intend to share.
+`cqa reports` opens the library in a browser. `open` also accepts a report ID, a unique friendly name, `latest`, `latest-quota`, `latest-combined`, or `latest-usage`. Reopening saved reports does not rescan logs. Friendly labels are user-provided metadata; avoid including private details in labels you intend to share.
 
 For machine-readable validation, install the optional schema validator in the same environment:
 
@@ -226,6 +227,49 @@ python3 -m cqa.workflow.profile --review-pauses workflow-profile.json \
 ```
 
 The revised file must be a new path. Older detailed exports without a compact usage timeline need regenerating before arbitrary boundary edits. See [pause accounting](workflow-profiler.md#quiet-intervals-and-pause-accounting) for adjusted-rate semantics.
+
+## Monthly and timestamp-range usage
+
+Count observed usage and its token-rate equivalent, without reconstructing workflow relationships or running quota fits:
+
+```bash
+cqa usage --month 2026-09 --timezone Europe/Berlin
+cqa usage --month 2026-09 --timezone Europe/Berlin --dashboard
+cqa usage --month 2026-09 --timezone Europe/Berlin --model gpt-6.1-sol
+cqa usage --month 2026-09 --report-json september.json --export-usage september.csv
+```
+
+Without a period, `cqa usage` selects the current calendar month in `--timezone`. The default timezone is **UTC**. Use an IANA name such as `Europe/Berlin` for a local calendar; the range runs from midnight on the first day through midnight on the next month's first day, exclusively, with daylight-saving changes respected. Named zones require system timezone data (or the optional Python `tzdata` package where that data is absent); UTC always works.
+
+For an explicit range, provide both timezone-aware endpoints. Do not combine these with `--month`:
+
+```bash
+cqa usage \
+  --after 2026-09-01T00:00:00+02:00 \
+  --before 2026-10-01T00:00:00+02:00 \
+  --timezone Europe/Berlin
+```
+
+`--model` matches the observed model name exactly and is repeatable. Token counts, models, agent/Auto-review portions, sign-in evidence and price coverage are derived from one aggregate result used by HTML, the terminal, JSON and CSV. Reasoning tokens are reported as a subset of output and are not added again. Unknown model prices retain their tokens; a priced subtotal is shown instead of a complete dollar equivalent. An empty selection is unavailable evidence, not proof of zero actual usage.
+
+Usage records without quota snapshots are included. Immediate cumulative duplicates, globally duplicated observations and evidence-backed replay prefixes are handled before date/model selection. The report exposes counting uncertainty and parse/missing-usage diagnostics; full-history diagnostics are labeled separately from selected-period observations. Coverage is limited to available local logs and does not establish activity on other devices or in missing logs.
+
+ChatGPT, API and unknown authentication evidence stay separate. A ChatGPT sign-in label does not distinguish included allowance from purchased credits. CQA does not inspect current credentials to label historical usage. Dollar equivalents use the bundled rate table or `--prices` overrides, with rate provenance and request-level long-context adjustments recorded; cache-write/tool charges and fast-mode/regional multipliers are unaccounted for. These totals measure work, not a bill or maximum plan capacity.
+
+Add `--dashboard` to generate and open self-contained HTML in the existing report library. It shows the requested period/timezone, token and dollar totals, daily activity with token/dollar views, clickable model/sign-in/activity breakdowns, and coverage/pricing evidence. Daily buckets use the selected timezone; gaps establish only an absence of retained records. Dollar charts label partial pricing as a subtotal and mark unpriced observations explicitly. HTML uses the same calculation as the terminal and exports, without another scan, workflow reconstruction or quota inference.
+
+```bash
+cqa usage --month 2026-09 --timezone Europe/Berlin --dashboard --report-json
+cqa usage --month 2026-09 --dashboard september.html --report-json --no-open
+cqa reports list --type usage
+cqa reports open latest-usage
+```
+
+`--dashboard PATH` writes to a chosen HTML path and bypasses the report library. `--no-open` writes HTML without launching a browser; `--name LABEL` names an archived report. JSON companions are opt-in: with `--dashboard`, bare `--report-json` keeps JSON beside the archived report or beside a custom HTML export. `--report-json PATH` exports to the specified path and also retains the companion when archiving HTML. Terminal JSON/CSV exports alone are not added to the HTML library.
+
+JSON uses `cqa-report-v1` with a versioned `report.extensions.usage` payload, including daily aggregates, rate rows, coverage and warnings. `--export-usage CSV` writes disjoint model/sign-in/activity rows whose counts, tokens and priced subtotals sum to the selected total; CSV retains period, timezone, rate-card date and override provenance. Saved usage JSON can be loaded through the dashboard's **Load report JSON** button.
+
+The first usage run builds its own entries in the existing SQLite cache, including observations omitted by quota extraction. This can read the history once; it does not clear existing discovery, quota or workflow entries. Warm runs reuse unchanged files, and changing dates, models, timezones or prices does not invalidate extracted data. `cqa usage --rebuild-cache` refreshes usage entries only. Shared options include `--home`, `--cache-dir`, `--no-cache`, `--prices` and `--quiet` (hide extraction progress, retain the summary).
 
 ## Quota analysis and banked resets
 

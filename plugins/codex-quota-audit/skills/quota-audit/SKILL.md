@@ -56,6 +56,17 @@ When quoting results, preserve these interpretation boundaries:
 
 If the report has insufficient or partial evidence, say so rather than filling the gap from assumptions.
 
+## Calendar usage totals
+
+For monthly token-rate-equivalent work, use the usage command rather than multiplying quota-efficiency averages by inferred capacity:
+
+```bash
+python3 scripts/run.py usage --month 2026-09 --timezone Europe/Berlin \
+  --dashboard --report-json --quiet
+```
+
+Preserve the user's month and timezone; UTC is the default. Inspect `report.extensions.usage` for totals, model and agent/Auto-review breakdowns, ChatGPT/API/unknown sign-in evidence, priced subtotals, coverage and pricing provenance. The command includes valid observations without quota snapshots and applies duplicate/replay handling before calendar selection. A ChatGPT label does not distinguish included allowance from purchased credits; missing logs and unobserved charges remain outside coverage. The command retains its terminal summary and optional JSON/CSV exports. Add `--dashboard` for the self-contained usage view with daily activity and clickable breakdowns; it opens the browser and archives the HTML in the local library. Use `--no-open` for headless generation or `cqa reports open latest-usage` to reopen it. It does not build a workflow graph, run quota fits or rescan logs for rendering. Do not infer absent authentication from current credentials.
+
 ## Privacy and execution boundaries
 
 Do not upload or share the generated report unless the user explicitly asks. Do not inspect `auth.json`. Do not print raw rollout lines. Do not add network calls, analytics, external fonts, or CDNs. The dashboard is designed to remain self-contained and local.

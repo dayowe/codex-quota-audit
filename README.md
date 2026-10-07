@@ -18,6 +18,7 @@ Use the reports to investigate questions such as:
 
 - **Which model and reasoning effort get more work from my quota?** Compare observed tokens and price-normalized work per quota point, with evidence coverage visible.
 - **Has quota efficiency changed over time?** Inspect historical trends and detected policy regimes instead of mixing incompatible periods into one average.
+- **How much token-rate-equivalent work did I use this month?** Count observed tokens and dollar equivalents by model, with sign-in evidence and pricing coverage visible.
 - **How much work does Approve for me / Guardian add?** Inspect review tokens and timing, historical quota estimates, and eligible free activity under the October 6, 2026 policy.
 - **Does a banked reset provide comparable capacity?** Supply reset timestamps you personally confirmed, then compare matched periods and equal quota slices before and after each reset.
 - **Where does an agent workflow spend its work and time?** Explore roles and individual agents, model response timing, overlapping lifetimes, context growth, and compactions on an interactive timeline.
@@ -75,17 +76,20 @@ With the standalone CLI installed:
 | Profile the latest multi-agent workflow | `cqa workflow profile latest --multi-agent-only` |
 | Choose a particular session or agent family | `cqa workflow candidates`, then `cqa workflow profile ID` |
 | Print quota history and detected regimes | `cqa audit --history` |
+| View a month's tokens and dollar equivalent | `cqa usage --month 2026-09 --timezone Europe/Berlin --dashboard` |
 | Revisit saved reports | `cqa reports` |
 
 The broad CLI `latest` selector can fall back to a solo session. Use `--multi-agent-only` for a workflow report, or `--workflow-multi-agent-only` with a combined dashboard, to require delegated workers.
 
 Reports open as self-contained HTML with clickable charts, tables, timelines, and evidence drawers. Quota and workflow sections expose different questions; missing evidence is labeled unavailable rather than displayed as zero.
 
-Normal runs archive reports under `~/.codex/codex-quota-audit/reports/`. Stable copies live in `latest/quota.html`, `latest/workflow.html`, and `latest/combined.html`. Run `cqa reports list` for a terminal list or `cqa reports open latest-workflow` to reopen a report without analyzing the logs again.
+Normal runs archive reports under `~/.codex/codex-quota-audit/reports/`. Stable copies live in `latest/quota.html`, `latest/workflow.html`, `latest/combined.html`, and `latest/usage.html`. Run `cqa reports list` for a terminal list or `cqa reports open latest-workflow` to reopen a report without analyzing the logs again.
 
 Useful options include `--home /path/to/.codex` for another log directory, `--no-open` for headless runs, and `--report-json` to keep the machine-readable report alongside the HTML. Use `cqa --help` or a command's `--help` for its options, and `cqa --version` to see package and analyzer versions.
 
 The [usage guide](docs/usage.md) covers exports, banked-reset timestamps, role declarations, pause review, and detailed analysis commands.
+
+`cqa usage` prints a terminal summary; add `--dashboard` for daily activity and clickable breakdowns, or export JSON/CSV. Reopen it with `cqa reports open latest-usage`. It counts valid usage even without quota readings and reports ChatGPT, API and unknown sign-in evidence separately. It measures available logged work; included allowance, purchased credits and maximum plan capacity cannot be inferred from these totals.
 
 ## Privacy and interpretation
 
