@@ -30,6 +30,8 @@ class ToolExcludedTask:
     effort: str = "unknown"
     start_ts: Optional[datetime] = None
     end_ts: Optional[datetime] = None
+    started_before_window: bool = False
+    completed_after_window: bool = False
     ttft_seconds: Optional[float] = None
     response_records: int = 0
     output_tokens: int = 0
@@ -135,6 +137,8 @@ def parse_tool_excluded_tasks(path: str, *, activation: Optional[datetime] = Non
     active_turn_id: Optional[str] = None
     current_model = "unknown"
     current_effort = "unknown"
+    earlier_starts: set[str] = set()
+    later_completions: set[str] = set()
 
     lower = activation
     if after is not None and (lower is None or after > lower):
@@ -191,17 +195,25 @@ def parse_tool_excluded_tasks(path: str, *, activation: Optional[datetime] = Non
             if effort:
                 current_effort = effort
 
-            # Keep context from earlier records, but do not create analysis
-            # events before activation/window start or after window end.
-            if lower is not None and ts < lower:
-                continue
-            if before is not None and ts > before:
-                continue
-
             raw_turn_id = payload.get("turn_id")
             meta = payload.get("internal_chat_message_metadata_passthrough")
             if not isinstance(raw_turn_id, str) and isinstance(meta, dict):
                 raw_turn_id = meta.get("turn_id")
+            # Earlier/later task boundaries explain truncation without adding
+            # their tokens or timing to the measurement. Inherited events before
+            # trusted activation remain excluded even from these diagnostics.
+            if activation is not None and ts < activation:
+                continue
+            if lower is not None and ts < lower:
+                if isinstance(raw_turn_id, str) and raw_turn_id:
+                    active_turn_id = raw_turn_id
+                    if ptype == "task_started":
+                        earlier_starts.add(raw_turn_id)
+                continue
+            if before is not None and ts >= before:
+                if ptype == "task_complete" and isinstance(raw_turn_id, str) and raw_turn_id:
+                    later_completions.add(raw_turn_id)
+                continue
             if isinstance(raw_turn_id, str) and raw_turn_id:
                 active_turn_id = raw_turn_id
 
@@ -294,6 +306,9 @@ def parse_tool_excluded_tasks(path: str, *, activation: Optional[datetime] = Non
                 if isinstance(ttft_ms, (int, float)) and ttft_ms >= 0:
                     task.ttft_seconds = float(ttft_ms) / 1000.0
 
+    for turn_id, task in tasks.items():
+        task.started_before_window = task.start_ts is None and turn_id in earlier_starts
+        task.completed_after_window = task.end_ts is None and turn_id in later_completions
     return list(tasks.values())
 
 
@@ -345,6 +360,12 @@ def aggregate_tool_excluded(tasks: Iterable[ToolExcludedTask]) -> dict:
     reasons = Counter()
 
     for task in task_list:
+        if task.started_before_window:
+            reasons["started_before_window"] += 1
+            continue
+        if task.completed_after_window:
+            reasons["completed_after_window"] += 1
+            continue
         if task.start_ts is None:
             reasons["missing_task_start"] += 1
             continue
@@ -434,7 +455,7 @@ def aggregate_tool_excluded(tasks: Iterable[ToolExcludedTask]) -> dict:
     agent_coverage = timed_agent_items / agent_items if agent_items else None
     if qualified_tasks == 0:
         evidence_quality = "unavailable"
-    elif complete_tasks == qualified_tasks and pairing_coverage == 1.0:
+    elif len(task_list) == qualified_tasks and pairing_coverage == 1.0:
         evidence_quality = "exact"
     else:
         evidence_quality = "partial"
@@ -498,6 +519,7 @@ def method_description() -> dict:
         "reasoning_semantics": "reasoning time remains in the denominator; positive timed Reasoning and AgentMessage spans are reported as direct diagnostics but are not required to infer the denominator",
         "residual_semantics": "other_tool_excluded_seconds is remaining observed client-side time after directly timed Reasoning/AgentMessage spans; it can include TTFT/request latency, inter-item/model-resume latency, tool-call generation/serialization, and small client overhead and is not server-internal compute time",
         "qualification": "headline throughput includes complete tasks with response-level usage and complete valid tool-call/result pairing; incomplete tool pairing is excluded rather than guessed",
+        "window_semantics": "task start and completion must both be inside the start-inclusive/end-exclusive window; boundary-crossing tasks are reported separately without clipping or estimating their rate",
     }
 
 

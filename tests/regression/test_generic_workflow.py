@@ -343,7 +343,7 @@ class GenericCliTests(unittest.TestCase):
                                  *options], capture_output=True, text=True, timeout=30, env=SUBPROCESS_ENV)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         data = json.loads(output.read_text())
-        self.assertEqual(data["schema"], "codex-workflow-cost-profile-v6.9")
+        self.assertEqual(data["schema"], "codex-workflow-cost-profile-v6.10")
         self.assertIn("turn_throughput", data)
         self.assertIn("turn_performance", data)
         self.assertIn("response_efficiency", data)
@@ -354,6 +354,82 @@ class GenericCliTests(unittest.TestCase):
             self.assertEqual(sum(s["direct"][metric] for s in nested["sessions"]), nested["total"][metric])
             self.assertEqual(sum(u["attributed"][metric] for u in nested["units"]) + nested["unattributed"][metric], nested["total"][metric])
         return data, result.stdout
+
+    def test_window_includes_continuing_workers_roles_and_clipped_lifetimes(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            ids = write_logs(home, {"root": None, "lead": "root", "worker": "lead", "reviewer": "lead"},
+                             {"root": "coordinator", "lead": "orchestrator", "worker": "implementer", "reviewer": "validator"},
+                             assignments=True)
+            after, before = NOW + timedelta(seconds=40), NOW + timedelta(seconds=65)
+            report, _ = self.run_profile(home, ids["root"], "--after", after.isoformat(), "--before", before.isoformat())
+            self.assertEqual(report["nested_attribution"]["total"]["total_tokens"], 440)
+            self.assertEqual({r["role"] for r in report["nested_attribution"]["sessions"]},
+                             {"coordinator", "orchestrator", "implementer", "validator"})
+            window = report["analysis_window"]
+            self.assertEqual(window["carry_in_policy"], "include")
+            self.assertEqual(window["included_carry_in_sessions"], 3)
+            self.assertEqual(window["included_carry_in_activity_in_window"]["total_tokens"], 330)
+            self.assertEqual(window["excluded_carry_in_sessions"], 0)
+            self.assertEqual(len(report["active_windows"]), 3)
+            for active in report["active_windows"]:
+                self.assertEqual(finder.parse_ts(active["start"]), after)
+                self.assertLessEqual(finder.parse_ts(active["end"]), before)
+            self.assertEqual(report["concurrency"]["peak_concurrent_children"], 3)
+
+            excluded, text = self.run_profile(home, ids["root"], "--after", after.isoformat(),
+                                               "--before", before.isoformat(), "--exclude-carry-in")
+            self.assertEqual(excluded["nested_attribution"]["total"]["total_tokens"], 110)
+            window = excluded["analysis_window"]
+            self.assertEqual(window["carry_in_policy"], "exclude")
+            self.assertEqual(window["included_carry_in_sessions"], 0)
+            self.assertEqual(window["excluded_carry_in_sessions"], 3)
+            self.assertEqual(window["excluded_carry_in_activity_in_window"]["total_tokens"], 330)
+            self.assertIn("excluded from primary totals", text)
+
+    def test_window_preserves_quiet_parent_without_counting_earlier_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            ids = write_logs(home, {"root": None, "lead": "root", "worker": "lead"},
+                             {"root": "coordinator", "lead": "orchestrator", "worker": "implementer"}, assignments=True)
+            path = home / "sessions" / "worker.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[-1]["timestamp"] = (NOW + timedelta(seconds=75)).isoformat()
+            path.write_text("\n".join(json.dumps(r) for r in rows))
+            report, _ = self.run_profile(home, ids["root"], "--after", (NOW + timedelta(seconds=70)).isoformat(),
+                                        "--before", (NOW + timedelta(seconds=80)).isoformat())
+            self.assertEqual(report["nested_attribution"]["total"]["total_tokens"], 110)
+            sessions = {r["role"]: r for r in report["nested_attribution"]["sessions"]}
+            self.assertEqual(set(sessions), {"coordinator", "orchestrator", "implementer"})
+            self.assertEqual(sessions["orchestrator"]["direct"]["requests"], 0)
+            self.assertIsNotNone(sessions["implementer"]["parent"])
+            self.assertEqual(len(report["active_windows"]), 1)
+            self.assertEqual(report["active_windows"][0]["role"], "implementer")
+            self.assertEqual(report["workflow_analysis"]["sessions_without_lifetime_windows"], [])
+
+    def test_excluding_carry_in_requires_a_start_boundary(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            ids = write_logs(home, {"root": None})
+            result = subprocess.run([sys.executable, "-m", "cqa.workflow.profile", "--home", d,
+                                     "--session", ids["root"], "--exclude-carry-in"],
+                                    capture_output=True, text=True, timeout=30, env=SUBPROCESS_ENV)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--exclude-carry-in requires --after", result.stderr)
+
+    def test_carry_in_audit_stays_inside_explicit_analysis_subtree(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            ids = write_logs(home, {"root": None, "lead": "root", "worker": "lead", "sibling": "root"},
+                             {"root": "coordinator", "lead": "orchestrator", "worker": "implementer", "sibling": "validator"})
+            for options, tokens, included, excluded in (([], 220, 1, 0), (["--exclude-carry-in"], 110, 0, 1)):
+                report, _ = self.run_profile(home, ids["root"], "--analysis-root", ids["lead"],
+                                            "--after", (NOW + timedelta(seconds=40)).isoformat(), *options)
+                self.assertEqual(report["nested_attribution"]["total"]["total_tokens"], tokens)
+                window = report["analysis_window"]
+                self.assertEqual(window["included_carry_in_sessions"], included)
+                self.assertEqual(window["excluded_carry_in_sessions"], excluded)
+                self.assertEqual(window["excluded_carry_in_activity_in_window"]["total_tokens"], 110 * excluded)
 
     def test_standalone_session_and_date_window(self):
         with tempfile.TemporaryDirectory() as d:

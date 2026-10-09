@@ -29,7 +29,7 @@ class ReleaseEngineeringTests(unittest.TestCase):
     def test_package_and_plugin_versions_are_aligned(self):
         manifest = json.loads((ROOT / "plugins/codex-quota-audit/.codex-plugin/plugin.json").read_text())
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertEqual(__version__, "0.10.1")
+        self.assertEqual(__version__, "0.10.2")
         self.assertEqual(manifest["version"], __version__)
         self.assertIn(f'version = "{__version__}"', pyproject)
 

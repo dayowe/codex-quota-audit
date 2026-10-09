@@ -1186,7 +1186,7 @@ def _workflow_response_efficiency_method(value: Mapping[str, object] | None) -> 
         return None
     keys = (
         "status", "task_interval", "token_basis", "tool_exclusion",
-        "reasoning_semantics", "residual_semantics", "qualification",
+        "reasoning_semantics", "residual_semantics", "qualification", "window_semantics",
     )
     return {key: str(value.get(key)) for key in keys if value.get(key) is not None}
 
@@ -1707,6 +1707,20 @@ def workflow_profile_to_cqa(profile_source: Mapping[str, object], profile_index:
             "chunk_correlation_coverage": _finite(comparison.get("chunk_correlation_coverage")),
             "role_attribution_sessions": max(0, _integer(coverage.get("assigned_or_inherited_sessions"))),
             "workflow_sessions": max(0, _integer(coverage.get("sessions"), session_count)),
+            "window_selection": {
+                "requested_after": _iso_utc(analysis_window.get("after")),
+                "requested_before": _iso_utc(analysis_window.get("before")),
+                "carry_in_policy": (analysis_window.get("carry_in_policy")
+                                    if analysis_window.get("carry_in_policy") in {"include", "exclude"} else "legacy"),
+                "included_carry_in_sessions": (max(0, _integer(analysis_window["included_carry_in_sessions"]))
+                                              if analysis_window.get("included_carry_in_sessions") is not None else None),
+                "excluded_carry_in_sessions": (max(0, _integer(analysis_window["excluded_carry_in_sessions"]))
+                                              if analysis_window.get("excluded_carry_in_sessions") is not None else None),
+                "included_carry_in_usage": (_workflow_usage(analysis_window["included_carry_in_activity_in_window"])
+                                            if isinstance(analysis_window.get("included_carry_in_activity_in_window"), Mapping) else None),
+                "excluded_carry_in_usage": (_workflow_usage(analysis_window["excluded_carry_in_activity_in_window"])
+                                            if isinstance(analysis_window.get("excluded_carry_in_activity_in_window"), Mapping) else None),
+            },
             "response_efficiency": {
                 "method": _workflow_response_efficiency_method(
                     response_source.get("method") if isinstance(response_source.get("method"), Mapping) else None
@@ -1722,17 +1736,41 @@ def workflow_profile_to_cqa(profile_source: Mapping[str, object], profile_index:
 
 
 def _workflow_quality(profile: Mapping[str, object]) -> tuple[str, list[Dict[str, object]]]:
-    status = str(profile.get("extensions", {}).get("section_status") if isinstance(profile.get("extensions"), Mapping) else "complete")
+    ext = profile.get("extensions") if isinstance(profile.get("extensions"), Mapping) else {}
+    lifetime = ext.get("lifetime_windows_status")
     warnings: list[Dict[str, object]] = []
-    if status == "partial":
+    if ext.get("section_status") == "partial" or lifetime in {"partial", "unavailable"}:
         warnings.append({
-            "code": "WORKFLOW_LIFETIME_WINDOWS_PARTIAL",
+            "code": "WORKFLOW_LIFETIME_WINDOWS_UNAVAILABLE" if lifetime == "unavailable" else "WORKFLOW_LIFETIME_WINDOWS_PARTIAL",
             "level": "caution",
-            "message": "The workflow profile reports partial lifetime-window coverage; concurrency and lifecycle views should preserve that caveat.",
+            "message": ("Trusted worker lifetime windows are unavailable; worker usage is still counted, but concurrency is not evidence of zero activity."
+                        if lifetime == "unavailable" else
+                        "The workflow profile reports partial lifetime-window coverage; concurrency and lifecycle views should preserve that caveat."),
             "refs": [str(profile.get("id"))],
         })
-        return "caution", warnings
-    return "good", warnings
+    window = ext.get("window_selection") or {}
+    excluded = _integer(window.get("excluded_carry_in_sessions"))
+    if excluded:
+        warnings.append({
+            "code": "WORKFLOW_CARRY_IN_EXCLUDED", "level": "caution",
+            "message": f"The selected window policy excludes {excluded} continuing workers and their in-window usage from primary totals.",
+            "refs": [str(profile.get("id"))],
+        })
+    evidence = [(r.get("extensions") or {}).get("response_efficiency")
+                for r in profile.get("performance_by_model", [])]
+    observed = [e for e in evidence if isinstance(e, Mapping) and _integer(e.get("tasks_seen")) > 0]
+    unavailable = sum(_integer(e.get("qualified_tasks")) == 0 for e in observed)
+    partial = any(_integer(e.get("qualified_tasks")) < _integer(e.get("tasks_seen")) for e in observed)
+    if unavailable or partial:
+        warnings.append({
+            "code": "WORKFLOW_RESPONSE_TIMING_UNAVAILABLE" if unavailable else "WORKFLOW_RESPONSE_TIMING_PARTIAL",
+            "level": "caution",
+            "message": (f"Tool-excluded output rate is unavailable for {unavailable} model/effort groups; inspect task boundaries and timing coverage. Usage totals still include their in-window work."
+                        if unavailable else
+                        "Response-efficiency rates cover only qualified complete tasks. Boundary-crossing tasks and incomplete timing evidence are excluded from rates, while their in-window usage remains counted."),
+            "refs": [str(profile.get("id"))],
+        })
+    return ("caution" if warnings else "good"), warnings
 
 
 def build_workflow_only_report_v1(profile_source: Mapping[str, object], *,

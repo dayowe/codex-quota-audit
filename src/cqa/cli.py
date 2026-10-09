@@ -29,7 +29,7 @@ from .workflow import profile as profiler
 from . import reports as reportlib
 from . import auto_review_policy as review_policy
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 
 def report_dir(home: str) -> Path:
@@ -495,6 +495,9 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
     p.add_argument("--multi-agent-only", action="store_true",
                    help="for 'latest', require a delegated non-Guardian worker and exclude the active Codex session")
     p.add_argument("--root-role", metavar="ROLE", help="explicit role for the selected workflow root; workflow-agnostic")
+    p.add_argument("--after", metavar="ISO8601", help="inclusive activity-window start, including continuing workers; timezone offset required")
+    p.add_argument("--before", metavar="ISO8601", help="exclusive activity-window end; timezone offset required")
+    p.add_argument("--exclude-carry-in", action="store_true", help="exclude non-root workers started before --after for restart comparisons")
     p.add_argument("--role-map", metavar="JSON", help="optional local workflow-role-map-v1 overrides")
     p.add_argument("--no-open", action="store_true", help="write the dashboard without opening it")
     p.add_argument("--quiet", action="store_true", help="suppress progress chatter; still print the final report path")
@@ -503,6 +506,8 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
     args, extra = p.parse_known_args(argv)
     if not math.isfinite(args.recent_days) or args.recent_days <= 0:
         p.error("--recent-days must be positive")
+    if args.exclude_carry_in and not args.after:
+        p.error("--exclude-carry-in requires --after")
     forbidden = {"--family", "--session", "--session-id", "--dashboard", "--report-json", "--home"}
     for token in extra:
         if token.split("=", 1)[0] in forbidden:
@@ -552,6 +557,12 @@ def workflow_profile_main(argv: Sequence[str]) -> int:
             profile_args += ["--root-role", args.root_role]
         if args.role_map:
             profile_args += ["--role-map", args.role_map]
+        if args.after:
+            profile_args += ["--after", args.after]
+        if args.before:
+            profile_args += ["--before", args.before]
+        if args.exclude_carry_in:
+            profile_args += ["--exclude-carry-in"]
         profile_args += list(extra)
         if reporter is None and not args.quiet:
             print("Profiling workflow…")

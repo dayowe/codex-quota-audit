@@ -437,7 +437,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stderr[-2000:])
             windowed = json.loads(out.read_text())
             self.assertEqual(windowed["root_role"], "coordinator")
-            self.assertEqual(windowed["nested_attribution"]["total"]["total_tokens"], 110)  # carry-in children remain separate
+            self.assertEqual(windowed["nested_attribution"]["total"]["total_tokens"], 440)
+            self.assertEqual(windowed["analysis_window"]["included_carry_in_sessions"], 3)
             process = subprocess.run(command + ["--after", NOW.isoformat(), "--before", (NOW + timedelta(seconds=63)).isoformat()],
                                      capture_output=True, text=True, timeout=30, env=SUBPROCESS_ENV)
             self.assertEqual(process.returncode, 0, process.stderr[-2000:])

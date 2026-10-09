@@ -128,7 +128,13 @@ Supervision ratios are reported only for complete isolated sequential cycles. Ov
 
 With a cutoff, root selection uses structural ancestry and observed in-window activity. It does not prefer coordinator/orchestrator titles or treat an inherited earliest timestamp as activation. Ambiguity requires `--analysis-root` with a session key or exact local ID (`--orchestrator` is a compatibility alias).
 
-Sessions are classified as pre-window, carry-in, in-window, post-window, or carry-out. Trusted spawn time overrides inherited history when establishing child activation. Non-root carry-in workers are reported separately and excluded from primary post-restart totals by default. The selected root is the carry-in exception: only its in-window events count.
+Sessions are classified as pre-window, carry-in, in-window, post-window, or carry-out. Trusted spawn time overrides inherited history when establishing child activation. By default, `--after` includes the selected root's descendants that continue working in the window, even if they started earlier. Only in-window usage counts. Quiet intermediate parents remain as structural context without adding their earlier usage.
+
+For a restart comparison that deliberately excludes workers activated before the cutoff, add `--exclude-carry-in` (requires `--after`). The selected root remains included. The dashboard, normalized JSON, and detailed export identify the policy and the number of included/excluded continuing workers, with excluded in-window usage kept separate from primary totals. An explicit subtree root does not include workers from other branches in those excluded totals.
+
+Pre-window spawn, role, and parent evidence remains available for reconstruction. Trusted lifetime bars are clipped to the analysis window; a lifetime spanning the cutoff does not imply continuous execution. Missing trusted lifetime evidence limits concurrency measurements without removing a worker's observed usage.
+
+Tool-excluded output rates require complete tasks with start and completion inside the window and valid tool-call/result timing. Tasks crossing either boundary do not receive estimated partial-task rates. Timing evidence distinguishes starts before the window, completions at or after its exclusive end, and missing observed task boundaries. Their in-window token usage still contributes to primary totals when their worker is included. The dashboard shows qualified tasks alongside complete/observed tasks, so unavailable timing is not presented as zero work.
 
 The selected segment contains the root and descendants meeting the window rules. An explicit leaf root does not acquire siblings as a fallback. Usage/actions before trusted child activation are excluded from primary totals and recorded in `pre_activation_records_excluded`. This does not prove that arbitrary inherited history was identified when no reliable activation boundary exists.
 

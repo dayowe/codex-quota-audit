@@ -182,6 +182,8 @@ class ReportContractTests(unittest.TestCase):
         self.assertAlmostEqual(profile["summary"]["api_list_equivalent_usd"], 325.0676165)
         self.assertEqual(profile["summary"]["sessions"], 29)
         self.assertEqual(profile["summary"]["compactions"], 16)
+        self.assertIsNone(profile["extensions"]["window_selection"]["excluded_carry_in_sessions"])
+        self.assertIsNone(profile["extensions"]["window_selection"]["excluded_carry_in_usage"])
         self.assertEqual(len(profile["agents"]), 29)
         self.assertEqual(len(profile["compactions"]), 16)
         self.assertEqual(len(profile["signals"]), 4)
@@ -474,6 +476,51 @@ class ReportContractTests(unittest.TestCase):
             self.assertIn("no parent link in report", html)
             self.assertNotIn("child / peer", html)
             self.assertNotIn("not enough evidence", html)
+
+    def test_window_selection_preserves_scoped_counts_usage_and_policy(self):
+        source = json.loads((FIXTURES / "workflow_cost_profile_5x_pauses_reviewed.json").read_text(encoding="utf-8"))
+        window = source["analysis_window"]
+        window.update({
+            "after": "2026-10-09T06:00:00+02:00", "before": "2026-10-09T12:00:00+02:00",
+            "carry_in_policy": "exclude", "included_carry_in_sessions": 0, "excluded_carry_in_sessions": 6,
+            "excluded_carry_in_activity_in_window": {"requests": 10, "total_tokens": 1100,
+                "input_tokens": 1000, "output_tokens": 100, "api_list_equivalent_usd": .02, "price_coverage": 1},
+            "root_candidates": [{"session_key": "PRIVATE_SELECTOR_DO_NOT_EXPORT"}],
+        })
+        report = build_workflow_only_report_v1(source, generator_version=audit.__version__)
+        selection = report["workflow"]["profiles"][0]["extensions"]["window_selection"]
+        self.assertEqual(selection["requested_after"], "2026-10-09T04:00:00Z")
+        self.assertEqual(selection["carry_in_policy"], "exclude")
+        self.assertEqual(selection["excluded_carry_in_sessions"], 6)
+        self.assertEqual(selection["excluded_carry_in_usage"]["total_tokens"], 1100)
+        self.assertNotIn("PRIVATE_SELECTOR_DO_NOT_EXPORT", json.dumps(report))
+        self.assertIn("WORKFLOW_CARRY_IN_EXCLUDED", {w["code"] for w in report["data_quality"]["warnings"]})
+        window.update({"carry_in_policy": "include", "included_carry_in_sessions": 6, "excluded_carry_in_sessions": 0,
+                       "included_carry_in_activity_in_window": window["excluded_carry_in_activity_in_window"],
+                       "excluded_carry_in_activity_in_window": {}})
+        included = build_workflow_only_report_v1(source, generator_version=audit.__version__)
+        self.assertEqual(included["workflow"]["profiles"][0]["extensions"]["window_selection"]["included_carry_in_sessions"], 6)
+        self.assertNotIn("WORKFLOW_CARRY_IN_EXCLUDED", {w["code"] for w in included["data_quality"]["warnings"]})
+
+    def test_missing_worker_lifetimes_and_model_task_timing_are_cautions(self):
+        source = json.loads((FIXTURES / "workflow_cost_profile_5x_pauses_reviewed.json").read_text(encoding="utf-8"))
+        source["workflow_analysis"] = {"lifetime_windows_status": "unavailable"}
+        source["active_windows"] = []
+        source["turn_performance"] = {"by_model_effort": [
+            {"model": "model-a", "effort": "high", "stats": {"turns": 2}}]}
+        stats = {"tasks_seen": 2, "complete_tasks": 0, "qualified_tasks": 0, "evidence_quality": "unavailable",
+                 "qualification_reasons": {"started_before_window": 1, "missing_task_complete": 1}}
+        source["response_efficiency"] = {"overall": stats, "by_model_effort": [
+            {"model": "model-a", "effort": "high", "stats": stats}]}
+        report = build_workflow_only_report_v1(source, generator_version=audit.__version__)
+        self.assertEqual(report["data_quality"]["overall"], "caution")
+        codes = {w["code"] for w in report["data_quality"]["warnings"]}
+        self.assertIn("WORKFLOW_LIFETIME_WINDOWS_UNAVAILABLE", codes)
+        self.assertIn("WORKFLOW_RESPONSE_TIMING_UNAVAILABLE", codes)
+        efficiency = report["workflow"]["profiles"][0]["performance_by_model"][0]["extensions"]["response_efficiency"]
+        self.assertEqual(efficiency["tasks_seen"], 2)
+        self.assertIsNone(efficiency["output_tokens_per_second"])
+        self.assertEqual(efficiency["qualification_reasons"]["started_before_window"], 1)
 
     def test_workflow_timeline_uses_privacy_safe_lifecycle_objects(self):
         source = json.loads((FIXTURES / "workflow_cost_profile_5x_pauses_reviewed.json").read_text(encoding="utf-8"))

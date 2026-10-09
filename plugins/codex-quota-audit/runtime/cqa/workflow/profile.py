@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Codex workflow cost profiler v6.9
+Codex workflow cost profiler v6.10
 
 Companion to cqa.workflow.candidates and cqa.workflow.lifecycle.
 
@@ -83,7 +83,7 @@ from ..report.core import (
     render_dashboard_html, write_cqa_report_json,
 )
 
-__version__ = "6.9"
+__version__ = "6.10"
 
 DEFAULT_SUCCESSOR_MAP = {
     "planner": "implementer",
@@ -320,14 +320,19 @@ class AnalysisMeta:
     root_selection_method: str = "family-root"
     root_selection_confidence: str = "high"
     membership_method: str = "full-family"
+    carry_in_policy: str = "include"
     pre_window: List[str] = field(default_factory=list)
     carry_in: List[str] = field(default_factory=list)
+    included_carry_in: List[str] = field(default_factory=list)
+    excluded_carry_in: List[str] = field(default_factory=list)
     in_window: List[str] = field(default_factory=list)
     post_window: List[str] = field(default_factory=list)
     carry_out: List[str] = field(default_factory=list)
     excluded_in_window: List[str] = field(default_factory=list)
     orchestrator_candidates: List[dict] = field(default_factory=list)
     carry_in_totals: TokenTotals = field(default_factory=TokenTotals)
+    included_carry_in_totals: TokenTotals = field(default_factory=TokenTotals)
+    excluded_carry_in_totals: TokenTotals = field(default_factory=TokenTotals)
 
     @property
     def windowed(self) -> bool:
@@ -1448,18 +1453,40 @@ def build_analysis_family(full_family: finder.Family,
     def eligible(key: str) -> bool:
         if key == analysis_root:
             return True
-        # Non-root carry-ins remain contamination and are reported separately.
-        # The selected orchestrator is the one allowed carry-in exception.
-        if key in meta.carry_in:
+        # Ordinary date windows include continuing workers. Restart isolation
+        # is explicit and still counts the selected root's in-window activity.
+        if meta.carry_in_policy == "exclude" and key in meta.carry_in:
             return False
         activation = effective_session_activation(key, sessions, spawn_activation)
         spawned_in_window = activation is not None and in_time_window(activation, start, end)
         return spawned_in_window or has_window_activity(key)
 
-    members = [analysis_root] + sorted(k for k in ancestry if k != analysis_root and eligible(k))
-    meta.membership_method = "selected-root-descendants-by-activity"
+    selected = {analysis_root} | {k for k in ancestry if eligible(k)}
+    if meta.carry_in_policy == "include":
+        # Keep quiet intermediate parents as structural context. Their usage
+        # is filtered by the same window, so this cannot add earlier work.
+        parents: Dict[str, set[str]] = defaultdict(set)
+        for edge in full_family.edges:
+            parents[edge.child].add(edge.parent)
+        for caller in full_family.members:
+            for action in parsed[caller].actions:
+                if (action.kind == "spawn" and lifecycle.is_trusted_action(action)
+                        and action.matched_session in ancestry):
+                    parents[action.matched_session].add(caller)
+        stack = list(selected)
+        while stack:
+            for parent in parents.get(stack.pop(), set()):
+                if parent in ancestry and parent not in selected:
+                    selected.add(parent)
+                    stack.append(parent)
+    members = [analysis_root] + sorted(selected - {analysis_root})
+    meta.membership_method = ("selected-root-descendants-by-activity" if meta.carry_in_policy == "include"
+                              else "selected-root-descendants-excluding-carry-in")
     members = list(dict.fromkeys(members))
     meta.analysis_root = analysis_root
+    meta.included_carry_in = [k for k in meta.carry_in if k in members and k != analysis_root]
+    meta.excluded_carry_in = [k for k in meta.carry_in if k in ancestry and k not in members
+                              and has_window_activity(k)]
     meta.excluded_in_window = [k for k in meta.in_window if k not in members]
     view = finder.Family(
         members=members,
@@ -1676,15 +1703,19 @@ def annotate_windows_with_assignments(windows: Sequence[ActiveWindow],
 
 def carry_in_activity(meta: AnalysisMeta,
                       parsed_full: Dict[str, lifecycle.ParsedSession],
-                      prices: Dict[str, Tuple[float, float, float]]) -> TokenTotals:
+                      prices: Dict[str, Tuple[float, float, float]], *,
+                      members: Optional[Sequence[str]] = None,
+                      activations: Optional[Dict[str, datetime]] = None) -> TokenTotals:
     if not meta.carry_in:
         return TokenTotals()
     start, end = meta.requested_after, meta.requested_before
     reqs = []
-    for key in meta.carry_in:
+    for key in meta.carry_in if members is None else members:
         if key == meta.analysis_root:
             continue
-        reqs.extend(r for r in parsed_full[key].usage if in_time_window(r.ts, start, end))
+        activation = (activations or {}).get(key)
+        reqs.extend(r for r in parsed_full[key].usage if in_time_window(r.ts, start, end)
+                    and (activation is None or r.ts >= activation))
     return aggregate_requests(reqs, prices)
 
 
@@ -2076,7 +2107,9 @@ def build_active_windows(family: finder.Family,
                          stage_roles: Optional[set[str]],
                          tail_seconds: float,
                          analysis_start: Optional[datetime] = None,
-                         analysis_end: Optional[datetime] = None) -> Tuple[List[ActiveWindow], List[str]]:
+                         analysis_end: Optional[datetime] = None, *,
+                         lifecycle_family: Optional[finder.Family] = None,
+                         activations: Optional[Dict[str, datetime]] = None) -> Tuple[List[ActiveWindow], List[str]]:
     """Build observed descendant lifetime windows from trusted spawns.
 
     Unlike v1's spawn-defined stages, one spawn never truncates another active
@@ -2087,9 +2120,14 @@ def build_active_windows(family: finder.Family,
     windows: List[ActiveWindow] = []
     recognized_targets: set[str] = set()
 
-    for action in trusted_spawn_actions(family, parsed):
+    for action in trusted_spawn_actions(lifecycle_family or family, parsed):
         key = action.matched_session
         assert key is not None
+        if key not in family.members or key == family.root:
+            continue
+        caller_activation = (activations or {}).get(action.caller_key)
+        if caller_activation is not None and action.ts < caller_activation:
+            continue
         role = lifecycle.role_for_key(key, family, sessions)
         if stage_roles is not None and role not in stage_roles:
             continue
@@ -2099,6 +2137,10 @@ def build_active_windows(family: finder.Family,
         start = action.ts
         natural_end = child.last_ts or start
         end = natural_end + timedelta(seconds=max(0.0, tail_seconds))
+        recognized_targets.add(key)
+        if ((analysis_start is not None and end < analysis_start)
+                or (analysis_end is not None and start >= analysis_end)):
+            continue
         if analysis_start is not None:
             start = max(start, analysis_start)
         if analysis_end is not None:
@@ -3233,6 +3275,7 @@ def build_export_object(family: finder.Family,
     def tt(t: TokenTotals) -> dict:
         return {
             "requests": t.requests,
+            "total_tokens": t.total_tokens,
             "input_tokens": t.input_tokens,
             "cached_input_tokens": t.cached_input_tokens,
             "uncached_input_tokens": t.uncached_input_tokens,
@@ -3257,7 +3300,7 @@ def build_export_object(family: finder.Family,
                 ((review_policy.observation(r, declaration), r.total_tokens) for r in selected
                  if r.model == audit.AUTO_REVIEW_ALIAS), declaration)
     obj = {
-        "schema": "codex-workflow-cost-profile-v6.9",
+        "schema": "codex-workflow-cost-profile-v6.10",
         "version": __version__,
         "family": family.family_key,
         "privacy": "No prompts/responses/source code/tool output/raw IDs are included.",
@@ -3305,14 +3348,19 @@ def build_export_object(family: finder.Family,
             "root_selection_method": analysis_meta.root_selection_method,
             "root_selection_confidence": analysis_meta.root_selection_confidence,
             "membership_method": analysis_meta.membership_method,
+            "carry_in_policy": analysis_meta.carry_in_policy,
             "primary_sessions": len(family.members),
             "pre_window_sessions": len(analysis_meta.pre_window),
             "carry_in_sessions": len(analysis_meta.carry_in),
+            "included_carry_in_sessions": len(analysis_meta.included_carry_in),
+            "excluded_carry_in_sessions": len(analysis_meta.excluded_carry_in),
             "in_window_sessions": len(analysis_meta.in_window),
             "post_window_sessions": len(analysis_meta.post_window),
             "carry_out_sessions": len(analysis_meta.carry_out),
             "excluded_in_window_sessions": len(analysis_meta.excluded_in_window),
             "carry_in_activity_in_window": tt(analysis_meta.carry_in_totals),
+            "included_carry_in_activity_in_window": tt(analysis_meta.included_carry_in_totals),
+            "excluded_carry_in_activity_in_window": tt(analysis_meta.excluded_carry_in_totals),
             "root_candidates": [
                 {
                     **{k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in row.items()}
@@ -3652,14 +3700,15 @@ def print_report(family: finder.Family,
               f"in-window={len(analysis_meta.in_window)}, post={len(analysis_meta.post_window)}, carry-out={len(analysis_meta.carry_out)}")
         if analysis_meta.excluded_in_window:
             print(f"in-window sessions outside selected segment: {len(analysis_meta.excluded_in_window)}")
-        excluded_carry_in = [k for k in analysis_meta.carry_in if k != family.root]
+        print(f"continuing-worker policy: {analysis_meta.carry_in_policy}; "
+              f"included={len(analysis_meta.included_carry_in)}, excluded={len(analysis_meta.excluded_carry_in)}")
         if family.root in analysis_meta.carry_in:
-            print("selected orchestrator is a carry-in/resumed session; only in-window events are counted in primary totals")
-        if excluded_carry_in:
+            print("selected root is a carry-in/resumed session; only in-window events are counted in primary totals")
+        if analysis_meta.excluded_carry_in:
             print(f"other carry-in activity after cutoff (excluded from primary totals): "
-                  f"sessions={len(excluded_carry_in)}, req={analysis_meta.carry_in_totals.requests}, "
-                  f"raw={fmt_tokens(analysis_meta.carry_in_totals.total_tokens)}, "
-                  f"API$eq={fmt_eq(analysis_meta.carry_in_totals.api_eq)}")
+                  f"sessions={len(analysis_meta.excluded_carry_in)}, req={analysis_meta.excluded_carry_in_totals.requests}, "
+                  f"raw={fmt_tokens(analysis_meta.excluded_carry_in_totals.total_tokens)}, "
+                  f"API$eq={fmt_eq(analysis_meta.excluded_carry_in_totals.api_eq)}")
     effective_first = analysis_meta.analysis_start or first
     effective_last = analysis_meta.analysis_end or last
     if effective_first and effective_last:
@@ -4346,7 +4395,8 @@ def main(argv: Optional[Sequence[str]] = None, *, progress: Optional[Callable[..
 Core activity covers every role with trusted spawn/lifetime evidence, including
 unnamed workers. Role and assignment interpretation is optional. With date windows,
 the profiler selects a structural root with subtree activity, requiring an explicit
---analysis-root if ambiguous. Non-root carry-ins remain separately reported.
+--analysis-root if ambiguous. Continuing workers are included by default;
+--exclude-carry-in explicitly isolates work from workers started in the window.
 Exact configured role names in SEND routing fields are trusted at the role level,
 but unresolved SEND/WAIT calls are never assigned to a specific child session.
 """,
@@ -4363,8 +4413,10 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     ap.add_argument("--timings", action="store_true", help="print stage timings and cache/file counters")
     ap.add_argument("--workers", type=int, choices=range(1,17), default=1, metavar="N", help="bounded processes for changed-file indexing (1–16; default 1)")
 
-    ap.add_argument("--after", metavar="ISO8601", help="analyze only the post-boundary segment; timezone offset is required")
+    ap.add_argument("--after", metavar="ISO8601", help="inclusive activity-window start, including continuing workers; timezone offset is required")
     ap.add_argument("--before", metavar="ISO8601", help="optional exclusive end of analysis window; timezone offset is required")
+    ap.add_argument("--exclude-carry-in", action="store_true",
+                    help="exclude non-root workers activated before --after (restart comparison); requires --after")
     ap.add_argument("--analysis-root", "--orchestrator", dest="orchestrator", metavar="ID", help="override the analysis root with a hashed key or exact raw session ID")
     ap.add_argument("--workflow-profile", choices=("generic", "staged"), default="generic",
                     help="optional workflow interpretation; generic assumes no stage sequence (default)")
@@ -4457,6 +4509,8 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             raise ValueError("--quiet-gap-minutes must be a positive finite number")
         analysis_after = parse_aware_iso8601(args.after, "--after")
         analysis_before = parse_aware_iso8601(args.before, "--before")
+        if args.exclude_carry_in and analysis_after is None:
+            raise ValueError("--exclude-carry-in requires --after")
         if analysis_after is not None and analysis_before is not None and analysis_before <= analysis_after:
             raise ValueError("--before must be later than --after")
         if not (0 < args.compaction_refill_fraction <= 1):
@@ -4568,6 +4622,7 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     source_family = family
     parsed_full = parsed
     analysis_meta = classify_sessions_for_window(source_family, sessions, parsed_full, analysis_after, analysis_before)
+    analysis_meta.carry_in_policy = "exclude" if args.exclude_carry_in else "include"
     try:
         analysis_root, selection_method, selection_confidence, candidates = select_analysis_root(
             source_family, sessions, parsed_full,
@@ -4612,7 +4667,13 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
             excluded_replay["actions"] += len(src.actions) - len(kept_actions)
             src.usage, src.turn_timings, src.actions = kept_usage, kept_timings, kept_actions
     labels = lifecycle.assign_agent_labels(family, sessions, parsed)
-    analysis_meta.carry_in_totals = carry_in_activity(analysis_meta, parsed_full, prices)
+    activations = {k: identity["activation"] for k, identity in source_identities.items()
+                   if identity["activation"] is not None}
+    analysis_meta.carry_in_totals = carry_in_activity(analysis_meta, parsed_full, prices, activations=activations)
+    analysis_meta.included_carry_in_totals = carry_in_activity(
+        analysis_meta, parsed_full, prices, members=analysis_meta.included_carry_in, activations=activations)
+    analysis_meta.excluded_carry_in_totals = carry_in_activity(
+        analysis_meta, parsed_full, prices, members=analysis_meta.excluded_carry_in, activations=activations)
 
     if progress is not None:
         progress("structure_start", sessions=len(family.members))
@@ -4620,8 +4681,9 @@ but unresolved SEND/WAIT calls are never assigned to a specific child session.
     nested["pre_activation_records_excluded"] = dict(excluded_replay)
 
     windows, excluded_windows = build_active_windows(
-        family, sessions, parsed, labels, None, args.active_tail_seconds,
+        family, sessions, parsed_full, labels, None, args.active_tail_seconds,
         analysis_meta.analysis_start, analysis_meta.analysis_end,
+        lifecycle_family=source_family, activations=activations,
     )
     apply_assignment_windows(windows, identities, source_family.family_key)
     chunks = chunk_rows(family, parsed, windows, prices)
